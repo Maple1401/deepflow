@@ -328,7 +328,7 @@ static int sockopt_msg_send(int clt_fd,
 	return ETR_OK;
 }
 
-/* free recieved msg */
+/* free received msg */
 static inline void sockopt_msg_free(struct tracer_sock_msg *msg)
 {
 	free(msg);
