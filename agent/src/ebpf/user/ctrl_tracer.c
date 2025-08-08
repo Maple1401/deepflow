@@ -337,8 +337,8 @@ static inline int msg_recv(int clt_fd, struct tracer_sock_msg_reply *reply_hdr,
 	res = readn(clt_fd, reply_hdr, len);
 	if (len != res) {
 		fprintf(stderr,
-			"[%s] socket msg header recv error -- %d/%d recieved\n",
-			__func__, res, len);
+                       "[%s] socket msg header recv error -- %d/%d received\n",
+                       __func__, res, len);
 		return -1;
 	}
 
@@ -360,8 +360,8 @@ static inline int msg_recv(int clt_fd, struct tracer_sock_msg_reply *reply_hdr,
 		res = readn(clt_fd, msg, reply_hdr->len);
 		if (res != reply_hdr->len) {
 			fprintf(stderr,
-				"[%s] socket msg body recv error -- %d/%d recieved\n",
-				__func__, res, (int)reply_hdr->len);
+                               "[%s] socket msg body recv error -- %d/%d received\n",
+                               __func__, res, (int)reply_hdr->len);
 			free(msg);
 			return -1;
 		}
