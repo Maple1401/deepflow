@@ -58,6 +58,7 @@ type Aws struct {
 	vmIDToPrivateIP       map[string]string
 	vpcIDToLcuuid         map[string]string
 	instanceIDToPrimaryIP map[string]string
+	subnetIDToVPCAZLcuuid map[string][2]string
 	publicIPToVinterface  map[string]model.VInterface
 	credential            awsconfig.LoadOptionsFunc
 }
@@ -93,6 +94,11 @@ func NewAws(orgID int, domain metadbmodel.Domain, cfg cloudconfig.CloudConfig) (
 		return nil, err
 	}
 
+	regionName := config.Get("region_name").MustString()
+	if regionName == "" {
+		regionName = REGION_NAME
+	}
+
 	regionLcuuid := config.Get("region_uuid").MustString()
 	if regionLcuuid == "" {
 		regionLcuuid = common.DEFAULT_REGION
@@ -108,7 +114,7 @@ func NewAws(orgID int, domain metadbmodel.Domain, cfg cloudconfig.CloudConfig) (
 		lcuuid:           domain.Lcuuid,
 		uuidGenerate:     domain.DisplayName,
 		httpClient:       httpClient,
-		apiDefaultRegion: cfg.AWSRegionName,
+		apiDefaultRegion: regionName,
 		regionLcuuid:     regionLcuuid,
 		includeRegions:   cloudcommon.UniqRegions(config.Get("include_regions").MustString()),
 		credential:       awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(secretID, decryptSecretKey, "")),
@@ -119,6 +125,7 @@ func NewAws(orgID int, domain metadbmodel.Domain, cfg cloudconfig.CloudConfig) (
 		vmIDToPrivateIP:       map[string]string{},
 		vpcIDToLcuuid:         map[string]string{},
 		instanceIDToPrimaryIP: map[string]string{},
+		subnetIDToVPCAZLcuuid: map[string][2]string{},
 		publicIPToVinterface:  map[string]model.VInterface{},
 	}, nil
 }
@@ -194,6 +201,7 @@ func (a *Aws) GetCloudData() (model.Resource, error) {
 		a.azLcuuidMap = map[string]int{}
 		a.vpcIDToLcuuid = map[string]string{}
 		a.instanceIDToPrimaryIP = map[string]string{}
+		a.subnetIDToVPCAZLcuuid = map[string][2]string{}
 
 		vpcs, err := a.getVPCs(ec2Client)
 		if err != nil {
@@ -243,6 +251,18 @@ func (a *Aws) GetCloudData() (model.Resource, error) {
 			return model.Resource{}, err
 		}
 		resource.VMs = append(resource.VMs, vms...)
+
+		rdsInstances, err := a.getRDSInstances(region)
+		if err != nil {
+			return model.Resource{}, err
+		}
+		resource.RDSInstances = append(resource.RDSInstances, rdsInstances...)
+
+		redisInstances, err := a.getRedisInstances(region)
+		if err != nil {
+			return model.Resource{}, err
+		}
+		resource.RedisInstances = append(resource.RedisInstances, redisInstances...)
 
 		lbs, lbListeners, lbTargetServers, err := a.getLoadBalances(region)
 		if err != nil {

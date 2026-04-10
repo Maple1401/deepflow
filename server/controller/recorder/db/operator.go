@@ -17,19 +17,19 @@
 package db
 
 import (
+	"fmt"
 	"slices"
-	"time"
 
 	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	rcommon "github.com/deepflowio/deepflow/server/controller/recorder/common"
-	"github.com/deepflowio/deepflow/server/controller/recorder/constraint"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db/idmng"
 	"github.com/deepflowio/deepflow/server/libs/logger"
 )
 
 var log = logger.MustGetLogger("recorder.db")
 
-type Operator[MPT constraint.MetadbModelPtr[MT], MT constraint.MetadbModel] interface {
+type Operator[MPT metadbmodel.AssetResourceConstraintPtr[MT], MT metadbmodel.AssetResourceConstraint] interface {
 	// 批量插入数据
 	AddBatch(dbItems []*MT) ([]*MT, bool)
 	// 更新数据
@@ -40,7 +40,7 @@ type Operator[MPT constraint.MetadbModelPtr[MT], MT constraint.MetadbModel] inte
 	GetSoftDelete() bool
 }
 
-type OperatorBase[MPT constraint.MetadbModelPtr[MT], MT constraint.MetadbModel] struct {
+type OperatorBase[MPT metadbmodel.AssetResourceConstraintPtr[MT], MT metadbmodel.AssetResourceConstraint] struct {
 	metadata *rcommon.Metadata
 
 	resourceTypeName        string
@@ -52,7 +52,7 @@ type OperatorBase[MPT constraint.MetadbModelPtr[MT], MT constraint.MetadbModel] 
 	toLoggable bool
 }
 
-func newOperatorBase[MPT constraint.MetadbModelPtr[MT], MT constraint.MetadbModel](resourceTypeName string, softDelete, allocateID bool) OperatorBase[MPT, MT] {
+func newOperatorBase[MPT metadbmodel.AssetResourceConstraintPtr[MT], MT metadbmodel.AssetResourceConstraint](resourceTypeName string, softDelete, allocateID bool) OperatorBase[MPT, MT] {
 	return OperatorBase[MPT, MT]{
 		resourceTypeName: resourceTypeName,
 		softDelete:       softDelete,
@@ -127,6 +127,10 @@ func (o *OperatorBase[MPT, MT]) DeleteBatch(lcuuids []string) ([]*MT, bool) {
 		log.Errorf("%s (lcuuids: %v) failed: %v", rcommon.LogDelete(o.resourceTypeName), lcuuids, err.Error(), o.metadata.LogPrefixes)
 		return nil, false
 	}
+	if len(deletedItems) == 0 {
+		log.Warningf("%s (lcuuids: %v) no data need to delete", rcommon.LogDelete(o.resourceTypeName), lcuuids, o.metadata.LogPrefixes)
+		return nil, true
+	}
 	err = o.metadata.DB.Delete(&deletedItems).Error
 	if err != nil {
 		log.Errorf("%s (lcuuids: %v) failed: %v", rcommon.LogDelete(o.resourceTypeName), lcuuids, err.Error(), o.metadata.LogPrefixes)
@@ -182,50 +186,37 @@ func (o OperatorBase[MPT, MT]) dedupInDB(items []*MT, lcuuids []string, lcuuidTo
 		return nil, nil, false
 	}
 
+	// 以 lcuuid 为对比 key 检查待入库数据与 db 数据是否重复,日志记录 db 重复数据，删除 db 重复数据后插入待入库数据。
+	// 若资源有手动分配 ID 需求，则复用 ID，将 db 数据的已分配 ID 赋值给待入库数据，保持 ID 分配池的正确性；若无，则不考虑 ID 复用。
+	// 若资源支持软删，有 db 重复数据为正常现象，日志记录等级为 INFO；反之，日志记录等级为 ERROR
 	if len(dupItems) != 0 {
-		if o.softDelete {
-			dupLcuuids := []string{}
-			dupItemIDs := []int{}
-			for _, dupItem := range dupItems {
-				lcuuid := MPT(dupItem).GetLcuuid()
-				id := MPT(dupItem).GetID()
-				item, exists := lcuuidToItem[lcuuid]
-				if !exists {
-					continue
-				}
-				if !slices.Contains(dupLcuuids, lcuuid) {
-					dupLcuuids = append(dupLcuuids, lcuuid)
-					dupItemIDs = append(dupItemIDs, id)
-				}
+		dupLcuuids := []string{}
+		dupItemIDs := []int{}
+		for _, dupItem := range dupItems {
+			lcuuid := MPT(dupItem).GetLcuuid()
+			id := MPT(dupItem).GetID()
+			item, exists := lcuuidToItem[lcuuid]
+			if !exists {
+				continue
+			}
+			if !slices.Contains(dupLcuuids, lcuuid) {
+				dupLcuuids = append(dupLcuuids, lcuuid)
+				dupItemIDs = append(dupItemIDs, id)
+			}
+			if o.allocateID {
 				MPT(item).SetID(id)
-				MPT(item).SetUpdatedAt(time.Now())
 			}
-			log.Infof("%s data is duplicated with db data (lcuuids: %v, ids: %v, one detail: %+v), will learn again", o.resourceTypeName, dupLcuuids, dupItemIDs, dupItems[0], o.metadata.LogPrefixes)
-			err = o.metadata.DB.Unscoped().Delete(&dupItems).Error
-			if err != nil {
-				log.Errorf("%s duplicated data failed: %+v", rcommon.LogDelete(o.resourceTypeName), err.Error(), o.metadata.LogPrefixes)
-				return items, lcuuids, false
-			}
+		}
+		msg := fmt.Sprintf("%s data is duplicated with db data (lcuuids: %v, ids: %v, count: %d, one detail: %+v), will learn again", o.resourceTypeName, dupLcuuids, dupItemIDs, len(dupItems), dupItems[0])
+		if o.softDelete {
+			log.Info(msg, o.metadata.LogPrefixes)
 		} else {
-			dupLcuuids := []string{}
-			for _, dupItem := range dupItems {
-				lcuuid := MPT(dupItem).GetLcuuid()
-				if !slices.Contains(dupLcuuids, lcuuid) {
-					dupLcuuids = append(dupLcuuids, lcuuid)
-				}
-			}
-			log.Errorf("%s data is duplicated with db data (lcuuids: %v, one detail: %+v)", o.resourceTypeName, dupLcuuids, dupItems[0], o.metadata.LogPrefixes)
-
-			count := len(lcuuids) - len(dupLcuuids)
-			dedupItems := make([]*MT, 0, count)
-			dedupLcuuids := make([]string, 0, count)
-			for lcuuid, dbItem := range lcuuidToItem {
-				if !slices.Contains(dupLcuuids, lcuuid) {
-					dedupItems = append(dedupItems, dbItem)
-					dedupLcuuids = append(dedupLcuuids, lcuuid)
-				}
-			}
-			return dedupItems, dedupLcuuids, true
+			log.Error(msg, o.metadata.LogPrefixes)
+		}
+		err = o.metadata.DB.Unscoped().Delete(&dupItems).Error
+		if err != nil {
+			log.Errorf("%s duplicated data failed: %+v", rcommon.LogDelete(o.resourceTypeName), err.Error(), o.metadata.LogPrefixes)
+			return items, lcuuids, false
 		}
 	}
 	return items, lcuuids, true

@@ -21,23 +21,37 @@ import (
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 )
 
+// ─── AlertEventBlock (new AlertEvent proto columns) ───────────────────────────
+
 type AlertEventBlock struct {
-	ColTime            proto.ColDateTime
-	ColId              proto.ColUInt64
-	ColPolicyId        proto.ColUInt32
-	ColPolicyType      proto.ColUInt8
-	ColAlertPolicy     *proto.ColLowCardinality[string]
-	ColMetricValue     proto.ColFloat64
-	ColEventLevel      proto.ColUInt8
-	ColTargetTags      proto.ColStr
-	ColTagStringNames  *proto.ColArr[string]
-	ColTagStringValues *proto.ColArr[string]
-	ColTagIntNames     *proto.ColArr[string]
-	ColTagIntValues    *proto.ColArr[int64]
-	ColTargetUid       proto.ColStr
-	ColQueryRegion     *proto.ColLowCardinality[string]
-	ColTeamId          proto.ColUInt16
-	ColUserId          proto.ColUInt32
+	ColTime             proto.ColDateTime
+	ColId               proto.ColUInt64
+	ColPolicyId         proto.ColUInt32
+	ColPolicyType       proto.ColUInt8
+	ColAlertPolicy      *proto.ColLowCardinality[string]
+	ColMetricValue      proto.ColFloat64
+	ColMetricValueStr   proto.ColStr
+	ColEventLevel       proto.ColUInt8
+	ColTargetTags       proto.ColStr
+	ColTagStringNames   *proto.ColArr[string]
+	ColTagStringValues  *proto.ColArr[string]
+	ColTagIntNames      *proto.ColArr[string]
+	ColTagIntValues     *proto.ColArr[int64]
+	ColTriggerThreshold *proto.ColLowCardinality[string]
+	ColMetricUnit       *proto.ColLowCardinality[string]
+	ColCustomTagNames   *proto.ColArr[string]
+	ColCustomTagValues  *proto.ColArr[string]
+	ColTargetUid        proto.ColStr
+	ColQueryRegion      *proto.ColLowCardinality[string]
+	ColTeamId           proto.ColUInt16
+	ColUserId           proto.ColUInt32
+	// New columns
+	ColEventId   proto.ColStr
+	ColStartTime proto.ColDateTime
+	ColEndTime   proto.ColDateTime
+	ColDuration  proto.ColUInt32
+	ColState     proto.ColUInt32
+	ColAlertTime proto.ColUInt64
 }
 
 func (b *AlertEventBlock) Reset() {
@@ -47,16 +61,27 @@ func (b *AlertEventBlock) Reset() {
 	b.ColPolicyType.Reset()
 	b.ColAlertPolicy.Reset()
 	b.ColMetricValue.Reset()
+	b.ColMetricValueStr.Reset()
 	b.ColEventLevel.Reset()
 	b.ColTargetTags.Reset()
 	b.ColTagStringNames.Reset()
 	b.ColTagStringValues.Reset()
 	b.ColTagIntNames.Reset()
 	b.ColTagIntValues.Reset()
+	b.ColTriggerThreshold.Reset()
+	b.ColMetricUnit.Reset()
+	b.ColCustomTagNames.Reset()
+	b.ColCustomTagValues.Reset()
 	b.ColTargetUid.Reset()
 	b.ColQueryRegion.Reset()
 	b.ColTeamId.Reset()
 	b.ColUserId.Reset()
+	b.ColEventId.Reset()
+	b.ColStartTime.Reset()
+	b.ColEndTime.Reset()
+	b.ColDuration.Reset()
+	b.ColState.Reset()
+	b.ColAlertTime.Reset()
 }
 
 func (b *AlertEventBlock) ToInput(input proto.Input) proto.Input {
@@ -67,27 +92,42 @@ func (b *AlertEventBlock) ToInput(input proto.Input) proto.Input {
 		proto.InputColumn{Name: ckdb.COLUMN_POLICY_TYPE, Data: &b.ColPolicyType},
 		proto.InputColumn{Name: ckdb.COLUMN_ALERT_POLICY, Data: b.ColAlertPolicy},
 		proto.InputColumn{Name: ckdb.COLUMN_METRIC_VALUE, Data: &b.ColMetricValue},
+		proto.InputColumn{Name: ckdb.COLUMN_METRIC_VALUE_STR, Data: &b.ColMetricValueStr},
 		proto.InputColumn{Name: ckdb.COLUMN_EVENT_LEVEL, Data: &b.ColEventLevel},
 		proto.InputColumn{Name: ckdb.COLUMN_TARGET_TAGS, Data: &b.ColTargetTags},
 		proto.InputColumn{Name: ckdb.COLUMN_TAG_STRING_NAMES, Data: b.ColTagStringNames},
 		proto.InputColumn{Name: ckdb.COLUMN_TAG_STRING_VALUES, Data: b.ColTagStringValues},
 		proto.InputColumn{Name: ckdb.COLUMN_TAG_INT_NAMES, Data: b.ColTagIntNames},
 		proto.InputColumn{Name: ckdb.COLUMN_TAG_INT_VALUES, Data: b.ColTagIntValues},
+		proto.InputColumn{Name: ckdb.COLUMN_TRIGGER_THRESHOLD, Data: b.ColTriggerThreshold},
+		proto.InputColumn{Name: ckdb.COLUMN_METRIC_UNIT, Data: b.ColMetricUnit},
+		proto.InputColumn{Name: ckdb.COLUMN_CUSTOM_TAG_NAMES, Data: b.ColCustomTagNames},
+		proto.InputColumn{Name: ckdb.COLUMN_CUSTOM_TAG_VALUES, Data: b.ColCustomTagValues},
 		proto.InputColumn{Name: ckdb.COLUMN__TARGET_UID, Data: &b.ColTargetUid},
 		proto.InputColumn{Name: ckdb.COLUMN__QUERY_REGION, Data: b.ColQueryRegion},
 		proto.InputColumn{Name: ckdb.COLUMN_TEAM_ID, Data: &b.ColTeamId},
 		proto.InputColumn{Name: ckdb.COLUMN_USER_ID, Data: &b.ColUserId},
+		proto.InputColumn{Name: ckdb.COLUMN_EVENT_ID, Data: &b.ColEventId},
+		proto.InputColumn{Name: ckdb.COLUMN_START_TIME, Data: &b.ColStartTime},
+		proto.InputColumn{Name: ckdb.COLUMN_END_TIME, Data: &b.ColEndTime},
+		proto.InputColumn{Name: ckdb.COLUMN_DURATION, Data: &b.ColDuration},
+		proto.InputColumn{Name: ckdb.COLUMN_STATE, Data: &b.ColState},
+		proto.InputColumn{Name: ckdb.COLUMN_ALERT_TIME, Data: &b.ColAlertTime},
 	)
 }
 
 func (n *AlertEventStore) NewColumnBlock() ckdb.CKColumnBlock {
 	return &AlertEventBlock{
-		ColAlertPolicy:     new(proto.ColStr).LowCardinality(),
-		ColQueryRegion:     new(proto.ColStr).LowCardinality(),
-		ColTagStringNames:  new(proto.ColStr).LowCardinality().Array(),
-		ColTagStringValues: new(proto.ColStr).Array(),
-		ColTagIntNames:     new(proto.ColStr).LowCardinality().Array(),
-		ColTagIntValues:    new(proto.ColInt64).Array(),
+		ColAlertPolicy:      new(proto.ColStr).LowCardinality(),
+		ColQueryRegion:      new(proto.ColStr).LowCardinality(),
+		ColTagStringNames:   new(proto.ColStr).LowCardinality().Array(),
+		ColTagStringValues:  new(proto.ColStr).Array(),
+		ColTagIntNames:      new(proto.ColStr).LowCardinality().Array(),
+		ColTagIntValues:     new(proto.ColInt64).Array(),
+		ColCustomTagNames:   new(proto.ColStr).LowCardinality().Array(),
+		ColCustomTagValues:  new(proto.ColStr).Array(),
+		ColTriggerThreshold: new(proto.ColStr).LowCardinality(),
+		ColMetricUnit:       new(proto.ColStr).LowCardinality(),
 	}
 }
 
@@ -99,14 +139,145 @@ func (n *AlertEventStore) AppendToColumnBlock(b ckdb.CKColumnBlock) {
 	block.ColPolicyType.Append(n.PolicyType)
 	block.ColAlertPolicy.Append(n.AlertPolicy)
 	block.ColMetricValue.Append(n.MetricValue)
+	block.ColMetricValueStr.Append(n.MetricValueStr)
 	block.ColEventLevel.Append(n.EventLevel)
 	block.ColTargetTags.Append(n.TargetTags)
 	block.ColTagStringNames.Append(n.TagStrKeys)
 	block.ColTagStringValues.Append(n.TagStrValues)
 	block.ColTagIntNames.Append(n.TagIntKeys)
 	block.ColTagIntValues.Append(n.TagIntValues)
+	block.ColTriggerThreshold.Append(n.TriggerThreshold)
+	block.ColMetricUnit.Append(n.MetricUnit)
+	block.ColCustomTagNames.Append(n.CustomTagKeys)
+	block.ColCustomTagValues.Append(n.CustomTagValues)
 	block.ColTargetUid.Append(n.XTargetUid)
 	block.ColQueryRegion.Append(n.XQueryRegion)
 	block.ColTeamId.Append(n.TeamID)
 	block.ColUserId.Append(n.UserId)
+	block.ColEventId.Append(n.EventId)
+	ckdb.AppendColDateTime(&block.ColStartTime, n.StartTime)
+	ckdb.AppendColDateTime(&block.ColEndTime, n.EndTime)
+	block.ColDuration.Append(n.Duration)
+	block.ColState.Append(n.State)
+	block.ColAlertTime.Append(n.AlertTime)
+}
+
+// ─── AlertRecordBlock (AlertRecord proto columns) ─────────────────────────────
+
+type AlertRecordBlock struct {
+	ColTime             proto.ColDateTime
+	ColId               proto.ColUInt64
+	ColPolicyId         proto.ColUInt32
+	ColPolicyType       proto.ColUInt8
+	ColAlertPolicy      *proto.ColLowCardinality[string]
+	ColMetricValue      proto.ColFloat64
+	ColMetricValueStr   proto.ColStr
+	ColEventLevel       proto.ColUInt8
+	ColTargetTags       proto.ColStr
+	ColTagStringNames   *proto.ColArr[string]
+	ColTagStringValues  *proto.ColArr[string]
+	ColTagIntNames      *proto.ColArr[string]
+	ColTagIntValues     *proto.ColArr[int64]
+	ColTriggerThreshold *proto.ColLowCardinality[string]
+	ColMetricUnit       *proto.ColLowCardinality[string]
+	ColCustomTagNames   *proto.ColArr[string]
+	ColCustomTagValues  *proto.ColArr[string]
+	ColTargetUid        proto.ColStr
+	ColQueryRegion      *proto.ColLowCardinality[string]
+	ColTeamId           proto.ColUInt16
+	ColUserId           proto.ColUInt32
+	ColEventId          proto.ColStr
+}
+
+func (b *AlertRecordBlock) Reset() {
+	b.ColTime.Reset()
+	b.ColId.Reset()
+	b.ColPolicyId.Reset()
+	b.ColPolicyType.Reset()
+	b.ColAlertPolicy.Reset()
+	b.ColMetricValue.Reset()
+	b.ColMetricValueStr.Reset()
+	b.ColEventLevel.Reset()
+	b.ColTargetTags.Reset()
+	b.ColTagStringNames.Reset()
+	b.ColTagStringValues.Reset()
+	b.ColTagIntNames.Reset()
+	b.ColTagIntValues.Reset()
+	b.ColTriggerThreshold.Reset()
+	b.ColMetricUnit.Reset()
+	b.ColCustomTagNames.Reset()
+	b.ColCustomTagValues.Reset()
+	b.ColTargetUid.Reset()
+	b.ColQueryRegion.Reset()
+	b.ColTeamId.Reset()
+	b.ColUserId.Reset()
+	b.ColEventId.Reset()
+}
+
+func (b *AlertRecordBlock) ToInput(input proto.Input) proto.Input {
+	return append(input,
+		proto.InputColumn{Name: ckdb.COLUMN_TIME, Data: &b.ColTime},
+		proto.InputColumn{Name: ckdb.COLUMN__ID, Data: &b.ColId},
+		proto.InputColumn{Name: ckdb.COLUMN_POLICY_ID, Data: &b.ColPolicyId},
+		proto.InputColumn{Name: ckdb.COLUMN_POLICY_TYPE, Data: &b.ColPolicyType},
+		proto.InputColumn{Name: ckdb.COLUMN_ALERT_POLICY, Data: b.ColAlertPolicy},
+		proto.InputColumn{Name: ckdb.COLUMN_METRIC_VALUE, Data: &b.ColMetricValue},
+		proto.InputColumn{Name: ckdb.COLUMN_METRIC_VALUE_STR, Data: &b.ColMetricValueStr},
+		proto.InputColumn{Name: ckdb.COLUMN_EVENT_LEVEL, Data: &b.ColEventLevel},
+		proto.InputColumn{Name: ckdb.COLUMN_TARGET_TAGS, Data: &b.ColTargetTags},
+		proto.InputColumn{Name: ckdb.COLUMN_TAG_STRING_NAMES, Data: b.ColTagStringNames},
+		proto.InputColumn{Name: ckdb.COLUMN_TAG_STRING_VALUES, Data: b.ColTagStringValues},
+		proto.InputColumn{Name: ckdb.COLUMN_TAG_INT_NAMES, Data: b.ColTagIntNames},
+		proto.InputColumn{Name: ckdb.COLUMN_TAG_INT_VALUES, Data: b.ColTagIntValues},
+		proto.InputColumn{Name: ckdb.COLUMN_TRIGGER_THRESHOLD, Data: b.ColTriggerThreshold},
+		proto.InputColumn{Name: ckdb.COLUMN_METRIC_UNIT, Data: b.ColMetricUnit},
+		proto.InputColumn{Name: ckdb.COLUMN_CUSTOM_TAG_NAMES, Data: b.ColCustomTagNames},
+		proto.InputColumn{Name: ckdb.COLUMN_CUSTOM_TAG_VALUES, Data: b.ColCustomTagValues},
+		proto.InputColumn{Name: ckdb.COLUMN__TARGET_UID, Data: &b.ColTargetUid},
+		proto.InputColumn{Name: ckdb.COLUMN__QUERY_REGION, Data: b.ColQueryRegion},
+		proto.InputColumn{Name: ckdb.COLUMN_TEAM_ID, Data: &b.ColTeamId},
+		proto.InputColumn{Name: ckdb.COLUMN_USER_ID, Data: &b.ColUserId},
+		proto.InputColumn{Name: ckdb.COLUMN_EVENT_ID, Data: &b.ColEventId},
+	)
+}
+
+func (n *AlertRecordStore) NewColumnBlock() ckdb.CKColumnBlock {
+	return &AlertRecordBlock{
+		ColAlertPolicy:      new(proto.ColStr).LowCardinality(),
+		ColQueryRegion:      new(proto.ColStr).LowCardinality(),
+		ColTagStringNames:   new(proto.ColStr).LowCardinality().Array(),
+		ColTagStringValues:  new(proto.ColStr).Array(),
+		ColTagIntNames:      new(proto.ColStr).LowCardinality().Array(),
+		ColTagIntValues:     new(proto.ColInt64).Array(),
+		ColCustomTagNames:   new(proto.ColStr).LowCardinality().Array(),
+		ColCustomTagValues:  new(proto.ColStr).Array(),
+		ColTriggerThreshold: new(proto.ColStr).LowCardinality(),
+		ColMetricUnit:       new(proto.ColStr).LowCardinality(),
+	}
+}
+
+func (n *AlertRecordStore) AppendToColumnBlock(b ckdb.CKColumnBlock) {
+	block := b.(*AlertRecordBlock)
+	ckdb.AppendColDateTime(&block.ColTime, n.Time)
+	block.ColId.Append(n._id)
+	block.ColPolicyId.Append(n.PolicyId)
+	block.ColPolicyType.Append(n.PolicyType)
+	block.ColAlertPolicy.Append(n.AlertPolicy)
+	block.ColMetricValue.Append(n.MetricValue)
+	block.ColMetricValueStr.Append(n.MetricValueStr)
+	block.ColEventLevel.Append(n.EventLevel)
+	block.ColTargetTags.Append(n.TargetTags)
+	block.ColTagStringNames.Append(n.TagStrKeys)
+	block.ColTagStringValues.Append(n.TagStrValues)
+	block.ColTagIntNames.Append(n.TagIntKeys)
+	block.ColTagIntValues.Append(n.TagIntValues)
+	block.ColTriggerThreshold.Append(n.TriggerThreshold)
+	block.ColMetricUnit.Append(n.MetricUnit)
+	block.ColCustomTagNames.Append(n.CustomTagKeys)
+	block.ColCustomTagValues.Append(n.CustomTagValues)
+	block.ColTargetUid.Append(n.XTargetUid)
+	block.ColQueryRegion.Append(n.XQueryRegion)
+	block.ColTeamId.Append(n.TeamID)
+	block.ColUserId.Append(n.UserId)
+	block.ColEventId.Append(n.EventId)
 }

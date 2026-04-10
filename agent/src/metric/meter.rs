@@ -358,6 +358,9 @@ pub struct Anomaly {
     pub l7_client_error: u32,
     pub l7_server_error: u32,
     pub l7_timeout: u32,
+
+    pub client_ooo: u64,
+    pub server_ooo: u64,
 }
 
 impl Anomaly {
@@ -379,6 +382,8 @@ impl Anomaly {
         self.l7_client_error += other.l7_client_error;
         self.l7_server_error += other.l7_server_error;
         self.l7_timeout += other.l7_timeout;
+        self.client_ooo += other.client_ooo;
+        self.server_ooo += other.server_ooo;
     }
 }
 
@@ -402,6 +407,9 @@ impl From<Anomaly> for metric::Anomaly {
             l7_client_error: m.l7_client_error,
             l7_server_error: m.l7_server_error,
             l7_timeout: m.l7_timeout,
+
+            client_ooo: m.client_ooo,
+            server_ooo: m.server_ooo,
         }
     }
 }

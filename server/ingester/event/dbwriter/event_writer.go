@@ -73,6 +73,12 @@ func (w *EventWriter) WriteAlertEvent(e *AlertEventStore) {
 	w.ckWriter.Put(e)
 }
 
+func (w *EventWriter) WriteAlertRecord(e *AlertRecordStore) {
+	e.GenerateNewFlowTags(w.flowTagWriter.Cache)
+	w.flowTagWriter.WriteFieldsAndFieldValuesInCache()
+	w.ckWriter.Put(e)
+}
+
 func NewEventWriter(eventType common.EventType, decoderIndex int, config *config.Config) (*EventWriter, error) {
 	w := &EventWriter{
 		ckdbAddrs:         config.Base.CKDB.ActualAddrs,
@@ -86,9 +92,9 @@ func NewEventWriter(eventType common.EventType, decoderIndex int, config *config
 	case common.RESOURCE_EVENT:
 		w.ttl = config.EventTTL
 		w.writerConfig = config.CKWriterConfig
-	case common.PERF_EVENT:
-		w.ttl = config.PerfEventTTL
-		w.writerConfig = config.PerfCKWriterConfig
+	case common.FILE_EVENT:
+		w.ttl = config.FileEventTTL
+		w.writerConfig = config.FileEventCKWriterConfig
 	case common.K8S_EVENT:
 		w.ttl = config.EventTTL
 		w.writerConfig = config.K8sCKWriterConfig

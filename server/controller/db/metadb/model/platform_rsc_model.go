@@ -134,21 +134,21 @@ type Domain struct {
 // TODO 最终可以与cloud模块命名统一，Domain -> DomainLcuuid
 
 type SubDomain struct {
-	Base         `gorm:"embedded" mapstructure:",squash"`
-	OperatedTime `gorm:"embedded" mapstructure:",squash"`
-	TeamID       int        `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID" mapstructure:"TEAM_ID"`
-	UserID       int        `gorm:"column:user_id;type:int;default:1" json:"USER_ID" mapstructure:"USER_ID"`
-	SyncedAt     *time.Time `gorm:"column:synced_at" json:"SYNCED_AT" mapstructure:"SYNCED_AT"`
-	Domain       string     `gorm:"column:domain;type:char(64);default:''" json:"DOMAIN" mapstructure:"DOMAIN"`
-	Name         string     `gorm:"column:name;type:varchar(64);default:''" json:"NAME" mapstructure:"NAME"`
-	DisplayName  string     `gorm:"column:display_name;type:varchar(64);default:''" json:"DISPLAY_NAME" mapstructure:"DISPLAY_NAME"`
-	CreateMethod int        `gorm:"column:create_method;type:int;default:0" json:"CREATE_METHOD" mapstructure:"CREATE_METHOD"` // 0.learning 1.user_defined
-	ClusterID    string     `gorm:"column:cluster_id;type:char(64);default:''" json:"CLUSTER_ID" mapstructure:"CLUSTER_ID"`
-	Config       string     `gorm:"column:config;type:text;default:''" json:"CONFIG" mapstructure:"CONFIG"`
-	ErrorMsg     string     `gorm:"column:error_msg;type:text;default:''" json:"ERROR_MSG" mapstructure:"ERROR_MSG"`
-	Enabled      int        `gorm:"column:enabled;type:int;not null;default:1" json:"ENABLED" mapstructure:"ENABLED"` // 0.false 1.true
-	State        int        `gorm:"column:state;type:int;not null;default:1" json:"STATE" mapstructure:"STATE"`       // 1.normal 2.deleting 3.exception 4.warning 5.no_license
-	Exceptions   int64      `gorm:"column:exceptions;type:int unsigned;default:0" json:"EXCEPTIONS"`
+	Base           `gorm:"embedded" mapstructure:",squash"`
+	SoftDeleteBase `gorm:"embedded" mapstructure:",squash"`
+	TeamID         int        `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID" mapstructure:"TEAM_ID"`
+	UserID         int        `gorm:"column:user_id;type:int;default:1" json:"USER_ID" mapstructure:"USER_ID"`
+	SyncedAt       *time.Time `gorm:"column:synced_at" json:"SYNCED_AT" mapstructure:"SYNCED_AT"`
+	Domain         string     `gorm:"column:domain;type:char(64);default:''" json:"DOMAIN" mapstructure:"DOMAIN"`
+	Name           string     `gorm:"column:name;type:varchar(64);default:''" json:"NAME" mapstructure:"NAME"`
+	DisplayName    string     `gorm:"column:display_name;type:varchar(64);default:''" json:"DISPLAY_NAME" mapstructure:"DISPLAY_NAME"`
+	CreateMethod   int        `gorm:"column:create_method;type:int;default:0" json:"CREATE_METHOD" mapstructure:"CREATE_METHOD"` // 0.learning 1.user_defined
+	ClusterID      string     `gorm:"column:cluster_id;type:char(64);default:''" json:"CLUSTER_ID" mapstructure:"CLUSTER_ID"`
+	Config         string     `gorm:"column:config;type:text;default:''" json:"CONFIG" mapstructure:"CONFIG"`
+	ErrorMsg       string     `gorm:"column:error_msg;type:text;default:''" json:"ERROR_MSG" mapstructure:"ERROR_MSG"`
+	Enabled        int        `gorm:"column:enabled;type:int;not null;default:1" json:"ENABLED" mapstructure:"ENABLED"` // 0.false 1.true
+	State          int        `gorm:"column:state;type:int;not null;default:1" json:"STATE" mapstructure:"STATE"`       // 1.normal 2.deleting 3.exception 4.warning 5.no_license
+	Exceptions     int64      `gorm:"column:exceptions;type:int unsigned;default:0" json:"EXCEPTIONS"`
 }
 
 type Region struct {
@@ -212,6 +212,7 @@ type Host struct {
 	Domain         string    `gorm:"column:domain;type:char(64);default:''" json:"DOMAIN" mapstructure:"DOMAIN"`
 	SyncedAt       time.Time `gorm:"column:synced_at;type:datetime;not null;default:CURRENT_TIMESTAMP" json:"SYNCED_AT" mapstructure:"SYNCED_AT"`
 	ExtraInfo      string    `gorm:"column:extra_info;type:text;default:''" json:"EXTRA_INFO" mapstructure:"EXTRA_INFO"`
+	UID            string    `gorm:"column:uid;type:char(64);default:''" json:"UID" mapstructure:"UID"`
 }
 
 func (Host) TableName() string {
@@ -275,6 +276,7 @@ type VPC struct {
 	Name           string `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
 	CreateMethod   int    `gorm:"column:create_method;type:int;default:0" json:"CREATE_METHOD" mapstructure:"CREATE_METHOD"` // 0.learning 1.user_defined
 	Label          string `gorm:"column:label;type:varchar(64);default:''" json:"LABEL" mapstructure:"LABEL"`
+	Owner          string `gorm:"column:owner;type:varchar(64);default:''" json:"OWNER" mapstructure:"OWNER"`
 	Alias          string `gorm:"column:alias;type:char(64);default:''" json:"ALIAS" mapstructure:"ALIAS"`
 	Domain         string `gorm:"column:domain;type:char(64);default:''" json:"DOMAIN" mapstructure:"DOMAIN"`
 	Region         string `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
@@ -664,11 +666,11 @@ func (p PeerConnection) GetRemoteVPCID() int {
 type CEN struct {
 	Base           `gorm:"embedded" mapstructure:",squash"`
 	SoftDeleteBase `gorm:"embedded" mapstructure:",squash"`
-	Name           string `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
-	Label          string `gorm:"column:label;type:char(64);default:''" json:"LABEL" mapstructure:"LABEL"`
-	Alias          string `gorm:"column:alias;type:char(64);default:''" json:"ALIAS" mapstructure:"ALIAS"`
-	VPCIDs         string `gorm:"column:epc_ids;type:text;default:''" json:"EPC_IDS" mapstructure:"EPC_IDS"` // separated by ,
-	Domain         string `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	Name           string          `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
+	Label          string          `gorm:"column:label;type:char(64);default:''" json:"LABEL" mapstructure:"LABEL"`
+	Alias          string          `gorm:"column:alias;type:char(64);default:''" json:"ALIAS" mapstructure:"ALIAS"`
+	VPCIDs         AutoSplitedInts `gorm:"column:epc_ids;type:text;default:''" json:"EPC_IDS" mapstructure:"EPC_IDS"` // separated by ,
+	Domain         string          `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
 }
 
 func (CEN) TableName() string {
@@ -759,6 +761,7 @@ type PodCluster struct {
 	Region         string `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
 	SubDomain      string `gorm:"column:sub_domain;type:char(64);default:''" json:"SUB_DOMAIN" mapstructure:"SUB_DOMAIN"`
 	Domain         string `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	UID            string `gorm:"column:uid;type:char(64);default:''" json:"UID" mapstructure:"UID"`
 }
 
 func (p PodCluster) GetDomainLcuuid() string {
@@ -780,6 +783,7 @@ type PodNamespace struct {
 	Domain           string            `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
 	LearnedCloudTags map[string]string `gorm:"column:learned_cloud_tags;type:text;default:'';serializer:json" json:"LEARNED_CLOUD_TAGS" mapstructure:"LEARNED_CLOUD_TAGS"`
 	CustomCloudTags  map[string]string `gorm:"column:custom_cloud_tags;type:text;default:'';serializer:json" json:"CUSTOM_CLOUD_TAGS" mapstructure:"CUSTOM_CLOUD_TAGS"`
+	UID              string            `gorm:"column:uid;type:char(64);default:''" json:"UID" mapstructure:"UID"`
 }
 
 func (p PodNamespace) GetDomainLcuuid() string {
@@ -865,26 +869,27 @@ type PodIngressRuleBackend struct {
 type PodService struct {
 	Base             `gorm:"embedded" mapstructure:",squash"`
 	SoftDeleteBase   `gorm:"embedded" mapstructure:",squash"`
-	Name             string `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
-	Label            string `gorm:"column:label;type:text;default:''" json:"LABEL" mapstructure:"LABEL"`                // separated by ,
-	Annotation       string `gorm:"column:annotation;type:text;default:''" json:"ANNOTATION" mapstructure:"ANNOTATION"` // separated by ,
-	Alias            string `gorm:"column:alias;type:char(64);default:''" json:"ALIAS" mapstructure:"ALIAS"`
-	Type             int    `gorm:"column:type;type:int;default:null" json:"TYPE" mapstructure:"TYPE"`                     // 1: ClusterIP 2: NodePort 3: LoadBalancer
-	Selector         string `gorm:"column:selector;type:text;default:''" json:"SELECTOR" mapstructure:"SELECTOR"`          // separated by ,
-	ExternalIP       string `gorm:"column:external_ip;type:text;default:''" json:"EXTERNAL_IP" mapstructure:"EXTERNAL_IP"` // separated by ,
-	ServiceClusterIP string `gorm:"column:service_cluster_ip;type:char(64);default:''" json:"SERVICE_CLUSTER_IP" mapstructure:"SERVICE_CLUSTER_IP"`
-	Metadata         string `gorm:"column:metadata;type:text;default:''" json:"METADATA" mapstructure:"-"`
-	MetadataHash     string `gorm:"column:metadata_hash;type:char(64);default:''" json:"METADATA_HASH" mapstructure:"-"`
-	Spec             string `gorm:"column:spec;type:text;default:''" json:"SPEC" mapstructure:"-"`
-	SpecHash         string `gorm:"column:spec_hash;type:char(64);default:''" json:"SPEC_HASH" mapstructure:"-"`
-	PodIngressID     int    `gorm:"column:pod_ingress_id;type:int;default:null" json:"POD_INGRESS_ID" mapstructure:"POD_INGRESS_ID"`
-	PodNamespaceID   int    `gorm:"column:pod_namespace_id;type:int;default:null" json:"POD_NAMESPACE_ID" mapstructure:"POD_NAMESPACE_ID"`
-	PodClusterID     int    `gorm:"column:pod_cluster_id;type:int;default:null" json:"POD_CLUSTER_ID" mapstructure:"POD_CLUSTER_ID"`
-	VPCID            int    `gorm:"column:epc_id;type:int;default:null" json:"VPC_ID" mapstructure:"EPC_ID"`
-	AZ               string `gorm:"column:az;type:char(64);default:''" json:"AZ" mapstructure:"AZ"`
-	Region           string `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
-	SubDomain        string `gorm:"column:sub_domain;type:char(64);default:''" json:"SUB_DOMAIN" mapstructure:"SUB_DOMAIN"`
-	Domain           string `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	Name             string              `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
+	Label            string              `gorm:"column:label;type:text;default:''" json:"LABEL" mapstructure:"LABEL"`                // separated by ,
+	Annotation       string              `gorm:"column:annotation;type:text;default:''" json:"ANNOTATION" mapstructure:"ANNOTATION"` // separated by ,
+	Alias            string              `gorm:"column:alias;type:char(64);default:''" json:"ALIAS" mapstructure:"ALIAS"`
+	Type             int                 `gorm:"column:type;type:int;default:null" json:"TYPE" mapstructure:"TYPE"`                     // 1: ClusterIP 2: NodePort 3: LoadBalancer
+	Selector         string              `gorm:"column:selector;type:text;default:''" json:"SELECTOR" mapstructure:"SELECTOR"`          // separated by ,
+	ExternalIP       string              `gorm:"column:external_ip;type:text;default:''" json:"EXTERNAL_IP" mapstructure:"EXTERNAL_IP"` // separated by ,
+	ServiceClusterIP string              `gorm:"column:service_cluster_ip;type:char(64);default:''" json:"SERVICE_CLUSTER_IP" mapstructure:"SERVICE_CLUSTER_IP"`
+	Metadata         AutoCompressedBytes `gorm:"column:compressed_metadata;type:mediumblob" json:"METADATA" mapstructure:"-"`
+	MetadataHash     string              `gorm:"column:metadata_hash;type:char(64);default:''" json:"METADATA_HASH" mapstructure:"-"`
+	Spec             AutoCompressedBytes `gorm:"column:compressed_spec;type:mediumblob" json:"SPEC" mapstructure:"-"`
+	SpecHash         string              `gorm:"column:spec_hash;type:char(64);default:''" json:"SPEC_HASH" mapstructure:"-"`
+	PodIngressID     int                 `gorm:"column:pod_ingress_id;type:int;default:null" json:"POD_INGRESS_ID" mapstructure:"POD_INGRESS_ID"`
+	PodNamespaceID   int                 `gorm:"column:pod_namespace_id;type:int;default:null" json:"POD_NAMESPACE_ID" mapstructure:"POD_NAMESPACE_ID"`
+	PodClusterID     int                 `gorm:"column:pod_cluster_id;type:int;default:null" json:"POD_CLUSTER_ID" mapstructure:"POD_CLUSTER_ID"`
+	VPCID            int                 `gorm:"column:epc_id;type:int;default:null" json:"VPC_ID" mapstructure:"EPC_ID"`
+	AZ               string              `gorm:"column:az;type:char(64);default:''" json:"AZ" mapstructure:"AZ"`
+	Region           string              `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
+	SubDomain        string              `gorm:"column:sub_domain;type:char(64);default:''" json:"SUB_DOMAIN" mapstructure:"SUB_DOMAIN"`
+	Domain           string              `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	UID              string              `gorm:"column:uid;type:char(64);default:''" json:"UID" mapstructure:"UID"`
 }
 
 func (p PodService) GetDomainLcuuid() string {
@@ -897,8 +902,8 @@ func (p PodService) GetSubDomainLcuuid() string {
 
 func (p PodService) ToLoggable() interface{} {
 	copied := p
-	copied.Metadata = "**HIDDEN**"
-	copied.Spec = "**HIDDEN**"
+	copied.Metadata = []byte("**HIDDEN**")
+	copied.Spec = []byte("**HIDDEN**")
 	return copied
 }
 
@@ -918,21 +923,23 @@ type PodServicePort struct {
 type PodGroup struct {
 	Base           `gorm:"embedded" mapstructure:",squash"`
 	SoftDeleteBase `gorm:"embedded" mapstructure:",squash"`
-	Name           string `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
-	Alias          string `gorm:"column:alias;type:char(64);default:''" json:"ALIAS" mapstructure:"ALIAS"`
-	Type           int    `gorm:"column:type;type:int;default:null" json:"TYPE" mapstructure:"TYPE"` // 1: Deployment 2: StatefulSet 3: ReplicationController
-	PodNum         int    `gorm:"column:pod_num;type:int;default:1" json:"POD_NUM" mapstructure:"POD_NUM"`
-	Label          string `gorm:"column:label;type:text;default:''" json:"LABEL" mapstructure:"LABEL"` // separated by ,
-	Metadata       string `gorm:"column:metadata;type:text;default:''" json:"METADATA" mapstructure:"-"`
-	MetadataHash   string `gorm:"column:metadata_hash;type:char(64);default:''" json:"METADATA_HASH" mapstructure:"-"`
-	Spec           string `gorm:"column:spec;type:text;default:''" json:"SPEC" mapstructure:"-"`
-	SpecHash       string `gorm:"column:spec_hash;type:char(64);default:''" json:"SPEC_HASH" mapstructure:"-"`
-	PodNamespaceID int    `gorm:"column:pod_namespace_id;type:int;default:null" json:"POD_NAMESPACE_ID" mapstructure:"POD_NAMESPACE_ID"`
-	PodClusterID   int    `gorm:"column:pod_cluster_id;type:int;default:null" json:"POD_CLUSTER_ID" mapstructure:"POD_CLUSTER_ID"`
-	AZ             string `gorm:"column:az;type:char(64);default:''" json:"AZ" mapstructure:"AZ"`
-	Region         string `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
-	SubDomain      string `gorm:"column:sub_domain;type:char(64);default:''" json:"SUB_DOMAIN" mapstructure:"SUB_DOMAIN"`
-	Domain         string `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	Name           string              `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
+	Alias          string              `gorm:"column:alias;type:char(64);default:''" json:"ALIAS" mapstructure:"ALIAS"`
+	Type           int                 `gorm:"column:type;type:int;default:null" json:"TYPE" mapstructure:"TYPE"` // 1: Deployment 2: StatefulSet 3: ReplicationController
+	PodNum         int                 `gorm:"column:pod_num;type:int;default:1" json:"POD_NUM" mapstructure:"POD_NUM"`
+	Label          string              `gorm:"column:label;type:text;default:''" json:"LABEL" mapstructure:"LABEL"`                    // separated by ,
+	NetworkMode    int                 `gorm:"column:network_mode;type:int;default:1" json:"NETWORK_MODE" mapstructure:"NETWORK_MODE"` // 1: Pod network 2: Host network
+	Metadata       AutoCompressedBytes `gorm:"column:compressed_metadata;type:mediumblob" json:"METADATA" mapstructure:"-"`
+	MetadataHash   string              `gorm:"column:metadata_hash;type:char(64);default:''" json:"METADATA_HASH" mapstructure:"-"`
+	Spec           AutoCompressedBytes `gorm:"column:compressed_spec;type:mediumblob" json:"SPEC" mapstructure:"-"`
+	SpecHash       string              `gorm:"column:spec_hash;type:char(64);default:''" json:"SPEC_HASH" mapstructure:"-"`
+	PodNamespaceID int                 `gorm:"column:pod_namespace_id;type:int;default:null" json:"POD_NAMESPACE_ID" mapstructure:"POD_NAMESPACE_ID"`
+	PodClusterID   int                 `gorm:"column:pod_cluster_id;type:int;default:null" json:"POD_CLUSTER_ID" mapstructure:"POD_CLUSTER_ID"`
+	AZ             string              `gorm:"column:az;type:char(64);default:''" json:"AZ" mapstructure:"AZ"`
+	Region         string              `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
+	SubDomain      string              `gorm:"column:sub_domain;type:char(64);default:''" json:"SUB_DOMAIN" mapstructure:"SUB_DOMAIN"`
+	Domain         string              `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	UID            string              `gorm:"column:uid;type:char(64);default:''" json:"UID" mapstructure:"UID"`
 }
 
 func (p PodGroup) GetDomainLcuuid() string {
@@ -945,8 +952,8 @@ func (p PodGroup) GetSubDomainLcuuid() string {
 
 func (p PodGroup) ToLoggable() interface{} {
 	copied := p
-	copied.Metadata = "**HIDDEN**"
-	copied.Spec = "**HIDDEN**"
+	copied.Metadata = []byte("**HIDDEN**")
+	copied.Spec = []byte("**HIDDEN**")
 	return copied
 }
 
@@ -1037,6 +1044,7 @@ type Pod struct {
 	Region          string `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
 	SubDomain       string `gorm:"column:sub_domain;type:char(64);default:''" json:"SUB_DOMAIN" mapstructure:"SUB_DOMAIN"`
 	Domain          string `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	UID             string `gorm:"column:uid;type:char(64);default:''" json:"UID" mapstructure:"UID"`
 }
 
 func (p Pod) GetDomainLcuuid() string { // TODO abstract this
@@ -1049,18 +1057,18 @@ func (p Pod) GetSubDomainLcuuid() string {
 
 type ConfigMap struct {
 	Base           `gorm:"embedded" mapstructure:",squash"`
-	SoftDeleteBase `gorm:"embedded" mapstructure:",squash"`
-	Name           string    `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
-	Data           string    `gorm:"column:data;type:text;default:''" json:"DATA" mapstructure:"-"`
-	DataHash       string    `gorm:"column:data_hash;type:char(64);default:''" json:"DATA_HASH" mapstructure:"-"`
-	PodNamespaceID int       `gorm:"column:pod_namespace_id;type:int;not null" json:"POD_NAMESPACE_ID" mapstructure:"POD_NAMESPACE_ID"`
-	PodClusterID   int       `gorm:"column:pod_cluster_id;type:int;not null" json:"POD_CLUSTER_ID" mapstructure:"POD_CLUSTER_ID"`
-	VPCID          int       `gorm:"column:epc_id;type:int;not null" json:"VPC_ID" mapstructure:"EPC_ID"`
-	AZ             string    `gorm:"column:az;type:char(64);default:''" json:"AZ" mapstructure:"AZ"`
-	Region         string    `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
-	SubDomain      string    `gorm:"column:sub_domain;type:char(64);default:''" json:"SUB_DOMAIN" mapstructure:"SUB_DOMAIN"`
-	Domain         string    `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
-	SyncedAt       time.Time `gorm:"column:synced_at" json:"SYNCED_AT" mapstructure:"SYNCED_AT"`
+	OperatedTime   `gorm:"embedded" mapstructure:",squash"`
+	Name           string              `gorm:"column:name;type:varchar(256);default:''" json:"NAME" mapstructure:"NAME"`
+	Data           AutoCompressedBytes `gorm:"column:compressed_data;type:mediumblob" json:"DATA" mapstructure:"-"`
+	DataHash       string              `gorm:"column:data_hash;type:char(64);default:''" json:"DATA_HASH" mapstructure:"-"`
+	PodNamespaceID int                 `gorm:"column:pod_namespace_id;type:int;not null" json:"POD_NAMESPACE_ID" mapstructure:"POD_NAMESPACE_ID"`
+	PodClusterID   int                 `gorm:"column:pod_cluster_id;type:int;not null" json:"POD_CLUSTER_ID" mapstructure:"POD_CLUSTER_ID"`
+	VPCID          int                 `gorm:"column:epc_id;type:int;not null" json:"VPC_ID" mapstructure:"EPC_ID"`
+	AZ             string              `gorm:"column:az;type:char(64);default:''" json:"AZ" mapstructure:"AZ"`
+	Region         string              `gorm:"column:region;type:char(64);default:''" json:"REGION" mapstructure:"REGION"`
+	SubDomain      string              `gorm:"column:sub_domain;type:char(64);default:''" json:"SUB_DOMAIN" mapstructure:"SUB_DOMAIN"`
+	Domain         string              `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	SyncedAt       time.Time           `gorm:"column:synced_at" json:"SYNCED_AT" mapstructure:"SYNCED_AT"`
 }
 
 func (p ConfigMap) GetDomainLcuuid() string {
@@ -1073,7 +1081,7 @@ func (p ConfigMap) GetSubDomainLcuuid() string {
 
 func (p ConfigMap) ToLoggable() interface{} {
 	copied := p
-	copied.Data = "**HIDDEN**"
+	copied.Data = []byte("**HIDDEN**")
 	return copied
 }
 
@@ -1095,17 +1103,18 @@ func (p PodGroupConfigMapConnection) GetSubDomainLcuuid() string {
 }
 
 type CustomService struct {
-	Base         `gorm:"embedded" mapstructure:",squash"`
-	OperatedTime `gorm:"embedded" mapstructure:",squash"`
-	Name         string `gorm:"column:name;type:varchar(128);default:''" json:"NAME" mapstructure:"NAME"`
-	Type         int    `gorm:"column:type;type:int;default:0" json:"TYPE" mapstructure:"TYPE"`
-	Resource     string `gorm:"column:resource;type:text;default:''" json:"RESOURCE" mapstructure:"RESOURCE"`
-	VPCID        int    `gorm:"column:epc_id;type:int;default:0" json:"EPC_ID" mapstructure:"EPC_ID"`
-	DomainID     int    `gorm:"column:domain_id;type:int;default:0" json:"DOMAIN_ID" mapstructure:"DOMAIN_ID"`
-	Domain       string `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
-	TeamID       int    `gorm:"column:team_id;type:int;default:0" json:"TEAM_ID" mapstructure:"TEAM_ID"`
-}
-
-func (CustomService) TableName() string {
-	return "custom_service"
+	Base             `gorm:"embedded" mapstructure:",squash"`
+	OperatedTime     `gorm:"embedded" mapstructure:",squash"`
+	Name             string          `gorm:"column:name;type:varchar(128);default:''" json:"NAME" mapstructure:"NAME"`
+	Type             int             `gorm:"column:type;type:int;default:0" json:"TYPE" mapstructure:"TYPE"`
+	MatchType        int             `gorm:"column:match_type;type:int;default:1" json:"MATCH_TYPE" mapstructure:"MATCH_TYPE"`
+	VPCIDs           AutoSplitedInts `gorm:"column:epc_ids;type:text;default:''" json:"EPC_IDS" mapstructure:"EPC_IDS"`
+	PodClusterIDs    AutoSplitedInts `gorm:"column:pod_cluster_ids;type:text;default:''" json:"POD_CLUSTER_IDS" mapstructure:"POD_CLUSTER_IDS"`
+	PodNamespaceIDs  AutoSplitedInts `gorm:"column:pod_namespace_ids;type:text;default:''" json:"POD_NAMESPACE_IDS" mapstructure:"POD_NAMESPACE_IDS"`
+	Resources        string          `gorm:"column:resources;type:text;default:''" json:"RESOURCES" mapstructure:"RESOURCES"`
+	DomainID         int             `gorm:"column:domain_id;type:int;default:0" json:"DOMAIN_ID" mapstructure:"DOMAIN_ID"`
+	Domain           string          `gorm:"column:domain;type:char(64);not null" json:"DOMAIN" mapstructure:"DOMAIN"`
+	TeamID           int             `gorm:"column:team_id;type:int;default:0" json:"TEAM_ID" mapstructure:"TEAM_ID"`
+	ServiceGroupName string          `gorm:"column:service_group_name;type:varchar(128);default:''" json:"SERVICE_GROUP_NAME" mapstructure:"SERVICE_GROUP_NAME"`
+	MatchPortEnabled int             `gorm:"column:match_port_enabled;type:tinyint(1);default:null" json:"MATCH_PORT_ENABLED" mapstructure:"MATCH_PORT_ENABLED"`
 }

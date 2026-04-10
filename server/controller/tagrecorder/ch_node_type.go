@@ -36,10 +36,11 @@ func NewChNodeType() *ChNodeType {
 }
 
 func (n *ChNodeType) generateNewData(db *metadb.DB) (map[NodeTypeKey]metadbmodel.ChNodeType, bool) {
+	log.Infof("generate data for %s", n.resourceTypeName, db.LogPrefixORGID)
 	keyToItem := make(map[NodeTypeKey]metadbmodel.ChNodeType)
 	for resourceType, nodeType := range RESOURCE_TYPE_TO_NODE_TYPE {
 		keyToItem[NodeTypeKey{ResourceType: resourceType}] = metadbmodel.ChNodeType{
-			ResourceType: resourceType,
+			ResourceType: &resourceType,
 			NodeType:     nodeType,
 		}
 	}
@@ -47,7 +48,7 @@ func (n *ChNodeType) generateNewData(db *metadb.DB) (map[NodeTypeKey]metadbmodel
 }
 
 func (n *ChNodeType) generateKey(dbItem metadbmodel.ChNodeType) NodeTypeKey {
-	return NodeTypeKey{ResourceType: dbItem.ResourceType}
+	return NodeTypeKey{ResourceType: *dbItem.ResourceType}
 }
 
 func (n *ChNodeType) generateUpdateInfo(oldItem, newItem metadbmodel.ChNodeType) (map[string]interface{}, bool) {

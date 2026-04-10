@@ -30,6 +30,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/controller/config"
 	"github.com/deepflowio/deepflow/server/controller/db/metadb"
+	"github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/db/redis"
 	"github.com/deepflowio/deepflow/server/controller/election"
 	"github.com/deepflowio/deepflow/server/controller/genesis"
@@ -59,7 +60,7 @@ var log = logging.MustGetLogger("controller")
 
 type Controller struct{}
 
-func Start(ctx context.Context, configPath, serverLogFile string, shared *servercommon.ControllerIngesterShared) {
+func Start(ctx context.Context, revision, configPath, serverLogFile string, shared *servercommon.ControllerIngesterShared) {
 	common.InitEnvData()
 	flag.Parse()
 
@@ -97,6 +98,28 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 		os.Exit(0)
 	}
 
+	if isMasterController && revision != "" {
+		var masterSysConfig model.SysConfiguration
+		err := metadb.DefaultDB.
+			Where(model.SysConfiguration{ParamName: common.SYS_CONFIG_MASTER_COMMIT_ID}).
+			Assign(model.SysConfiguration{Value: revision}).
+			FirstOrCreate(&masterSysConfig).Error
+		if err != nil {
+			log.Warningf("upsert master sys config param (%s:%s) failed: %s", common.SYS_CONFIG_MASTER_COMMIT_ID, revision, err.Error())
+		}
+	} else if !IsMasterRegion(cfg) {
+		var masterSysConfig model.SysConfiguration
+		err := metadb.DefaultDB.Where(model.SysConfiguration{ParamName: common.SYS_CONFIG_MASTER_COMMIT_ID}).First(&masterSysConfig).Error
+		if err != nil {
+			log.Warningf("get master sys config param (%s) failed: %s", common.SYS_CONFIG_MASTER_COMMIT_ID, err.Error())
+		} else {
+			if revision != masterSysConfig.Value {
+				log.Errorf("current commit id (%s) is different from master commit id (%s)", revision, masterSysConfig.Value)
+				os.Exit(0)
+			}
+		}
+	}
+
 	// 启动资源ID管理器
 	router.SetInitStageForHealthChecker("Resource ID manager init")
 	recorderResource := recorder.GetResource().Init(ctx, cfg.ManagerCfg.TaskCfg.RecorderCfg)
@@ -110,7 +133,7 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 	}
 
 	// 初始化Redis
-	if cfg.RedisCfg.Enabled && cfg.TrisolarisCfg.NodeType == "master" {
+	if cfg.RedisCfg.Enabled {
 		router.SetInitStageForHealthChecker("Redis init")
 
 		err := redis.Init(ctx, cfg.RedisCfg)
@@ -127,7 +150,7 @@ func Start(ctx context.Context, configPath, serverLogFile string, shared *server
 
 	router.SetInitStageForHealthChecker("Genesis init")
 	// 启动genesis
-	g := genesis.NewGenesis(ctx, cfg)
+	g := genesis.NewGenesis(ctx, isMasterController, cfg)
 
 	// start tagrecorder before manager to prevent recorder from publishing message when tagrecorder is not ready
 	router.SetInitStageForHealthChecker("TagRecorder init")

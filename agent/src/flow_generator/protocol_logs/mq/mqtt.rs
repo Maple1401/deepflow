@@ -29,10 +29,10 @@ use serde::{Serialize, Serializer};
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::{L7PerfStats, L7Protocol, PacketDirection},
+        flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     config::handler::LogParserConfig,
     flow_generator::{
@@ -40,10 +40,11 @@ use crate::{
         protocol_logs::{
             pb_adapter::{L7ProtocolSendLog, L7Request, L7Response},
             set_captured_byte, swap_if, value_is_default, value_is_negative, AppProtoHead,
-            L7ResponseStatus, LogMessageType,
+            L7ResponseStatus,
         },
     },
 };
+use public::l7_protocol::LogMessageType;
 use public::proto::flow_log::MqttTopic;
 
 #[derive(Serialize, Clone, Debug)]
@@ -238,9 +239,9 @@ impl From<MqttInfo> for L7ProtocolSendLog {
     fn from(f: MqttInfo) -> Self {
         let version = Some(String::from(f.get_version_str()));
         let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
 
         L7ProtocolSendLog {
@@ -267,27 +268,40 @@ impl From<MqttInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&MqttInfo> for LogCache {
+    fn from(info: &MqttInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct MqttLog {
     msg_type: LogMessageType,
     status: L7ResponseStatus,
     version: u8,
-    perf_stats: Option<L7PerfStats>,
-    last_is_on_blacklist: bool,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 impl L7ProtocolParserInterface for MqttLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
-        Self::check_protocol(payload, param)
+        if Self::check_protocol(payload, param) {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
+        self.perf_stats.clear();
 
         let mut infos = self.parse(payload, param)?;
 
@@ -299,27 +313,20 @@ impl L7ProtocolParserInterface for MqttLog {
                 if let Some(config) = param.parse_config {
                     info.set_is_on_blacklist(config);
                 }
-                if !info.is_on_blacklist && !self.last_is_on_blacklist {
-                    match param.direction {
-                        PacketDirection::ClientToServer => {
-                            self.perf_stats.as_mut().map(|p| p.inc_req());
-                        }
-                        PacketDirection::ServerToClient => {
-                            self.perf_stats.as_mut().map(|p| p.inc_resp());
+
+                if param.parse_perf {
+                    let mut perf_stat = L7PerfStats::default();
+                    if info.msg_type == LogMessageType::Response {
+                        if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                            info.endpoint = Some(endpoint.to_string());
                         }
                     }
-                    if self.msg_type != LogMessageType::Session {
-                        // FIXME due to mqtt not parse and handle packet identity correctly, the rrt is incorrect now.
-                        info.cal_rrt(param, &info.endpoint).map(|(rrt, endpoint)| {
-                            info.rrt = rrt;
-                            if info.msg_type == LogMessageType::Response {
-                                info.endpoint = endpoint;
-                            }
-                            self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-                        });
+                    if let Some(stats) = info.perf_stats(param) {
+                        info.rrt = stats.rrt_sum;
+                        perf_stat.sequential_merge(&stats);
                     }
+                    self.perf_stats.push(perf_stat);
                 }
-                self.last_is_on_blacklist = info.is_on_blacklist;
             } else {
                 unreachable!()
             }
@@ -341,14 +348,13 @@ impl L7ProtocolParserInterface for MqttLog {
 
     fn reset(&mut self) {
         let mut s = Self::default();
-        s.last_is_on_blacklist = self.last_is_on_blacklist;
         s.version = self.version;
-        s.perf_stats = self.perf_stats.take();
+        s.perf_stats = self.perf_stats();
         *self = s;
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -554,14 +560,8 @@ impl MqttLog {
             NotAuthorized = 0x5,
             */
             0 => L7ResponseStatus::Ok,
-            1 | 2 | 4 | 5 => {
-                self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                L7ResponseStatus::ClientError
-            }
-            3 => {
-                self.perf_stats.as_mut().map(|p| p.inc_req_err());
-                L7ResponseStatus::ServerError
-            }
+            1 | 2 | 4 | 5 => L7ResponseStatus::ClientError,
+            3 => L7ResponseStatus::ServerError,
             _ => L7ResponseStatus::ParseFailed,
         }
     }
@@ -913,7 +913,7 @@ mod tests {
     use crate::flow_generator::L7_RRT_CACHE_CAPACITY;
     use crate::{
         common::{flow::PacketDirection, MetaPacket},
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/mqtt";
@@ -941,7 +941,7 @@ mod tests {
             };
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -1168,7 +1168,7 @@ mod tests {
         if packets.len() < 2 {
             unreachable!()
         }
-
+        let mut perf_stat = L7PerfStats::default();
         let first_dst_port = packets[0].lookup_key.dst_port;
         for packet in packets.iter_mut() {
             if packet.lookup_key.dst_port == first_dst_port {
@@ -1182,7 +1182,7 @@ mod tests {
                     packet.get_l4_payload().unwrap(),
                     &ParseParam::new(
                         &*packet,
-                        rrt_cache.clone(),
+                        Some(rrt_cache.clone()),
                         Default::default(),
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         Default::default(),
@@ -1190,9 +1190,12 @@ mod tests {
                         true,
                     ),
                 );
+                for i in mqtt.perf_stats() {
+                    perf_stat.sequential_merge(&i);
+                }
                 mqtt.reset();
             }
         }
-        mqtt.perf_stats.unwrap()
+        perf_stat
     }
 }

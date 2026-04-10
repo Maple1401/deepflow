@@ -1,4 +1,4 @@
-0th perf data:
+1th perf data from "resources/test/flow_generator/client_request_timewait_and_syn_synack_count.pcap":
 PerfData {
     rtt_0: TimeStats {
         count: 0,
@@ -56,9 +56,12 @@ PerfData {
     synack: 0,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
-1th perf data:
+2th perf data from "resources/test/flow_generator/client_request_timewait_and_syn_synack_count.pcap":
 PerfData {
     rtt_0: TimeStats {
         count: 0,
@@ -116,9 +119,12 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
-2th perf data:
+3th perf data from "resources/test/flow_generator/client_request_timewait_and_syn_synack_count.pcap":
 PerfData {
     rtt_0: TimeStats {
         count: 1,
@@ -176,9 +182,12 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
-3th perf data:
+4th perf data from "resources/test/flow_generator/client_request_timewait_and_syn_synack_count.pcap":
 PerfData {
     rtt_0: TimeStats {
         count: 1,
@@ -236,9 +245,12 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
-4th perf data:
+5th perf data from "resources/test/flow_generator/client_request_timewait_and_syn_synack_count.pcap":
 PerfData {
     rtt_0: TimeStats {
         count: 1,
@@ -296,9 +308,12 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }
-5th perf data:
+6th perf data from "resources/test/flow_generator/client_request_timewait_and_syn_synack_count.pcap":
 PerfData {
     rtt_0: TimeStats {
         count: 1,
@@ -356,5 +371,8 @@ PerfData {
     synack: 1,
     retrans_syn: 0,
     retrans_synack: 0,
+    ooo_0: 0,
+    ooo_1: 0,
+    fin_count: 0,
     updated: true,
 }

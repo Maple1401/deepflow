@@ -46,6 +46,10 @@
 #include <regex.h>
 #include "config.h"
 
+#define CTLBIN_INSTALL_PATH  "/usr/bin/deepflow-ebpfctl"
+
+#define PERF_PAGE_DEF_SZ 4096
+
 #define STRINGIFY(x) #x
 #define UPROBE_FUNC_NAME(N) STRINGIFY(df_U_##N)
 #define URETPROBE_FUNC_NAME(N) STRINGIFY(df_UR_##N)
@@ -87,7 +91,8 @@
 #define PERF_READER_TIMEOUT_DEF 100
 #define PERF_READER_NUM_MAX	16
 
-#define DEBUG_BUFF_SIZE 4096
+// The maximum output character value of datadump
+#define DEBUG_BUFF_SIZE 163840
 typedef void (*debug_callback_t) (char *data, int len);
 
 enum perf_event_state {
@@ -278,7 +283,11 @@ struct mem_block_head {
 	void (*fn) (void *);
 } __attribute__ ((packed));
 
-typedef void (*tracer_callback_t) (void *ctx, int queue_id, void *cp_data);
+typedef int (*tracer_callback_t) (void *ctx, int queue_id, void *cp_data);
+
+enum {
+    TRACER_CALLBACK_FLAG_KEEP_DATA = 0x1,
+};
 
 struct tracer_probes_conf {
 	char *bin_file;		// only use uprobe;
@@ -616,7 +625,12 @@ int enable_ebpf_protocol(int protocol);
 int set_feature_regex(int feature, const char *pattern);
 bool is_feature_enabled(int feature);
 bool is_feature_matched(int feature, int pid, const char *path);
+bool is_feature_regex_set(int feature);
+bool php_profiler_enabled(void);
+bool v8_profiler_enabled(void);
+bool python_profiler_enabled(void);
 int bpf_tracer_init(const char *log_file, bool is_stdout);
+int set_kick_kern_nice(int32_t nice);
 int tracer_bpf_load(struct bpf_tracer *tracer);
 int tracer_probes_init(struct bpf_tracer *tracer);
 int tracer_hooks_attach(struct bpf_tracer *tracer);
@@ -742,4 +756,41 @@ struct ebpf_object *create_ebpf_object(const void *bpf_code,
  * @return 0 on success, or a non-zero value on error.
  */
 int load_ebpf_object(struct ebpf_object *obj);
+
+/**
+ * tracepoint_attach - Attach an eBPF program to a tracepoint
+ * @tp: Pointer to tracepoint descriptor
+ *
+ * This function attaches the eBPF program referenced by @tp->prog
+ * to its corresponding tracepoint and stores the returned link
+ * object into @tp->link.
+ *
+ * Return:
+ *   ETR_OK        - Attach success
+ *   ETR_EXIST     - Tracepoint already attached
+ *   ETR_INVAL     - Attach failed
+ *
+ * Notes:
+ *   - This function is NOT fully thread-safe. Caller must ensure
+ *     proper synchronization if called concurrently.
+ *   - On failure, attach_failed_count will be incremented.
+ */
+int tracepoint_attach(struct tracepoint *tp);
+
+/**
+ * tracepoint_detach - Detach an eBPF program from a tracepoint
+ * @tp: Pointer to tracepoint descriptor
+ *
+ * This function detaches the eBPF program associated with the
+ * given tracepoint and releases the link object.
+ *
+ * Return:
+ *   ETR_OK         - Detach success
+ *   ETR_NOTEXIST   - Tracepoint not attached
+ *
+ * Notes:
+ *   - Safe to call even if detach callback is NULL.
+ *   - Caller must ensure no concurrent attach/detach.
+ */
+int tracepoint_detach(struct tracepoint *tp);
 #endif /* DF_USER_TRACER_H */

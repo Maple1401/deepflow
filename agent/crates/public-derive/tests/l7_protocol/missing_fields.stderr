@@ -1,0 +1,35 @@
+error: Missing field: endpoint
+  --> tests/l7_protocol/missing_fields.rs:21:1
+   |
+21 | / #[l7_log(version.skip = "true")]
+22 | | #[l7_log(request_type.skip = "true")]
+23 | | #[l7_log(request_domain.skip = "true")]
+24 | | #[l7_log(request_resource.skip = "true")]
+...  |
+39 | |     path: String,
+40 | | }
+   | |_^
+
+error: Missing setter for field: endpoint
+  --> tests/l7_protocol/missing_fields.rs:43:1
+   |
+43 | / #[l7_log(endpoint.getter = "get_endpoint")]
+44 | | #[l7_log(version.skip = "true")]
+45 | | #[l7_log(request_type.skip = "true")]
+46 | | #[l7_log(request_domain.skip = "true")]
+...  |
+61 | | struct MissingSetter {
+62 | | }
+   | |_^
+
+error: Missing getter for field: endpoint
+  --> tests/l7_protocol/missing_fields.rs:69:1
+   |
+69 | / #[l7_log(endpoint.setter = "set_endpoint")]
+70 | | #[l7_log(version.skip = "true")]
+71 | | #[l7_log(request_type.skip = "true")]
+72 | | #[l7_log(request_domain.skip = "true")]
+...  |
+87 | | struct MissingGetter {
+88 | | }
+   | |_^

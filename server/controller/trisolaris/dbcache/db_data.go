@@ -82,6 +82,11 @@ type DBDataCache struct {
 	vtapGroups []*models.VTapGroup
 	chDevices  []*models.ChDevice
 
+	bizDecodeCustomProtocol              []*models.BizDecodeCustomProtocol
+	bizDecodeDictionaries                []*models.BizDecodeDictionary
+	bizDecodePolicies                    []*models.BizDecodePolicy
+	bizDecodePolicyAgentGroupConnections []*models.BizDecodePolicyAgentGroupConnection
+
 	config *config.Config
 
 	ORGID
@@ -295,6 +300,22 @@ func (d *DBDataCache) GetCustomServices() []*models.CustomService {
 	return d.customServices
 }
 
+func (d *DBDataCache) GetBizBizDecodeCustomProtocol() []*models.BizDecodeCustomProtocol {
+	return d.bizDecodeCustomProtocol
+}
+
+func (d *DBDataCache) GetBizDecodeDictionaries() []*models.BizDecodeDictionary {
+	return d.bizDecodeDictionaries
+}
+
+func (d *DBDataCache) GetBizDecodePolicies() []*models.BizDecodePolicy {
+	return d.bizDecodePolicies
+}
+
+func (d *DBDataCache) GetBizDecodePolicyAgentGroupConnections() []*models.BizDecodePolicyAgentGroupConnection {
+	return d.bizDecodePolicyAgentGroupConnections
+}
+
 // SetCustomServices sets the custom services for testing purposes
 func (d *DBDataCache) SetCustomServices(services []*models.CustomService) {
 	d.customServices = services
@@ -357,9 +378,9 @@ func (d *DBDataCache) GetDataCacheFromDB(db *gorm.DB) {
 
 	podFields := []string{}
 	if d.config.ExportersEnabled {
-		podFields = []string{"id", "name", "epc_id", "container_ids", "pod_cluster_id", "pod_node_id", "pod_namespace_id", "pod_group_id", "az", "domain", "label"}
+		podFields = []string{"id", "name", "epc_id", "container_ids", "pod_cluster_id", "pod_node_id", "pod_namespace_id", "pod_group_id", "az", "domain", "uid", "label"}
 	} else {
-		podFields = []string{"id", "name", "epc_id", "container_ids", "pod_cluster_id", "pod_node_id", "pod_namespace_id", "pod_group_id", "az", "domain"}
+		podFields = []string{"id", "name", "epc_id", "container_ids", "pod_cluster_id", "pod_node_id", "pod_namespace_id", "pod_group_id", "az", "domain", "uid"}
 	}
 	pods, err := dbmgr.DBMgr[models.Pod](db).GetFields(podFields)
 	if err == nil {
@@ -462,7 +483,7 @@ func (d *DBDataCache) GetDataCacheFromDB(db *gorm.DB) {
 	}
 
 	podServices, err := dbmgr.DBMgr[models.PodService](db).GetFields([]string{
-		"id", "name", "type", "service_cluster_ip", "pod_namespace_id", "pod_cluster_id", "epc_id", "az",
+		"id", "name", "type", "service_cluster_ip", "pod_namespace_id", "pod_cluster_id", "epc_id", "az", "uid",
 	})
 	if err == nil {
 		d.podServices = podServices
@@ -497,7 +518,9 @@ func (d *DBDataCache) GetDataCacheFromDB(db *gorm.DB) {
 	} else {
 		log.Error(d.Log(err.Error()))
 	}
-	podGroups, err := dbmgr.DBMgr[models.PodGroup](db).GetFields([]string{"id", "name", "type"})
+	podGroups, err := dbmgr.DBMgr[models.PodGroup](db).GetFields([]string{
+		"id", "name", "type", "uid", "network_mode", "pod_cluster_id", "pod_namespace_id",
+	})
 	if err == nil {
 		d.podGroups = podGroups
 	} else {
@@ -575,7 +598,8 @@ func (d *DBDataCache) GetDataCacheFromDB(db *gorm.DB) {
 		log.Error(d.Log(err.Error()))
 	}
 
-	acls, err := dbmgr.DBMgr[models.ACL](db).GetBatchFromState(ACL_STATE_ENABLE)
+	var acls []*models.ACL
+	err = db.Where("state = ? AND valid = ?", ACL_STATE_ENABLE, ACL_STATE_VALID).Find(&acls).Error
 	if err == nil {
 		d.acls = acls
 	} else {
@@ -656,6 +680,34 @@ func (d *DBDataCache) GetDataCacheFromDB(db *gorm.DB) {
 	err = db.Order("type asc, id asc").Find(&customServices).Error
 	if err == nil {
 		d.customServices = customServices
+	} else {
+		log.Error(d.Log(err.Error()))
+	}
+
+	bizDecodeCustomProtocol, err := dbmgr.DBMgr[models.BizDecodeCustomProtocol](db).OrderIDGets()
+	if err == nil {
+		d.bizDecodeCustomProtocol = bizDecodeCustomProtocol
+	} else {
+		log.Error(d.Log(err.Error()))
+	}
+
+	bizDecodeDictionaries, err := dbmgr.DBMgr[models.BizDecodeDictionary](db).OrderIDGets()
+	if err == nil {
+		d.bizDecodeDictionaries = bizDecodeDictionaries
+	} else {
+		log.Error(d.Log(err.Error()))
+	}
+
+	bizDecodePolicies, err := dbmgr.DBMgr[models.BizDecodePolicy](db).OrderIDGets()
+	if err == nil {
+		d.bizDecodePolicies = bizDecodePolicies
+	} else {
+		log.Error(d.Log(err.Error()))
+	}
+
+	bizDecodePolicyAgentGroupConnections, err := dbmgr.DBMgr[models.BizDecodePolicyAgentGroupConnection](db).OrderIDGets()
+	if err == nil {
+		d.bizDecodePolicyAgentGroupConnections = bizDecodePolicyAgentGroupConnections
 	} else {
 		log.Error(d.Log(err.Error()))
 	}

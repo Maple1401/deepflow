@@ -18,6 +18,7 @@ package event
 
 import (
 	ctrlrcommon "github.com/deepflowio/deepflow/server/controller/common"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/event/config"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
@@ -34,7 +35,7 @@ type PodGroup struct {
 func NewPodGroup(cfg config.Config, q *queue.OverwriteQueue) *PodGroup {
 	mng := &PodGroup{
 		newManagerComponent(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, q),
-		newCUDSubscriberComponent(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, SubTopic(pubsub.TopicResourceUpdatedFields)),
+		newCUDSubscriberComponent(ctrlrcommon.RESOURCE_TYPE_POD_GROUP_EN, SubTopic(pubsub.TopicResourceUpdatedFull)),
 		cfg,
 	}
 	mng.SetSubscriberSelf(mng)
@@ -46,7 +47,9 @@ func (p *PodGroup) OnResourceBatchAdded(md *message.Metadata, msg interface{}) {
 }
 
 func (c *PodGroup) OnResourceUpdated(md *message.Metadata, msg interface{}) {
-	fields := msg.(*message.UpdatedPodGroupFields)
+	updatedFull := msg.(*message.UpdatedPodGroup)
+	newDBItem := updatedFull.GetNewMetadbItem().(*metadbmodel.PodGroup)
+	fields := updatedFull.GetFields().(*message.UpdatedPodGroupFields)
 	if !fields.Metadata.IsDifferent() && !fields.Spec.IsDifferent() {
 		return
 	}
@@ -62,6 +65,12 @@ func (c *PodGroup) OnResourceUpdated(md *message.Metadata, msg interface{}) {
 
 		opts = []eventapi.TagFieldOption{
 			eventapi.TagPodGroupID(fields.GetID()),
+			// We need to provide pod group type information for ingester to recognize auto_service classification
+			eventapi.TagPodGroupType(uint32(ctrlrcommon.RESOURCE_POD_GROUP_TYPE_MAP[newDBItem.Type])),
+			// Provide instance type to fill in auto_instance information
+			// Pod group itself does not have an instance type, but its changes essentially affect pods,
+			// so the type is set to pod; since it affects many pods, the auto instance id remains 0
+			eventapi.TagInstanceType(uint32(ctrlrcommon.VIF_DEVICE_TYPE_POD)),
 			eventapi.TagAttributes(
 				[]string{eventapi.AttributeNameConfig, eventapi.AttributeNameConfigDiff},
 				[]string{new, diff}),

@@ -20,7 +20,6 @@ use std::sync::{Arc, Weak};
 use public::enums::IpProtocol;
 
 use crate::flow_generator::protocol_logs::pb_adapter::KeyVal;
-use crate::flow_generator::protocol_logs::LogMessageType;
 use crate::plugin::PluginCounterInfo;
 use crate::{common::l7_protocol_log::ParseParam, flow_generator::protocol_logs::L7ResponseStatus};
 
@@ -28,6 +27,7 @@ use super::{
     shared_obj::SoPluginCounter, CustomInfo, CustomInfoRequest, CustomInfoResp, CustomInfoTrace,
 };
 use public::counter::{Countable, RefCountable};
+use public::l7_protocol::LogMessageType;
 
 pub const INIT_FUNC_SYM: &'static str = "init";
 pub const CHECK_PAYLOAD_FUNC_SYM: &'static str = "on_check_payload";
@@ -76,15 +76,15 @@ impl From<(&ParseParam<'_>, &[u8])> for ParseCtx {
             ebpf_type: (p.ebpf_type as u8),
             time: p.time,
             direction: (p.direction as u8),
-            process_kname: if let Some(e) = p.ebpf_param.as_ref() {
-                e.process_kname.as_ptr()
-            } else {
-                "".as_ptr()
-            },
+            process_kname: "".as_ptr(),
             buf_size: p.buf_size as i32,
             payload_size: payload.len() as i32,
             payload: payload.as_ptr(),
         };
+        #[cfg(feature = "libtrace")]
+        if let Some(e) = p.ebpf_param.as_ref() {
+            ctx.process_kname = e.process_kname.as_ptr();
+        }
 
         match (p.ip_src, p.ip_dst) {
             (IpAddr::V4(src), IpAddr::V4(dst)) => {
@@ -131,6 +131,8 @@ pub struct Response {
     pub(super) code: i32,
     pub(super) exception: [u8; 128],
     pub(super) result: [u8; 512],
+    pub(super) req_type: [u8; 64],
+    pub(super) endpoint: [u8; 128],
 }
 impl std::fmt::Debug for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -277,6 +279,8 @@ impl TryFrom<ParseInfo> for CustomInfo {
                         code: Some(resp.code),
                         exception: c_str_to_string(&resp.exception).unwrap_or_default(),
                         result: c_str_to_string(&resp.result).unwrap_or_default(),
+                        req_type: c_str_to_string(&resp.req_type).unwrap_or_default(),
+                        endpoint: c_str_to_string(&resp.endpoint).unwrap_or_default(),
                     },
                 )
             }
@@ -307,7 +311,11 @@ impl TryFrom<ParseInfo> for CustomInfo {
             req,
             resp,
             trace: CustomInfoTrace {
-                trace_id: c_str_to_string(&v.trace.trace_id),
+                trace_ids: if let Some(trace_id) = c_str_to_string(&v.trace.trace_id) {
+                    vec![trace_id]
+                } else {
+                    Vec::new()
+                },
                 span_id: c_str_to_string(&v.trace.span_id),
                 parent_span_id: c_str_to_string(&v.trace.parent_span_id),
                 ..Default::default()
@@ -322,6 +330,7 @@ impl TryFrom<ParseInfo> for CustomInfo {
 pub struct CheckResult {
     pub proto: u8,
     pub proto_name: [u8; 16],
+    pub direction: u8,
 }
 
 pub const ACTION_ERROR: u8 = 0;

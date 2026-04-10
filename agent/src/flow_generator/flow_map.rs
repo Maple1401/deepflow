@@ -58,13 +58,11 @@ use crate::{
         endpoint::{EndpointData, EndpointDataPov, EndpointInfo, EPC_DEEPFLOW, EPC_INTERNET},
         enums::{CaptureNetworkType, EthernetType, HeaderType, IpProtocol, TcpFlags},
         flow::{
-            CloseType, Flow, FlowKey, FlowMetricsPeer, FlowPerfStats, L4Protocol, L7Protocol,
-            L7Stats, PacketDirection, SignalSource, TunnelField,
+            CloseType, Flow, FlowKey, FlowMetricsPeer, FlowPerfStats, L4Protocol, L7PerfStats,
+            L7Protocol, L7Stats, PacketDirection, SignalSource, TunnelField,
         },
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{
-            L7PerfCache, L7ProtocolBitmap, L7ProtocolParser, L7ProtocolParserInterface,
-        },
+        l7_protocol_log::{L7PerfCache, L7PerfCacheCounter, L7ProtocolBitmap},
         lookup_key::LookupKey,
         meta_packet::{MetaPacket, MetaPacketTcpHeader, ProtocolData},
         tagged_flow::TaggedFlow,
@@ -75,7 +73,6 @@ use crate::{
         handler::{CollectorConfig, LogParserConfig, PluginConfig},
         FlowConfig, ModuleConfig, UserConfig,
     },
-    flow_generator::LogMessageType,
     metric::document::TapSide,
     plugin::wasm::WasmVm,
     policy::{Policy, PolicyGetter},
@@ -88,7 +85,7 @@ use public::{
     buffer::{Allocator, BatchedBox},
     counter::{Counter, CounterType, CounterValue, RefCountable},
     debug::QueueDebugger,
-    l7_protocol::L7ProtocolEnum,
+    l7_protocol::{L7ProtocolEnum, LogMessageType},
     packet::SECONDS_IN_MINUTE,
     proto::agent::AgentType,
     queue::{self, DebugSender, Receiver},
@@ -260,8 +257,9 @@ impl FlowMap {
         stats_collector: Arc<stats::Collector>,
         from_ebpf: bool,
     ) -> Self {
+        let perf_cache = L7PerfCache::new(config.rrt_cache_capacity as usize);
         let flow_perf_counter = Arc::new(FlowPerfCounter::default());
-        let stats_counter = Arc::new(FlowMapCounter::default());
+        let stats_counter = Arc::new(FlowMapCounter::new(perf_cache.counters()));
         let packet_sequence_enabled = config.packet_sequence_flag > 0 && !from_ebpf;
         let time_window_size = {
             let max_timeout = config.flow_timeout.max;
@@ -298,6 +296,7 @@ impl FlowMap {
             app_table: AppTable::new(
                 config.l7_protocol_inference_max_fail_count,
                 config.l7_protocol_inference_ttl,
+                config.l7_protocol_inference_whitelist.clone(),
             ),
             policy_getter,
             start_time,
@@ -340,23 +339,12 @@ impl FlowMap {
                 _ => None,
             },
             last_queue_flush: Duration::ZERO,
-            perf_cache: Rc::new(RefCell::new(L7PerfCache::new(config.capacity as usize))),
+            perf_cache: Rc::new(RefCell::new(perf_cache)),
             flow_perf_counter,
             ntp_diff,
             stats_counter,
             system_time,
-            l7_protocol_checker: L7ProtocolChecker::new(
-                &config.l7_protocol_enabled_bitmap,
-                &config
-                    .l7_protocol_parse_port_bitmap
-                    .iter()
-                    .filter_map(|(name, bitmap)| {
-                        L7ProtocolParser::try_from(name.as_ref())
-                            .ok()
-                            .map(|p| (p.protocol(), bitmap.clone()))
-                    })
-                    .collect(),
-            ),
+            l7_protocol_checker: L7ProtocolChecker::from(config),
             time_key_buffer: None,
             plugin_digest: 0, // force initial load
             wasm_vm: Default::default(),
@@ -717,7 +705,7 @@ impl FlowMap {
 
         self.load_plugins(&flow_config.plugins);
 
-        let pkt_key = FlowMapKey::new(&meta_packet.lookup_key, meta_packet.tap_port);
+        let pkt_key = FlowMapKey::new(&meta_packet);
 
         let Some((mut node_map, mut time_set)) = self.node_map.take() else {
             warn!("cannot get node map and time set");
@@ -745,7 +733,7 @@ impl FlowMap {
                 });
                 let Some(index) = index else {
                     // If no exact match of FlowNode is found and close event is received, there is no need to create a new FlowNode
-                    if meta_packet.ebpf_type == EbpfType::SocketCloseEvent {
+                    if meta_packet.is_socket_closed {
                         self.node_map.replace((node_map, time_set));
                         return;
                     }
@@ -789,7 +777,7 @@ impl FlowMap {
                     (flow.start_time.as_secs() % SECONDS_IN_MINUTE) as u8;
                 // 2. 更新Flow状态，判断是否已结束
                 // 设置timestamp_key为流的相同，time_set根据key来删除
-                let flow_closed = match meta_packet.lookup_key.proto {
+                let flow_closed = match flow.flow_key.proto {
                     IpProtocol::TCP => self.update_tcp_node(config, node, meta_packet),
                     IpProtocol::UDP => self.update_udp_node(config, node, meta_packet),
                     _ => self.update_other_node(config, node, meta_packet),
@@ -826,7 +814,7 @@ impl FlowMap {
             }
             // No exact match of FlowNode was found, insert new Node
             None => {
-                if meta_packet.ebpf_type == EbpfType::SocketCloseEvent {
+                if meta_packet.is_socket_closed {
                     self.node_map.replace((node_map, time_set));
                     return;
                 }
@@ -902,7 +890,7 @@ impl FlowMap {
         node.last_cap_seq = meta_packet.cap_end_seq as u32;
         // For short connections, in order to quickly get the node flush of the closed socket out, set a short timeout
         // FIXME: At present, the purpose of flush is to set the timeout, and different node type may be set in the future.
-        if meta_packet.ebpf_type == EbpfType::SocketCloseEvent {
+        if meta_packet.is_socket_closed {
             node.timeout = DEFAULT_SOCKET_CLOSE_TIMEOUT;
             return false;
         }
@@ -1315,6 +1303,7 @@ impl FlowMap {
             ],
             signal_source: meta_packet.signal_source,
             is_active_service,
+            init_ipid: meta_packet.ip_id as u32,
             ..Default::default()
         };
         tagged_flow.flow = flow;
@@ -1430,6 +1419,7 @@ impl FlowMap {
         */
         let (l7_proto_enum, port, is_skip, l7_failed_count, last) = match meta_packet.signal_source
         {
+            #[cfg(feature = "libtrace")]
             SignalSource::EBPF => {
                 let (local_epc, remote_epc) = if meta_packet.lookup_key.l2_end_0 {
                     (local_epc_id, 0)
@@ -1655,23 +1645,19 @@ impl FlowMap {
     fn collect_l7_stats(
         &mut self,
         node: &mut FlowNode,
-        meta_flow_log: &mut Box<FlowLog>,
+        l7_protocol: L7Protocol,
         l7_info: &L7ProtocolInfo,
+        l7_stat: L7PerfStats,
         consistent_timestamp_in_l7_metrics: bool,
         time_in_micros: u64,
     ) {
-        let Some(mut perf_stats) = node.tagged_flow.flow.flow_perf_stats.take() else {
+        let flow = &mut node.tagged_flow.flow;
+        let Some(mut perf_stats) = flow.flow_perf_stats.take() else {
             return;
         };
+        perf_stats.l7.sequential_merge(&l7_stat);
+        flow.flow_perf_stats = Some(perf_stats);
 
-        let flow = &node.tagged_flow.flow;
-        let flow_id = flow.flow_id;
-        let l7_timeout_count = self
-            .perf_cache
-            .borrow_mut()
-            .pop_timeout_count(&flow_id, false);
-        let (l7_perf_stats, l7_protocol) =
-            meta_flow_log.copy_and_reset_l7_perf_data(l7_timeout_count as u32);
         let app_proto_head = l7_info.app_proto_head().unwrap();
         let time_span = if consistent_timestamp_in_l7_metrics
             && app_proto_head.msg_type == LogMessageType::Response
@@ -1684,9 +1670,10 @@ impl FlowMap {
         };
 
         let mut l7_stats = L7Stats::default();
-        l7_stats.stats = l7_perf_stats.clone();
+        l7_stats.is_reversed = l7_info.is_reversed();
+        l7_stats.stats = l7_stat;
         l7_stats.endpoint = l7_info.get_endpoint();
-        l7_stats.flow_id = flow_id;
+        l7_stats.flow_id = flow.flow_id;
         l7_stats.signal_source = flow.signal_source;
         l7_stats.time_in_second = Duration::from_secs(time_in_micros / Self::MICROS_IN_SECONDS);
         l7_stats.l7_protocol = l7_protocol;
@@ -1696,10 +1683,6 @@ impl FlowMap {
 
         self.l7_stats_output
             .send(self.l7_stats_allocator.allocate_one_with(l7_stats));
-
-        let l7_perf_stats_all = &mut perf_stats.l7;
-        l7_perf_stats_all.sequential_merge(&l7_perf_stats);
-        node.tagged_flow.flow.flow_perf_stats = Some(perf_stats);
     }
 
     fn collect_metric(
@@ -1775,13 +1758,30 @@ impl FlowMap {
                             // Here we determine whether to reverse flow.
                             self.rectify_flow_direction(node, packet, is_first_packet);
                         }
+
+                        let flow_id = node.tagged_flow.flow.flow_id;
+                        let (mut l7_perf_stats, l7_protocol) = log.copy_and_reset_l7_perf_data();
+
                         match info {
                             crate::common::l7_protocol_log::L7ParseResult::Single(s) => {
                                 let timestamp = packet.lookup_key.timestamp.as_micros();
+                                let mut l7_stat = if l7_perf_stats.is_empty() {
+                                    L7PerfStats::default()
+                                } else {
+                                    l7_perf_stats.remove(0)
+                                };
+                                // TODO: Distinguish timeout counts by endpoint
+                                l7_stat.err_timeout = self
+                                    .perf_cache
+                                    .borrow_mut()
+                                    .timeout_cache
+                                    .pop_timeout_count(flow_id, false, s.is_reversed())
+                                    as u32;
                                 self.collect_l7_stats(
                                     node,
-                                    &mut log,
+                                    l7_protocol,
                                     &s,
+                                    l7_stat,
                                     consistent_timestamp_in_l7_metrics,
                                     timestamp,
                                 );
@@ -1794,10 +1794,23 @@ impl FlowMap {
 
                                 let timestamp = packet.lookup_key.timestamp.as_micros();
                                 for i in m.into_iter() {
+                                    let mut l7_stat = if l7_perf_stats.is_empty() {
+                                        L7PerfStats::default()
+                                    } else {
+                                        l7_perf_stats.remove(0)
+                                    };
+                                    // TODO: Distinguish timeout counts by endpoint
+                                    l7_stat.err_timeout = self
+                                        .perf_cache
+                                        .borrow_mut()
+                                        .timeout_cache
+                                        .pop_timeout_count(flow_id, false, i.is_reversed())
+                                        as u32;
                                     self.collect_l7_stats(
                                         node,
-                                        &mut log,
+                                        l7_protocol,
                                         &i,
+                                        l7_stat,
                                         consistent_timestamp_in_l7_metrics,
                                         timestamp,
                                     );
@@ -1831,7 +1844,7 @@ impl FlowMap {
         meta_packet.is_active_service = node.tagged_flow.flow.is_active_service;
         let mut reverse = false;
         if node.tagged_flow.flow.signal_source == SignalSource::EBPF {
-            if meta_packet.ebpf_type == EbpfType::SocketCloseEvent {
+            if meta_packet.is_socket_closed {
                 // When receiving the socket close event, set the node timeout to 1s to reduce the memory occupation
                 node.timeout = DEFAULT_SOCKET_CLOSE_TIMEOUT;
             } else {
@@ -1882,7 +1895,7 @@ impl FlowMap {
 
         // After collect_metric() is called for eBPF MetaPacket, its direction is determined.
         if node.tagged_flow.flow.signal_source == SignalSource::EBPF
-            && meta_packet.ebpf_type != EbpfType::SocketCloseEvent
+            && meta_packet.is_socket_closed
             && count > 0
         {
             if meta_packet.lookup_key.direction == PacketDirection::ClientToServer {
@@ -2008,22 +2021,60 @@ impl FlowMap {
         collect_stats: bool,
         tagged_flow: Arc<BatchedBox<TaggedFlow>>,
         flow_end: bool,
+        cached_l7_perf_stats: Option<(L7PerfStats, L7PerfStats)>,
     ) {
         if collect_stats {
             let flow = &tagged_flow.flow;
             if let Some(flow_perf) = flow.flow_perf_stats.as_ref() {
-                let mut l7_stats = L7Stats::default();
-                let l7_timeout_count = self
-                    .perf_cache
-                    .borrow_mut()
-                    .pop_timeout_count(&flow.flow_id, flow_end);
-                l7_stats.stats.err_timeout = l7_timeout_count as u32;
-                l7_stats.endpoint = None;
-                l7_stats.flow_id = flow.flow_id;
-                l7_stats.signal_source = flow.signal_source;
-                l7_stats.time_in_second = flow.flow_stat_time.into();
-                l7_stats.l7_protocol = flow_perf.l7_protocol;
-                l7_stats.flow = Some(tagged_flow.clone());
+                let mut perf_cache = self.perf_cache.borrow_mut();
+                let (forward, backward) = if flow_end {
+                    cached_l7_perf_stats.unwrap_or_else(|| {
+                        perf_cache
+                            .rrt_cache
+                            .collect_flow_perf_stats(flow.flow_id)
+                            .unwrap_or_default()
+                    })
+                } else {
+                    (L7PerfStats::default(), L7PerfStats::default())
+                };
+                let l7_stats = L7Stats {
+                    stats: L7PerfStats {
+                        err_timeout: perf_cache.timeout_cache.pop_timeout_count(
+                            flow.flow_id,
+                            flow_end,
+                            false,
+                        ) as u32,
+                        ..forward
+                    },
+                    flow_id: flow.flow_id,
+                    signal_source: flow.signal_source,
+                    time_in_second: self.start_time,
+                    l7_protocol: flow_perf.l7_protocol,
+                    flow: Some(tagged_flow.clone()),
+                    is_reversed: false,
+                    ..Default::default()
+                };
+                self.l7_stats_output
+                    .send(self.l7_stats_allocator.allocate_one_with(l7_stats));
+
+                let l7_stats = L7Stats {
+                    stats: L7PerfStats {
+                        err_timeout: perf_cache.timeout_cache.pop_timeout_count(
+                            flow.flow_id,
+                            flow_end,
+                            true,
+                        ) as u32,
+                        ..backward
+                    },
+                    flow_id: flow.flow_id,
+                    signal_source: flow.signal_source,
+                    time_in_second: self.start_time,
+                    l7_protocol: flow_perf.l7_protocol,
+                    flow: Some(tagged_flow.clone()),
+                    is_reversed: true,
+                    ..Default::default()
+                };
+
                 self.l7_stats_output
                     .send(self.l7_stats_allocator.allocate_one_with(l7_stats));
             }
@@ -2058,6 +2109,26 @@ impl FlowMap {
         self.update_flow_direction(&mut node, meta_packet);
 
         let mut flow = &mut node.tagged_flow.flow;
+        let cached_l7_perf_stats = if config.flow.collector_enabled {
+            if let Some(perf_stats) = flow.flow_perf_stats.as_mut() {
+                let cached = self
+                    .perf_cache
+                    .borrow_mut()
+                    .rrt_cache
+                    .collect_flow_perf_stats(flow.flow_id);
+                if let Some((forward, backward)) = cached {
+                    perf_stats.l7.sequential_merge(&forward);
+                    perf_stats.l7.sequential_merge(&backward);
+                    Some((forward, backward))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if flow.signal_source == SignalSource::EBPF {
             // the flow which from eBPF, it's close_type always be CloseType::Timeout
             flow.close_type = CloseType::Timeout;
@@ -2105,12 +2176,17 @@ impl FlowMap {
         );
         let flow_id = tagged_flow.flow.flow_id;
 
-        self.flush_l7_perf_stats(collect_stats, tagged_flow.clone(), true);
+        self.flush_l7_perf_stats(
+            collect_stats,
+            tagged_flow.clone(),
+            true,
+            cached_l7_perf_stats,
+        );
         self.push_to_flow_stats_queue(tagged_flow);
         if let Some(log) = node.meta_flow_log.take() {
             FlowLog::recycle(&mut self.tcp_perf_pool, *log);
         }
-        self.perf_cache.borrow_mut().remove(&flow_id);
+        self.perf_cache.borrow_mut().remove_flow(flow_id);
 
         self.flow_node_pool.put(node);
     }
@@ -2155,7 +2231,7 @@ impl FlowMap {
                 self.tagged_flow_allocator
                     .allocate_one_with(node.tagged_flow.clone()),
             );
-            self.flush_l7_perf_stats(collect_stats, tagged_flow.clone(), false);
+            self.flush_l7_perf_stats(collect_stats, tagged_flow.clone(), false, None);
             self.push_to_flow_stats_queue(tagged_flow);
             node.reset_flow_stat_info();
         }
@@ -2494,10 +2570,15 @@ impl FlowMap {
         c.slots.swap(slots, Ordering::Relaxed);
         c.slot_max_depth.fetch_max(max_depth, Ordering::Relaxed);
     }
+
+    #[cfg(test)]
+    pub fn reset_start_time(&mut self, d: Duration) {
+        self.start_time = d;
+        self.start_time_in_unit = (d.as_nanos() / TIME_UNIT.as_nanos()) as u64;
+    }
 }
 
 #[rustfmt::skip]
-#[derive(Default)]
 pub struct FlowMapCounter {
     new: AtomicU64,                      // the number of created flow
     closed: AtomicU64,                   // the number of closed flow
@@ -2511,8 +2592,27 @@ pub struct FlowMapCounter {
     slot_max_depth: AtomicU64,           // the max length of Vec<FlowNode>
     total_scan: AtomicU64,               // the total number of iteration to scan over Vec<FlowNode>
     time_set_shrinks: AtomicU64,         // the total number of time_set HashSet shrinks
-    pub l7_perf_cache_len: AtomicU64,    // the number of struct L7PerfCache::rrt_cache length
-    pub l7_timeout_cache_len: AtomicU64, // the number of struct L7PerfCache::timeout_cache length
+    l7_perf_cache_counters: L7PerfCacheCounter,
+}
+
+impl FlowMapCounter {
+    fn new(l7_perf_cache_counters: L7PerfCacheCounter) -> Self {
+        Self {
+            new: AtomicU64::new(0),
+            closed: AtomicU64::new(0),
+            drop_by_window: AtomicU64::new(0),
+            drop_by_capacity: AtomicU64::new(0),
+            packet_delay: AtomicI64::new(0),
+            flush_delay: AtomicI64::new(0),
+            flow_delay: AtomicI64::new(0),
+            concurrent: AtomicU64::new(0),
+            slots: AtomicU64::new(0),
+            slot_max_depth: AtomicU64::new(0),
+            total_scan: AtomicU64::new(0),
+            time_set_shrinks: AtomicU64::new(0),
+            l7_perf_cache_counters,
+        }
+    }
 }
 
 impl RefCountable for FlowMapCounter {
@@ -2580,12 +2680,20 @@ impl RefCountable for FlowMapCounter {
             (
                 "l7_perf_cache_len",
                 CounterType::Gauged,
-                CounterValue::Unsigned(self.l7_perf_cache_len.swap(0, Ordering::Relaxed)),
+                CounterValue::Unsigned(
+                    self.l7_perf_cache_counters
+                        .rrt_cache_len
+                        .load(Ordering::Relaxed),
+                ),
             ),
             (
                 "l7_timeout_cache_len",
                 CounterType::Gauged,
-                CounterValue::Unsigned(self.l7_timeout_cache_len.swap(0, Ordering::Relaxed)),
+                CounterValue::Unsigned(
+                    self.l7_perf_cache_counters
+                        .timeout_cache_len
+                        .load(Ordering::Relaxed),
+                ),
             ),
         ]
     }
@@ -2714,20 +2822,19 @@ mod tests {
     use super::*;
 
     use crate::{
-        common::{enums::EthernetType, flow::CloseType, tap_port::TapPort},
-        utils::test::Capture,
+        common::{
+            enums::EthernetType,
+            flow::CloseType,
+            l7_protocol_log::{LogCache, LogCacheKey, ParseParam},
+            tap_port::TapPort,
+        },
+        flow_generator::protocol_logs::L7ResponseStatus,
+        utils::test_utils::Capture,
     };
     use npb_pcap_policy::{DirectionType, NpbAction, NpbTunnelType, PolicyData, TapSide};
     use public::utils::net::MacAddr;
 
     const DEFAULT_DURATION: Duration = Duration::from_millis(10);
-
-    impl FlowMap {
-        fn reset_start_time(&mut self, d: Duration) {
-            self.start_time = d;
-            self.start_time_in_unit = (d.as_nanos() / TIME_UNIT.as_nanos()) as u64;
-        }
-    }
 
     #[test]
     fn syn_rst() {
@@ -3435,6 +3542,175 @@ mod tests {
         let perf_stats = &tagged_flow.flow.flow_perf_stats.as_ref().unwrap().tcp;
         assert_eq!(perf_stats.counts_peers[0].zero_win_count, 0);
         assert_eq!(perf_stats.counts_peers[1].zero_win_count, 1);
+    }
+
+    #[test]
+    fn cached_l7_success_should_affect_final_close_type_before_flow_end() {
+        let (module_config, mut flow_map, output_queue_receiver) =
+            _new_flow_map_and_receiver(AgentType::TtProcess, None, false);
+        let config = Config {
+            flow: &module_config.flow,
+            log_parser: &module_config.log_parser,
+            collector: &module_config.collector,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ebpf: None,
+        };
+        let mut packet = _new_meta_packet();
+        let mut node = flow_map.init_flow(&config, &mut packet);
+        node.flow_state = FlowState::Reset;
+        node.tagged_flow.flow.flow_key.proto = IpProtocol::TCP;
+        node.tagged_flow.flow.flow_perf_stats = Some(FlowPerfStats {
+            l7_protocol: L7Protocol::Http1,
+            ..Default::default()
+        });
+        node.tagged_flow.flow.flow_metrics_peers[FLOW_METRICS_PEER_SRC].total_tcp_flags =
+            TcpFlags::RST;
+        node.meta_flow_log = FlowLog::new(
+            false,
+            &mut flow_map.tcp_perf_pool,
+            true,
+            flow_map.perf_cache.clone(),
+            L4Protocol::Tcp,
+            L7ProtocolEnum::L7Protocol(L7Protocol::Http1),
+            false,
+            flow_map.flow_perf_counter.clone(),
+            0,
+            Rc::clone(&flow_map.wasm_vm),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Rc::clone(&flow_map.so_plugin),
+            flow_map.stats_counter.clone(),
+            config.log_parser.l7_log_session_aggr_max_timeout.as_secs() as usize,
+            config.flow.l7_protocol_inference_ttl.try_into().unwrap(),
+            None,
+            flow_map.ntp_diff.clone(),
+            flow_map.obfuscate_cache.clone(),
+        )
+        .map(Box::new);
+
+        packet.flow_id = node.tagged_flow.flow.flow_id;
+        packet.lookup_key.direction = PacketDirection::ClientToServer;
+        let key = LogCacheKey::new(
+            &ParseParam::new(
+                &packet,
+                Some(flow_map.perf_cache.clone()),
+                Rc::clone(&flow_map.wasm_vm),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Rc::clone(&flow_map.so_plugin),
+                true,
+                true,
+            ),
+            None,
+            false,
+        );
+        flow_map.perf_cache.borrow_mut().rrt_cache.put(
+            key,
+            LogCache {
+                msg_type: LogMessageType::Response,
+                time: packet.lookup_key.timestamp.as_micros() as u64,
+                resp_status: L7ResponseStatus::Ok,
+                ..Default::default()
+            },
+        );
+
+        flow_map.node_removed_aftercare(&config, node, Duration::from_secs(1), None);
+        flow_map.flush_queue(config.flow, Duration::from_secs(2));
+
+        let tagged_flow = output_queue_receiver
+            .recv(Some(TIME_UNIT))
+            .expect("expected output flow");
+        let l7 = tagged_flow
+            .flow
+            .flow_perf_stats
+            .as_ref()
+            .unwrap()
+            .l7
+            .clone();
+        assert_eq!(
+            tagged_flow.flow.close_type,
+            CloseType::TcpFinClientRst,
+            "actual close_type={:?}, l7={:?}, tcp_flags_src={:?}, tcp_flags_dst={:?}",
+            tagged_flow.flow.close_type,
+            l7,
+            tagged_flow.flow.flow_metrics_peers[FLOW_METRICS_PEER_SRC].total_tcp_flags,
+            tagged_flow.flow.flow_metrics_peers[FLOW_METRICS_PEER_DST].total_tcp_flags,
+        );
+    }
+
+    #[test]
+    fn cached_l7_client_error_should_keep_client_reset_close_type() {
+        let (module_config, mut flow_map, output_queue_receiver) =
+            _new_flow_map_and_receiver(AgentType::TtProcess, None, false);
+        let config = Config {
+            flow: &module_config.flow,
+            log_parser: &module_config.log_parser,
+            collector: &module_config.collector,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ebpf: None,
+        };
+        let mut packet = _new_meta_packet();
+        let mut node = flow_map.init_flow(&config, &mut packet);
+        node.flow_state = FlowState::Reset;
+        node.tagged_flow.flow.flow_key.proto = IpProtocol::TCP;
+        node.tagged_flow.flow.flow_perf_stats = Some(FlowPerfStats {
+            l7_protocol: L7Protocol::Http1,
+            ..Default::default()
+        });
+        node.tagged_flow.flow.flow_metrics_peers[FLOW_METRICS_PEER_SRC].total_tcp_flags =
+            TcpFlags::RST;
+        node.meta_flow_log = FlowLog::new(
+            false,
+            &mut flow_map.tcp_perf_pool,
+            true,
+            flow_map.perf_cache.clone(),
+            L4Protocol::Tcp,
+            L7ProtocolEnum::L7Protocol(L7Protocol::Http1),
+            false,
+            flow_map.flow_perf_counter.clone(),
+            0,
+            Rc::clone(&flow_map.wasm_vm),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Rc::clone(&flow_map.so_plugin),
+            flow_map.stats_counter.clone(),
+            config.log_parser.l7_log_session_aggr_max_timeout.as_secs() as usize,
+            config.flow.l7_protocol_inference_ttl.try_into().unwrap(),
+            None,
+            flow_map.ntp_diff.clone(),
+            flow_map.obfuscate_cache.clone(),
+        )
+        .map(Box::new);
+
+        packet.flow_id = node.tagged_flow.flow.flow_id;
+        packet.lookup_key.direction = PacketDirection::ClientToServer;
+        let key = LogCacheKey::new(
+            &ParseParam::new(
+                &packet,
+                Some(flow_map.perf_cache.clone()),
+                Rc::clone(&flow_map.wasm_vm),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Rc::clone(&flow_map.so_plugin),
+                true,
+                true,
+            ),
+            None,
+            false,
+        );
+        flow_map.perf_cache.borrow_mut().rrt_cache.put(
+            key,
+            LogCache {
+                msg_type: LogMessageType::Response,
+                time: packet.lookup_key.timestamp.as_micros() as u64,
+                resp_status: L7ResponseStatus::ClientError,
+                ..Default::default()
+            },
+        );
+
+        flow_map.node_removed_aftercare(&config, node, Duration::from_secs(1), None);
+        flow_map.flush_queue(config.flow, Duration::from_secs(2));
+
+        let tagged_flow = output_queue_receiver
+            .recv(Some(TIME_UNIT))
+            .expect("expected output flow");
+        assert_eq!(tagged_flow.flow.close_type, CloseType::TcpClientRst);
     }
 
     #[test]

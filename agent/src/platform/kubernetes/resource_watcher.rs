@@ -32,8 +32,8 @@ use k8s_openapi::{
     api::{
         apps::v1::{DaemonSet, Deployment, ReplicaSet, ReplicaSetSpec, StatefulSet},
         core::v1::{
-            ConfigMap, Container, ContainerStatus, Namespace, Node, NodeSpec, NodeStatus, Pod,
-            PodSpec, PodStatus, ReplicationController, Service, ServiceStatus,
+            ConfigMap, Container, ContainerStatus, Namespace, Node, NodeCondition, NodeSpec,
+            NodeStatus, Pod, PodSpec, PodStatus, ReplicationController, Service, ServiceStatus,
         },
         networking,
     },
@@ -60,6 +60,7 @@ use tokio::{
 use super::crd::{
     calico::IpPool,
     kruise::{CloneSet, StatefulSet as KruiseStatefulSet},
+    legacy,
     opengauss::OpenGaussCluster,
     pingan_cloud::ServiceRule,
     tkex::StatefulSetPlus,
@@ -210,6 +211,8 @@ pub enum GenericResourceWatcher {
     ReplicationController(ResourceWatcher<ReplicationController>),
     ReplicaSet(ResourceWatcher<ReplicaSet>),
     V1Ingress(ResourceWatcher<networking::v1::Ingress>),
+    V1Beta1Ingress(ResourceWatcher<legacy::networking::Ingress>),
+    ExtV1Beta1Ingress(ResourceWatcher<legacy::extensions::Ingress>),
     Route(ResourceWatcher<Route>),
     ConfigMap(ResourceWatcher<ConfigMap>),
 
@@ -381,10 +384,20 @@ pub fn default_resources() -> Vec<Resource> {
         Resource {
             name: "ingresses",
             pb_name: "*v1.Ingress",
-            group_versions: vec![GroupVersion {
-                group: "networking.k8s.io",
-                version: "v1",
-            }],
+            group_versions: vec![
+                GroupVersion {
+                    group: "networking.k8s.io",
+                    version: "v1",
+                },
+                GroupVersion {
+                    group: "networking.k8s.io",
+                    version: "v1beta1",
+                },
+                GroupVersion {
+                    group: "extensions",
+                    version: "v1beta1",
+                },
+            ],
             selected_gv: SelectedGv::None,
             field_selector: String::new(),
         },
@@ -506,10 +519,20 @@ pub fn supported_resources() -> Vec<Resource> {
         Resource {
             name: "ingresses",
             pb_name: "*v1.Ingress",
-            group_versions: vec![GroupVersion {
-                group: "networking.k8s.io",
-                version: "v1",
-            }],
+            group_versions: vec![
+                GroupVersion {
+                    group: "networking.k8s.io",
+                    version: "v1",
+                },
+                GroupVersion {
+                    group: "networking.k8s.io",
+                    version: "v1beta1",
+                },
+                GroupVersion {
+                    group: "extensions",
+                    version: "v1beta1",
+                },
+            ],
             selected_gv: SelectedGv::None,
             field_selector: String::new(),
         },
@@ -1137,7 +1160,15 @@ impl Trimmable for Node {
         if let Some(node_status) = self.status.take() {
             trim_node.status = Some(NodeStatus {
                 addresses: node_status.addresses,
-                conditions: node_status.conditions,
+                conditions: node_status.conditions.map(|cs| {
+                    cs.into_iter()
+                        .map(|s| NodeCondition {
+                            reason: s.reason,
+                            status: s.status,
+                            ..Default::default()
+                        })
+                        .collect()
+                }),
                 capacity: node_status.capacity,
                 ..Default::default()
             });
@@ -1177,7 +1208,8 @@ impl Trimmable for ReplicaSet {
 }
 
 impl Trimmable for ReplicationController {
-    fn trim(self) -> Self {
+    fn trim(mut self) -> Self {
+        self.metadata.managed_fields = None;
         ReplicationController {
             metadata: self.metadata,
             spec: self.spec,
@@ -1216,14 +1248,21 @@ impl Trimmable for ConfigMap {
     fn trim(self) -> Self {
         ConfigMap {
             data: self.data,
-            metadata: self.metadata,
+            metadata: ObjectMeta {
+                uid: self.metadata.uid,
+                name: self.metadata.name,
+                namespace: self.metadata.namespace,
+                creation_timestamp: self.metadata.creation_timestamp,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
 }
 
 impl Trimmable for DaemonSet {
-    fn trim(self) -> Self {
+    fn trim(mut self) -> Self {
+        self.metadata.managed_fields = None;
         DaemonSet {
             metadata: self.metadata,
             spec: self.spec,
@@ -1233,7 +1272,8 @@ impl Trimmable for DaemonSet {
 }
 
 impl Trimmable for StatefulSet {
-    fn trim(self) -> Self {
+    fn trim(mut self) -> Self {
+        self.metadata.managed_fields = None;
         StatefulSet {
             metadata: self.metadata,
             spec: self.spec,
@@ -1243,7 +1283,8 @@ impl Trimmable for StatefulSet {
 }
 
 impl Trimmable for Deployment {
-    fn trim(self) -> Self {
+    fn trim(mut self) -> Self {
+        self.metadata.managed_fields = None;
         Deployment {
             metadata: self.metadata,
             spec: self.spec,
@@ -1256,6 +1297,7 @@ impl Trimmable for Service {
     fn trim(mut self) -> Self {
         let mut trim_svc = Service::default();
         trim_svc.metadata = self.metadata;
+        trim_svc.metadata.managed_fields = None;
         trim_svc.spec = self.spec;
         if let Some(svc_status) = self.status.take() {
             trim_svc.status = Some(ServiceStatus {
@@ -1459,6 +1501,24 @@ impl ResourceWatcherFactory {
                     group: "networking.k8s.io",
                     version: "v1",
                 } => GenericResourceWatcher::V1Ingress(self.new_namespace_resource(
+                    resource,
+                    stats_collector,
+                    namespace,
+                    config,
+                )),
+                GroupVersion {
+                    group: "networking.k8s.io",
+                    version: "v1beta1",
+                } => GenericResourceWatcher::V1Beta1Ingress(self.new_namespace_resource(
+                    resource,
+                    stats_collector,
+                    namespace,
+                    config,
+                )),
+                GroupVersion {
+                    group: "extensions",
+                    version: "v1beta1",
+                } => GenericResourceWatcher::ExtV1Beta1Ingress(self.new_namespace_resource(
                     resource,
                     stats_collector,
                     namespace,

@@ -27,21 +27,24 @@ type EventType uint8
 
 const (
 	RESOURCE_EVENT EventType = iota
-	PERF_EVENT
+	FILE_EVENT
 	ALERT_EVENT
 	K8S_EVENT
+	ALERT_RECORD
 )
 
 func (e EventType) String() string {
 	switch e {
 	case RESOURCE_EVENT:
 		return "resource_event"
-	case PERF_EVENT:
-		return "perf_event"
+	case FILE_EVENT:
+		return "file_event"
 	case ALERT_EVENT:
 		return "alert_event"
 	case K8S_EVENT:
 		return "k8s_event"
+	case ALERT_RECORD:
+		return "alert_record"
 	default:
 		return "unknown_event"
 	}
@@ -52,10 +55,12 @@ func (e EventType) TableName() string {
 	// both resource_event and k8s_event are stored in event table
 	case RESOURCE_EVENT, K8S_EVENT:
 		return "event"
-	case PERF_EVENT:
-		return "perf_event"
+	case FILE_EVENT:
+		return "file_event"
 	case ALERT_EVENT:
 		return "alert_event"
+	case ALERT_RECORD:
+		return "alert_record"
 	default:
 		return "unknown_event"
 	}
@@ -63,8 +68,8 @@ func (e EventType) TableName() string {
 
 func (e EventType) DataSource() uint32 {
 	switch e {
-	case PERF_EVENT:
-		return uint32(exportconfig.PERF_EVENT)
+	case FILE_EVENT:
+		return uint32(exportconfig.FILE_EVENT)
 	default:
 		return uint32(exportconfig.MAX_DATASOURCE_ID)
 	}

@@ -23,7 +23,7 @@ use std::{
     time::Duration,
 };
 
-use public::enums::IpProtocol;
+use public::{enums::IpProtocol, l7_protocol::LogMessageType};
 
 use crate::{
     common::{
@@ -31,13 +31,16 @@ use crate::{
         flow::PacketDirection,
         l7_protocol_info::L7ProtocolInfo,
         l7_protocol_log::L7ProtocolParserInterface,
-        l7_protocol_log::{EbpfParam, L7PerfCache, ParseParam},
+        l7_protocol_log::{L7PerfCache, ParseParam},
     },
-    config::OracleConfig,
+    config::{
+        config::{Iso8583ParseConfig, WebSphereMqParseConfig},
+        OracleConfig,
+    },
     flow_generator::protocol_logs::{
         pb_adapter::KeyVal,
         plugin::shared_obj::{get_so_parser, SoLog},
-        L7ResponseStatus, LogMessageType,
+        L7ResponseStatus,
     },
 };
 
@@ -65,7 +68,8 @@ fn get_req_param<'a>(
         flow_id: 1234567,
         direction: PacketDirection::ClientToServer,
         ebpf_type: EbpfType::TracePoint,
-        ebpf_param: Some(EbpfParam {
+        #[cfg(feature = "libtrace")]
+        ebpf_param: Some(crate::common::l7_protocol_log::EbpfParam {
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
@@ -77,7 +81,8 @@ fn get_req_param<'a>(
         parse_log: true,
         parse_perf: true,
         parse_config: None,
-        l7_perf_cache: rrt_cache.clone(),
+        obfuscate_cache: None,
+        l7_perf_cache: Some(rrt_cache.clone()),
         wasm_vm: Default::default(),
         so_func: plugin,
         stats_counter: None,
@@ -85,6 +90,8 @@ fn get_req_param<'a>(
         buf_size: 0,
         captured_byte: 0,
         oracle_parse_conf: OracleConfig::default(),
+        iso8583_parse_conf: Iso8583ParseConfig::default(),
+        web_sphere_mq_parse_conf: WebSphereMqParseConfig::default(),
         icmp_data: None,
     }
 }
@@ -102,8 +109,8 @@ fn get_resp_param<'a>(
         flow_id: 1234567,
         direction: PacketDirection::ServerToClient,
         ebpf_type: EbpfType::TracePoint,
-
-        ebpf_param: Some(EbpfParam {
+        #[cfg(feature = "libtrace")]
+        ebpf_param: Some(crate::common::l7_protocol_log::EbpfParam {
             is_tls: false,
             is_req_end: false,
             is_resp_end: false,
@@ -115,7 +122,8 @@ fn get_resp_param<'a>(
         parse_perf: true,
         parse_log: true,
         parse_config: None,
-        l7_perf_cache: rrt_cache.clone(),
+        obfuscate_cache: None,
+        l7_perf_cache: Some(rrt_cache.clone()),
         wasm_vm: Default::default(),
         so_func: plugin,
         stats_counter: None,
@@ -123,6 +131,8 @@ fn get_resp_param<'a>(
         buf_size: 0,
         captured_byte: 0,
         oracle_parse_conf: OracleConfig::default(),
+        iso8583_parse_conf: Iso8583ParseConfig::default(),
+        web_sphere_mq_parse_conf: WebSphereMqParseConfig::default(),
         icmp_data: None,
     }
 }
@@ -143,7 +153,7 @@ fn test_check() {
     let rrt_cache = Rc::new(RefCell::new(L7PerfCache::new(100)));
     let param = get_req_param(rrt_cache, Rc::new(RefCell::new(Some(vec![get_plugin()]))));
     let mut p = SoLog::default();
-    assert!(p.check_payload(&REQ_PAYLOAD, &param));
+    assert!(p.check_payload(&REQ_PAYLOAD, &param) == Some(LogMessageType::Request));
 }
 
 #[test]
@@ -176,7 +186,7 @@ fn test_parse() {
         assert_eq!(info.req.domain.as_str(), "baidu.com.");
 
         assert_eq!(
-            info.trace.trace_id.as_ref().unwrap().as_str(),
+            info.trace.trace_ids.first().unwrap().as_str(),
             "this is trace id"
         );
         assert_eq!(
@@ -209,7 +219,7 @@ fn test_parse() {
         assert_eq!(info.resp.status, L7ResponseStatus::Ok);
 
         assert_eq!(
-            info.trace.trace_id.as_ref().unwrap().as_str(),
+            info.trace.trace_ids.first().unwrap().as_str(),
             "this is trace id"
         );
         assert_eq!(
@@ -226,7 +236,7 @@ fn test_parse() {
         unreachable!()
     }
 
-    let stat = p.perf_stats().unwrap();
+    let stat = p.perf_stats().remove(0);
     assert_eq!(stat.request_count, 1);
     assert_eq!(stat.response_count, 1);
     assert_eq!(stat.rrt_count, 1);

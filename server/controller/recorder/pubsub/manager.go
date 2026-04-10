@@ -21,12 +21,16 @@ import (
 	"sync"
 )
 
-// Subscribe 提供订阅接口
-// pubSubType: 消息中心类型
-// topic: 主题
-// subscriber: 订阅者
-func Subscribe(pubSubType string, topic int, subscriber interface{}) error {
-	return GetManager().Subscribe(pubSubType, topic, subscriber)
+// Subscribe allows subscribers to subscribe to messages.
+// Upon successful subscription, messages will be pushed to the subscriber according to the subscription speciification.
+func Subscribe(subscriber interface{}, spec ...*SubscriptionSpec) error {
+	mng := GetManager()
+	for _, s := range spec {
+		if err := mng.Subscribe(subscriber, s); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func GetPubSub(pubSubType string) interface{} {
@@ -42,55 +46,12 @@ func GetManager() *Manager {
 	pubSubManagerOnce.Do(func() {
 		pubSubManager = &Manager{
 			TypeToPubSub: map[string]PubSub{
-				// AnyChangePubSub
-				PubSubTypeWholeDomain:    NewWholeDomain(),
-				PubSubTypeWholeSubDomain: NewWholeSubDomain(),
-
-				// ResourcePubSub
-				PubSubTypeAZ:                          NewAZ(),
-				PubSubTypeRegion:                      NewRegion(),
-				PubSubTypeSubDomain:                   NewSubDomain(),
-				PubSubTypeHost:                        NewHost(),
-				PubSubTypeVM:                          NewVM(),
-				PubSubTypeVPC:                         NewVPC(),
-				PubSubTypeNetwork:                     NewNetwork(),
-				PubSubTypeSubnet:                      NewSubnet(),
-				PubSubTypeVRouter:                     NewVRouter(),
-				PubSubTypeRoutingTable:                NewRoutingTable(),
-				PubSubTypeDHCPPort:                    NewDHCPPort(),
-				PubSubTypeVInterface:                  NewVInterface(),
-				PubSubTypeFloatingIP:                  NewFloatingIP(),
-				PubSubTypeWANIP:                       NewWANIP(),
-				PubSubTypeLANIP:                       NewLANIP(),
-				PubSubTypeVIP:                         NewVIP(),
-				PubSubTypeNATGateway:                  NewNATGateway(),
-				PubSubTypeNATRule:                     NewNATRule(),
-				PubSubTypeNATVMConnection:             NewNATVMConnection(),
-				PubSubTypeLB:                          NewLB(),
-				PubSubTypeLBListener:                  NewLBListener(),
-				PubSubTypeLBTargetServer:              NewLBTargetServer(),
-				PubSubTypeLBVMConnection:              NewLBVMConnection(),
-				PubSubTypePeerConnection:              NewPeerConnection(),
-				PubSubTypeCEN:                         NewCEN(),
-				PubSubTypeRDSInstance:                 NewRDSInstance(),
-				PubSubTypeRedisInstance:               NewRedisInstance(),
-				PubSubTypePodCluster:                  NewPodCluster(),
-				PubSubTypePodNode:                     NewPodNode(),
-				PubSubTypeVMPodNodeConnection:         NewVMPodNodeConnection(),
-				PubSubTypePodNamespace:                NewPodNamespace(),
-				PubSubTypePodIngress:                  NewPodIngress(),
-				PubSubTypePodIngressRule:              NewPodIngressRule(),
-				PubSubTypePodIngressRuleBackend:       NewPodIngressRuleBackend(),
-				PubSubTypePodService:                  NewPodService(),
-				PubSubTypePodServicePort:              NewPodServicePort(),
-				PubSubTypePodGroup:                    NewPodGroup(),
-				PubSubTypePodGroupPort:                NewPodGroupPort(),
-				PubSubTypePodReplicaSet:               NewPodReplicaSet(),
-				PubSubTypePod:                         NewPod(),
-				PubSubTypeConfigMap:                   NewConfigMap(),
-				PubSubTypePodGroupConfigMapConnection: NewPodGroupConfigMapConnection(),
-				PubSubTypeProcess:                     NewProcess(),
+				PubSubTypeWholeDomain:    newAnyChangePubSub(PubSubTypeWholeDomain),
+				PubSubTypeWholeSubDomain: newAnyChangePubSub(PubSubTypeWholeSubDomain),
 			},
+		}
+		for pubSubType := range rscPubSubTypeToResourceType {
+			pubSubManager.TypeToPubSub[pubSubType] = newResourcePubSub(pubSubType)
 		}
 	})
 	return pubSubManager
@@ -100,13 +61,13 @@ type Manager struct {
 	TypeToPubSub map[string]PubSub
 }
 
-func (m *Manager) Subscribe(pubSubType string, topic int, subscriber interface{}) error {
-	ps, ok := m.TypeToPubSub[pubSubType]
+func (m *Manager) Subscribe(subscriber interface{}, spec *SubscriptionSpec) error {
+	ps, ok := m.TypeToPubSub[spec.PubSubType]
 	if !ok {
-		log.Errorf("pubsub type not found: %s", pubSubType)
+		log.Errorf("pubsub type not found: %s", spec.PubSubType)
 		return errors.New("pubsub type not found")
 	}
-	ps.Subscribe(topic, subscriber)
+	ps.Subscribe(subscriber, spec)
 	return nil
 }
 

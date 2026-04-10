@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#[cfg(feature = "enterprise")]
+mod pcap_replay;
+
 use std::{
     borrow::Cow,
     cell::OnceCell,
@@ -39,7 +42,7 @@ use futures::{future::BoxFuture, stream::Stream, TryFutureExt};
 use k8s_openapi::api::core::v1::{Event, Pod};
 use kube::{
     api::{ListParams, LogParams},
-    Api, Client, Config,
+    Api, Client, Config as KubeConfig,
 };
 use log::{debug, info, trace, warn};
 use md5::{Digest, Md5};
@@ -51,15 +54,31 @@ use tokio::{
     time::{self, Interval},
 };
 
-use super::{Session, RPC_RETRY_INTERVAL};
-use crate::{exception::ExceptionHandler, trident::AgentId};
-
+pub use public::rpc::remote_exec::*;
 use public::{
     netns::{reset_netns, set_netns},
     proto::agent as pb,
 };
 
-pub use public::rpc::remote_exec::*;
+use super::{Session, RPC_RECONNECT_INTERVAL, RPC_RETRY_INTERVAL};
+use crate::{
+    config::handler::{FlowAccess, LogParserAccess},
+    exception::ExceptionHandler,
+    trident::AgentId,
+};
+cfg_if::cfg_if! {
+    if #[cfg(feature = "enterprise")] {
+        use arc_swap::access::Access;
+        use prost::Message;
+
+        use public::proto::flow_log;
+
+        use crate::{
+            flow_generator::protocol_logs::pb_adapter::L7ProtocolSendLog,
+            utils::hasher::md5_to_string,
+        };
+    }
+}
 
 const MIN_BATCH_LEN: usize = 1024;
 const TIMEOUT_PARAM: &'static Parameter = &Parameter {
@@ -119,6 +138,12 @@ fn all_supported_commands() -> Vec<Command> {
         },
         Command {
             cmdline: "ip address",
+            output_format: OutputFormat::Text,
+            command_type: CMD_TYPE_SYSTEM,
+            ..Default::default()
+        },
+        Command {
+            cmdline: "date",
             output_format: OutputFormat::Text,
             command_type: CMD_TYPE_SYSTEM,
             ..Default::default()
@@ -230,25 +255,30 @@ fn max_param_nums() -> usize {
 
 type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone)]
+struct Config {
+    flow: FlowAccess,
+    log_parser: LogParserAccess,
+}
+
 struct Interior {
     agent_id: Arc<RwLock<AgentId>>,
     session: Arc<Session>,
     exc: ExceptionHandler,
     running: Arc<AtomicBool>,
+    config: Config,
 }
 
 impl Interior {
     async fn run(&mut self) {
         while self.running.load(Ordering::Relaxed) {
             let (sender, receiver) = mpsc::channel(1);
-            let responser = Responser::new(self.agent_id.clone(), receiver);
+            let responser = Responser::new(self.agent_id.clone(), receiver, self.config.clone());
 
-            self.session.update_current_server().await;
             let session_version = self.session.get_version();
             let (channel, rx_size) = match self.session.get_client() {
                 Some(c) => c,
                 None => {
-                    self.session.set_request_failed(true);
                     tokio::time::sleep(RPC_RETRY_INTERVAL).await;
                     continue;
                 }
@@ -262,8 +292,10 @@ impl Interior {
             let mut stream = match client.remote_execute(responser).await {
                 Ok(stream) => stream,
                 Err(e) => {
-                    warn!("calling server remote_execute rpc failed: {:?}", e);
-                    self.exc.set(pb::Exception::ControllerSocketError);
+                    let error_msg = format!("calling server remote_execute rpc failed: {:?}", e);
+                    warn!("{}", error_msg);
+                    self.exc
+                        .set(pb::Exception::ControllerSocketError, Some(error_msg));
                     tokio::time::sleep(RPC_RETRY_INTERVAL).await;
                     continue;
                 }
@@ -278,33 +310,33 @@ impl Interior {
                     Ok(Some(message)) => message,
                     Ok(None) => {
                         debug!("server closed stream");
+                        tokio::time::sleep(RPC_RECONNECT_INTERVAL).await;
                         break;
                     }
                     Err(e) => {
-                        warn!("receiving server remote_execute rpc has error: {:?}", e);
-                        self.exc.set(pb::Exception::ControllerSocketError);
+                        let error_msg =
+                            format!("receiving server remote_execute rpc has error: {:?}", e);
+                        warn!("{}", error_msg);
+                        self.exc
+                            .set(pb::Exception::ControllerSocketError, Some(error_msg));
+                        tokio::time::sleep(RPC_RECONNECT_INTERVAL).await;
                         break;
                     }
                 };
                 if session_version != self.session.get_version() {
                     info!("grpc server or config changed");
+                    tokio::time::sleep(RPC_RECONNECT_INTERVAL).await;
                     break;
                 }
                 if message.exec_type.is_none() {
                     continue;
                 }
-                match pb::ExecutionType::try_from(message.exec_type.unwrap()) {
-                    Ok(t) => debug!("received {:?} command from server", t),
-                    Err(_) => {
-                        warn!(
-                            "unsupported remote exec type id {}",
-                            message.exec_type.unwrap()
-                        );
-                        continue;
-                    }
+                if let Ok(t) = pb::ExecutionType::try_from(message.exec_type.unwrap()) {
+                    debug!("received {:?} command from server", t);
                 }
                 if sender.send(message).await.is_err() {
                     debug!("responser channel closed");
+                    tokio::time::sleep(RPC_RECONNECT_INTERVAL).await;
                     break;
                 }
             }
@@ -317,7 +349,7 @@ pub struct Executor {
     session: Arc<Session>,
     runtime: Arc<Runtime>,
     exc: ExceptionHandler,
-
+    config: Config,
     running: Arc<AtomicBool>,
 }
 
@@ -327,12 +359,18 @@ impl Executor {
         session: Arc<Session>,
         runtime: Arc<Runtime>,
         exc: ExceptionHandler,
+        flow_config: FlowAccess,
+        log_parser_config: LogParserAccess,
     ) -> Self {
         Self {
             agent_id,
             session,
             runtime,
             exc,
+            config: Config {
+                flow: flow_config,
+                log_parser: log_parser_config,
+            },
             running: Default::default(),
         }
     }
@@ -346,6 +384,7 @@ impl Executor {
             session: self.session.clone(),
             exc: self.exc.clone(),
             running: self.running.clone(),
+            config: self.config.clone(),
         };
         self.runtime.spawn(async move {
             interior.run().await;
@@ -362,7 +401,7 @@ impl Executor {
 }
 
 #[derive(Default)]
-struct CommandResult {
+struct DataChunk {
     request_id: Option<u64>,
 
     errno: i32,
@@ -373,12 +412,89 @@ struct CommandResult {
     err_msg: Option<String>,
 }
 
+enum ControlFlow {
+    Return(Option<pb::RemoteExecResponse>),
+    Continue,
+    Fallthrough,
+}
+
+#[cfg(feature = "enterprise")]
+struct PcapReplay {
+    request_id: Option<u64>,
+    replayer: pcap_replay::Replayer,
+    // if we have more data than expected in one batch, cache it here
+    cached_data: Option<flow_log::AppProtoLogsData>,
+    input_digest: Md5,
+    output_digest: Md5,
+    // no more pcap data from server, finish after reading all data from replayer and sending all cached data
+    end_of_stream: bool,
+}
+
+#[cfg(feature = "enterprise")]
+impl PcapReplay {
+    const LENGTH_FIELD_SIZE: usize = 4;
+
+    pub fn next_batch(
+        &mut self,
+        batch_len: usize,
+        config: &pcap_replay::Config,
+    ) -> Result<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(batch_len);
+        if let Some(cached_data) = self.cached_data.take() {
+            // min batch len is 1024, it's unlikely to have one data larger than that
+            let frame_size = cached_data.encoded_len() + Self::LENGTH_FIELD_SIZE;
+            if frame_size > batch_len {
+                return Err(Error::BatchLengthTooSmall(frame_size));
+            }
+            buffer.extend_from_slice(&(frame_size as u32).to_be_bytes());
+            if let Err(e) = cached_data.encode(&mut buffer) {
+                warn!("failed to encode app proto logs data: {e:?}");
+            }
+            trace!("encoded {frame_size} bytes to buffer");
+        }
+        loop {
+            match self.replayer.next(config) {
+                Ok(Some(meta_app)) => {
+                    let mut pb_data = flow_log::AppProtoLogsData {
+                        base: Some(meta_app.base_info.into()),
+                        ..Default::default()
+                    };
+                    let log: L7ProtocolSendLog = meta_app.l7_info.into();
+                    log.fill_app_proto_log(&mut pb_data);
+                    let length = pb_data.encoded_len();
+                    if buffer.len() + length + Self::LENGTH_FIELD_SIZE > batch_len {
+                        self.cached_data = Some(pb_data);
+                        break;
+                    }
+                    buffer.extend_from_slice(&(length as u32).to_be_bytes());
+                    if let Err(e) = pb_data.encode(&mut buffer) {
+                        warn!("failed to encode app proto logs data: {e:?}");
+                        continue;
+                    }
+                    trace!(
+                        "encoded {} bytes to buffer",
+                        length + Self::LENGTH_FIELD_SIZE
+                    );
+                }
+                Ok(None) | Err(pcap_replay::Error::RequireMoreData) => break,
+                Err(e) => return Err(Error::PcapParseFailed(e.to_string())),
+            }
+        }
+        if !buffer.is_empty() {
+            self.output_digest.update(&buffer[..]);
+        }
+        Ok(buffer)
+    }
+}
+
 struct Responser {
     agent_id: Arc<RwLock<AgentId>>,
     batch_len: usize,
 
     heartbeat: Interval,
     msg_recv: Receiver<pb::RemoteExecRequest>,
+
+    config: Config,
 
     // request id, future
     pending_lsns: Option<(
@@ -388,30 +504,40 @@ struct Responser {
 
     // request id, command id, future
     pending_command: Option<(Option<u64>, String, BoxFuture<'static, Result<Output>>)>,
-    result: CommandResult,
+    result: DataChunk,
+
+    #[cfg(feature = "enterprise")]
+    pcap_replay: Option<PcapReplay>,
 }
 
 impl Responser {
-    fn new(agent_id: Arc<RwLock<AgentId>>, receiver: Receiver<pb::RemoteExecRequest>) -> Self {
+    pub fn new(
+        agent_id: Arc<RwLock<AgentId>>,
+        receiver: Receiver<pb::RemoteExecRequest>,
+        config: Config,
+    ) -> Self {
         Responser {
             agent_id,
             batch_len: pb::RemoteExecRequest::default().batch_len() as usize,
             heartbeat: time::interval(Duration::from_secs(30)),
             msg_recv: receiver,
+            config,
             pending_lsns: None,
             pending_command: None,
-            result: CommandResult::default(),
+            result: DataChunk::default(),
+            #[cfg(feature = "enterprise")]
+            pcap_replay: None,
         }
     }
 
-    fn generate_result_batch(&mut self) -> Option<(pb::CommandResult, Option<String>)> {
+    fn generate_result_batch(&mut self) -> Option<(pb::DataChunk, Option<String>)> {
         let batch_len = self.batch_len;
         let r = &mut self.result;
         if r.output.is_empty() {
             return None;
         }
 
-        let mut pb_result = pb::CommandResult {
+        let mut pb_result = pb::DataChunk {
             errno: Some(r.errno),
             total_len: Some(r.total_len as u64),
             pkt_count: Some((r.total_len.saturating_sub(1) / batch_len + 1) as u32),
@@ -432,24 +558,385 @@ impl Responser {
         }
     }
 
+    fn generate_command_list() -> Vec<pb::RemoteCommand> {
+        let mut commands = vec![];
+        SUPPORTED_COMMANDS.with(|cell| {
+            let cs = cell.get_or_init(|| all_supported_commands());
+            for c in cs.iter() {
+                commands.push(pb::RemoteCommand {
+                    cmd: if c.desc.is_empty() {
+                        Some(c.cmdline.to_owned())
+                    } else {
+                        Some(c.desc.to_owned())
+                    },
+                    output_format: match c.output_format {
+                        OutputFormat::Text => Some(pb::OutputFormat::Text as i32),
+                        OutputFormat::Binary => Some(pb::OutputFormat::Binary as i32),
+                    },
+                    ident: Some(c.id.clone()),
+                    params: c
+                        .params
+                        .iter()
+                        .map(|p| pb::CommandParam {
+                            name: Some(p.name.to_owned()),
+                            regex: Some(p.regex.unwrap_or(DEFAULT_PARAM_REGEX).to_owned()),
+                            required: Some(p.required),
+                            param_type: match p.param_type {
+                                ParamType::Boolean => Some(pb::ParamType::PfBoolean as i32),
+                                _ => Some(pb::ParamType::PfText as i32),
+                            },
+                            description: Some(p.description.to_owned()),
+                        })
+                        .collect(),
+                    type_name: Some(c.command_type.to_string()),
+                    ..Default::default()
+                });
+            }
+        });
+        commands
+    }
+
     fn command_failed_helper<'a, S: Into<Cow<'a, str>>>(
         &self,
         request_id: Option<u64>,
         code: Option<i32>,
         msg: S,
-    ) -> Poll<Option<pb::RemoteExecResponse>> {
+    ) -> Option<pb::RemoteExecResponse> {
         let msg: Cow<str> = msg.into();
         warn!("{}", msg);
-        Poll::Ready(Some(pb::RemoteExecResponse {
+        Some(pb::RemoteExecResponse {
             agent_id: Some(self.agent_id.read().deref().into()),
             request_id,
             errmsg: Some(msg.into_owned()),
-            command_result: Some(pb::CommandResult {
+            command_result: Some(pb::DataChunk {
                 errno: code,
                 ..Default::default()
             }),
             ..Default::default()
-        }))
+        })
+    }
+
+    fn handle_pending_command(&mut self, ctx: &mut Context<'_>) -> ControlFlow {
+        let Some((_, id, future)) = self.pending_command.as_mut() else {
+            return ControlFlow::Fallthrough;
+        };
+
+        trace!("poll pending command '{}'", get_cmdline(id).unwrap());
+        let p = future.as_mut().poll(ctx);
+        let Poll::Ready(res) = p else {
+            return ControlFlow::Fallthrough;
+        };
+
+        let (request_id, id, _) = self.pending_command.take().unwrap();
+        match res {
+            Ok(output) => {
+                let err_msg = if output.status.success() {
+                    None
+                } else {
+                    Some(match String::from_utf8(output.stderr) {
+                        Ok(msg) if !msg.is_empty() => msg,
+                        _ => format!("command '{}' failed", get_cmdline(&id).unwrap()),
+                    })
+                };
+                if output.stdout.is_empty() {
+                    if let Some(e_msg) = err_msg {
+                        return ControlFlow::Return(self.command_failed_helper(
+                            request_id,
+                            output.status.code(),
+                            e_msg,
+                        ));
+                    } else {
+                        return ControlFlow::Return(Some(pb::RemoteExecResponse {
+                            agent_id: Some(self.agent_id.read().deref().into()),
+                            request_id: request_id,
+                            command_result: Some(pb::DataChunk::default()),
+                            ..Default::default()
+                        }));
+                    }
+                }
+                let r = &mut self.result;
+                r.request_id = request_id;
+                r.errno = output.status.code().unwrap_or_default();
+                r.err_msg = err_msg;
+                r.output = output.stdout.into();
+                r.total_len = r.output.len();
+                r.digest.reset();
+                ControlFlow::Continue
+            }
+            Err(e) => ControlFlow::Return(self.command_failed_helper(
+                request_id,
+                None,
+                format!(
+                    "command '{}' execute failed: {}",
+                    get_cmdline(&id).unwrap(),
+                    e
+                ),
+            )),
+        }
+    }
+
+    fn handle_pending_lsns(&mut self, ctx: &mut Context<'_>) -> ControlFlow {
+        let Some((_, future)) = self.pending_lsns.as_mut() else {
+            return ControlFlow::Fallthrough;
+        };
+
+        trace!("poll pending lsns");
+        let Poll::Ready(result) = future.as_mut().poll(ctx) else {
+            return ControlFlow::Fallthrough;
+        };
+
+        let (request_id, _) = self.pending_lsns.take().unwrap();
+        match result {
+            Ok(namespaces) => {
+                debug!("list namespace completed with {} entries", namespaces.len());
+                ControlFlow::Return(Some(pb::RemoteExecResponse {
+                    agent_id: Some(self.agent_id.read().deref().into()),
+                    request_id,
+                    linux_namespaces: namespaces,
+                    ..Default::default()
+                }))
+            }
+            Err(e) => {
+                warn!("list namespace failed: {}", e);
+                ControlFlow::Return(Some(pb::RemoteExecResponse {
+                    agent_id: Some(self.agent_id.read().deref().into()),
+                    request_id,
+                    errmsg: Some(e.to_string()),
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+
+    fn handle_run_command_message(&mut self, msg: pb::RemoteExecRequest) -> ControlFlow {
+        if let Some(batch_len) = msg.batch_len {
+            self.batch_len = MIN_BATCH_LEN.max(batch_len as usize);
+        }
+        let Some(cmd_id) = msg.command_ident else {
+            return ControlFlow::Return(self.command_failed_helper(
+                msg.request_id,
+                None,
+                "command_ident not specified in run command request",
+            ));
+        };
+        let Some(cmd) = get_cmd(&cmd_id) else {
+            return ControlFlow::Return(self.command_failed_helper(
+                msg.request_id,
+                None,
+                format!("command not found for id {}", cmd_id),
+            ));
+        };
+        let cmdline = &cmd.cmdline;
+        let params = Params(&msg.params[..msg.params.len().min(max_param_nums())]);
+        if let Err(e) = cmd.check_params(&params) {
+            return ControlFlow::Return(self.command_failed_helper(
+                msg.request_id,
+                None,
+                format!(
+                    "rejected run command '{}' with invalid params: {}",
+                    cmdline, e
+                ),
+            ));
+        }
+
+        let nsfile_fp = match msg.linux_ns_pid {
+            Some(pid) if pid != process::id() => {
+                let path: PathBuf = ["/proc", &pid.to_string(), "ns", "net"].iter().collect();
+                match File::open(&path) {
+                    Ok(fp) => Some(fp),
+                    Err(e) => {
+                        return ControlFlow::Return(self.command_failed_helper(
+                            msg.request_id,
+                            None,
+                            format!("open namespace file {} failed: {}", path.display(), e),
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        trace!(
+            "pending run command '{}', ns_pid: {:?}, params: {:?}",
+            cmdline,
+            msg.linux_ns_pid,
+            params
+        );
+
+        if let Some(f) = nsfile_fp.as_ref() {
+            if let Err(e) = set_netns(f) {
+                warn!("set_netns failed when executing {}: {}", cmdline, e);
+            }
+        }
+
+        let output = if let Some(func) = cmd.override_cmdline.as_ref() {
+            func(&params)
+        } else {
+            // split the whole command line to enable PATH lookup
+            let mut args = cmdline.split_whitespace();
+            let mut cmd = TokioCommand::new(args.next().unwrap());
+            for arg in args {
+                if arg.starts_with('$') {
+                    let name = arg.split_at(1).1;
+                    cmd.arg(params.get(name).unwrap());
+                } else {
+                    cmd.arg(arg);
+                }
+            }
+            Box::pin(cmd.output().map_err(|e| e.into()))
+        };
+
+        if nsfile_fp.is_some() {
+            if let Err(e) = reset_netns() {
+                warn!("reset_netns failed when executing {}: {}", cmdline, e);
+            }
+        }
+        self.pending_command = Some((msg.request_id, cmd_id, output));
+        ControlFlow::Continue
+    }
+
+    #[cfg(feature = "enterprise")]
+    fn handle_dry_replay_pcap_message(&mut self, msg: pb::RemoteExecRequest) -> ControlFlow {
+        trace!("received dry replay pcap message");
+        match self.pcap_replay.as_mut() {
+            Some(pcap_replay) if pcap_replay.request_id != msg.request_id => {
+                warn!("pcap replay request id mismatch: expected {:?}, got {:?}. old request terminated.", pcap_replay.request_id, msg.request_id);
+                self.pcap_replay.take();
+            }
+            Some(pcap_replay) => {
+                let Some(data) = msg.command_data else {
+                    return ControlFlow::Return(self.command_failed_helper(
+                        msg.request_id,
+                        None,
+                        "command_data not specified in DRY_REPLAY_PCAP request",
+                    ));
+                };
+                match data.content {
+                    Some(content) if !content.is_empty() => {
+                        trace!("received {} bytes of pcap data", content.len());
+                        pcap_replay.input_digest.update(&content[..]);
+                        pcap_replay.replayer.push_chunk(content);
+                    }
+                    _ => (),
+                }
+                if let Some(md5) = data.md5 {
+                    debug!(
+                        "request {:?} finished with checksum {md5}",
+                        pcap_replay.request_id
+                    );
+                    let input_digest = md5_to_string(&mut pcap_replay.input_digest);
+                    if input_digest != md5 {
+                        self.pcap_replay.take();
+                        return ControlFlow::Return(self.command_failed_helper(
+                            msg.request_id,
+                            None,
+                            format!("pcap data md5 mismatch: expected {md5}, got {input_digest}. pcap replay terminated."),
+                        ));
+                    }
+                    pcap_replay.end_of_stream = true;
+                }
+                return ControlFlow::Continue;
+            }
+            _ => (),
+        }
+        // new replay request
+        let Some(data) = msg.command_data else {
+            return ControlFlow::Return(self.command_failed_helper(
+                msg.request_id,
+                None,
+                "command_data not specified in DRY_REPLAY_PCAP request",
+            ));
+        };
+        let (replayer, input_digest) = match data.content {
+            Some(content) if !content.is_empty() => {
+                debug!("new pcap replay request {:?}", msg.request_id);
+                let mut digest = Md5::new();
+                digest.update(&content[..]);
+                match pcap_replay::Replayer::new(content) {
+                    Ok(replayer) => (replayer, digest),
+                    Err(e) => {
+                        return ControlFlow::Return(self.command_failed_helper(
+                            msg.request_id,
+                            None,
+                            format!("failed to create pcap replayer: {e}"),
+                        ))
+                    }
+                }
+            }
+            _ => return ControlFlow::Return(self.command_failed_helper(
+                msg.request_id,
+                None,
+                "command_data.content not specified or is empty in first DRY_REPLAY_PCAP request",
+            )),
+        };
+        let mut pcap_replay = PcapReplay {
+            request_id: msg.request_id,
+            replayer,
+            cached_data: None,
+            input_digest,
+            output_digest: Md5::new(),
+            end_of_stream: false,
+        };
+        if let Some(md5) = data.md5 {
+            debug!(
+                "request {:?} finished with checksum {md5}",
+                pcap_replay.request_id
+            );
+            let input_digest = md5_to_string(&mut pcap_replay.input_digest);
+            if input_digest != md5 {
+                return ControlFlow::Return(self.command_failed_helper(
+                    msg.request_id,
+                    None,
+                    format!("pcap data md5 mismatch: expected {md5}, got {input_digest}. pcap replay terminated."),
+                ));
+            }
+            pcap_replay.end_of_stream = true;
+        }
+        self.pcap_replay = Some(pcap_replay);
+        ControlFlow::Continue
+    }
+
+    fn handle_message(&mut self, ctx: &mut Context<'_>) -> ControlFlow {
+        match self.msg_recv.poll_recv(ctx) {
+            // sender closed, terminate the current stream
+            Poll::Ready(None) => ControlFlow::Return(None),
+            Poll::Ready(Some(msg)) => {
+                let raw_exec_type = msg.exec_type.unwrap();
+                match pb::ExecutionType::try_from(raw_exec_type) {
+                    Ok(pb::ExecutionType::ListCommand) => {
+                        let commands = Self::generate_command_list();
+                        debug!("list command returning {} entries", commands.len());
+                        ControlFlow::Return(Some(pb::RemoteExecResponse {
+                            agent_id: Some(self.agent_id.read().deref().into()),
+                            request_id: msg.request_id,
+                            commands,
+                            ..Default::default()
+                        }))
+                    }
+                    Ok(pb::ExecutionType::ListNamespace) => {
+                        trace!("pending list namespace");
+                        self.pending_lsns = Some((msg.request_id, Box::pin(ls_netns())));
+                        ControlFlow::Continue
+                    }
+                    Ok(pb::ExecutionType::RunCommand) => self.handle_run_command_message(msg),
+                    #[cfg(feature = "enterprise")]
+                    Ok(pb::ExecutionType::DryReplayPcap) => {
+                        self.handle_dry_replay_pcap_message(msg)
+                    }
+                    Ok(exec_type) => ControlFlow::Return(self.command_failed_helper(
+                        msg.request_id,
+                        None,
+                        format!("unsupported execution type: {exec_type:?}"),
+                    )),
+                    Err(_) => ControlFlow::Return(self.command_failed_helper(
+                        msg.request_id,
+                        None,
+                        format!("unsupported execution type: {raw_exec_type}"),
+                    )),
+                }
+            }
+            _ => ControlFlow::Fallthrough,
+        }
     }
 }
 
@@ -460,10 +947,11 @@ impl Stream for Responser {
         /*
          * order of polling:
          * 1. Send remaining buffered command output
-         * 2. Poll pending command if any. If command succeeded, restart from top
-         * 3. Poll pending lsns function if any
-         * 4. Poll message queue for command from server. On receiving a new command, restart from top
-         * 5. Poll ticker for heartbeat
+         * 2. Send remaining buffered pcap replay output
+         * 3. Poll pending command if any. If command succeeded, restart from top
+         * 4. Poll pending lsns function if any
+         * 5. Poll message queue for command from server. On receiving a new command, restart from top
+         * 6. Poll ticker for heartbeat
          */
 
         loop {
@@ -481,255 +969,86 @@ impl Stream for Responser {
                 }));
             }
 
-            if let Some((_, id, future)) = self.pending_command.as_mut() {
-                trace!("poll pending command '{}'", get_cmdline(id).unwrap());
-                let p = future.as_mut().poll(ctx);
-
-                if let Poll::Ready(res) = p {
-                    let (request_id, id, _) = self.pending_command.take().unwrap();
-                    match res {
-                        Ok(output) => {
-                            let err_msg = if output.status.success() {
-                                None
-                            } else {
-                                Some(match String::from_utf8(output.stderr) {
-                                    Ok(msg) if !msg.is_empty() => msg,
-                                    _ => format!("command '{}' failed", get_cmdline(&id).unwrap()),
-                                })
-                            };
-                            if output.stdout.is_empty() {
-                                if let Some(e_msg) = err_msg {
-                                    return self.command_failed_helper(
-                                        request_id,
-                                        output.status.code(),
-                                        e_msg,
-                                    );
-                                } else {
-                                    return Poll::Ready(Some(pb::RemoteExecResponse {
-                                        agent_id: Some(self.agent_id.read().deref().into()),
-                                        request_id: request_id,
-                                        command_result: Some(pb::CommandResult::default()),
-                                        ..Default::default()
-                                    }));
-                                }
-                            }
-                            let r = &mut self.result;
-                            r.request_id = request_id;
-                            r.errno = output.status.code().unwrap_or_default();
-                            r.err_msg = err_msg;
-                            r.output = output.stdout.into();
-                            r.total_len = r.output.len();
-                            r.digest.reset();
-                            continue;
+            #[cfg(feature = "enterprise")]
+            let (config, batch_len, agent_id) = (
+                pcap_replay::Config {
+                    flow_config: &self.config.flow.load(),
+                    log_parser_config: &self.config.log_parser.load(),
+                },
+                self.batch_len,
+                Some(self.agent_id.read().deref().into()),
+            );
+            #[cfg(feature = "enterprise")]
+            if let Some(pcap_replay) = self.pcap_replay.as_mut() {
+                match pcap_replay.next_batch(batch_len, &config) {
+                    Ok(batch) => {
+                        if pcap_replay.end_of_stream && pcap_replay.cached_data.is_none() {
+                            debug!("pcap replay request {:?} finished", pcap_replay.request_id);
+                            let ret = Poll::Ready(Some(pb::RemoteExecResponse {
+                                agent_id,
+                                request_id: pcap_replay.request_id,
+                                command_result: Some(pb::DataChunk {
+                                    content: if batch.is_empty() { None } else { Some(batch) },
+                                    md5: Some(md5_to_string(&mut pcap_replay.output_digest)),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }));
+                            self.pcap_replay.take();
+                            return ret;
                         }
-                        Err(e) => {
-                            return self.command_failed_helper(
-                                request_id,
-                                None,
-                                format!(
-                                    "command '{}' execute failed: {}",
-                                    get_cmdline(&id).unwrap(),
-                                    e
-                                ),
-                            )
+                        if !batch.is_empty() {
+                            trace!("send {} bytes of pcap replay data", batch.len());
+                            return Poll::Ready(Some(pb::RemoteExecResponse {
+                                agent_id,
+                                request_id: pcap_replay.request_id,
+                                command_result: Some(pb::DataChunk {
+                                    content: Some(batch),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }));
                         }
+                        // no more data yet, fallthrough to poll recv queue for more data
+                    }
+                    Err(e) => {
+                        let pcap_replay = self.pcap_replay.take().unwrap();
+                        return Poll::Ready(self.command_failed_helper(
+                            pcap_replay.request_id,
+                            None,
+                            format!("failed to generate pcap replay batch: {e}"),
+                        ));
                     }
                 }
             }
 
-            if let Some((_, future)) = self.pending_lsns.as_mut() {
-                trace!("poll pending lsns");
-                if let Poll::Ready(result) = future.as_mut().poll(ctx) {
-                    let (request_id, _) = self.pending_lsns.take().unwrap();
-                    match result {
-                        Ok(namespaces) => {
-                            debug!("list namespace completed with {} entries", namespaces.len());
-                            return Poll::Ready(Some(pb::RemoteExecResponse {
-                                agent_id: Some(self.agent_id.read().deref().into()),
-                                request_id,
-                                linux_namespaces: namespaces,
-                                ..Default::default()
-                            }));
-                        }
-                        Err(e) => {
-                            warn!("list namespace failed: {}", e);
-                            return Poll::Ready(Some(pb::RemoteExecResponse {
-                                agent_id: Some(self.agent_id.read().deref().into()),
-                                request_id,
-                                errmsg: Some(e.to_string()),
-                                ..Default::default()
-                            }));
-                        }
-                    }
-                }
+            match self.handle_pending_command(ctx) {
+                ControlFlow::Return(response) => return Poll::Ready(response),
+                ControlFlow::Continue => continue,
+                ControlFlow::Fallthrough => (),
             }
 
-            match self.msg_recv.poll_recv(ctx) {
-                // sender closed, terminate the current stream
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(msg)) => {
-                    match pb::ExecutionType::try_from(msg.exec_type.unwrap()).unwrap() {
-                        pb::ExecutionType::ListCommand => {
-                            let mut commands = vec![];
-                            SUPPORTED_COMMANDS.with(|cell| {
-                                let cs = cell.get_or_init(|| all_supported_commands());
-                                for c in cs.iter() {
-                                    commands.push(pb::RemoteCommand {
-                                        cmd: if c.desc.is_empty() {
-                                            Some(c.cmdline.to_owned())
-                                        } else {
-                                            Some(c.desc.to_owned())
-                                        },
-                                        output_format: match c.output_format {
-                                            OutputFormat::Text => {
-                                                Some(pb::OutputFormat::Text as i32)
-                                            }
-                                            OutputFormat::Binary => {
-                                                Some(pb::OutputFormat::Binary as i32)
-                                            }
-                                        },
-                                        ident: Some(c.id.clone()),
-                                        params: c
-                                            .params
-                                            .iter()
-                                            .map(|p| pb::CommandParam {
-                                                name: Some(p.name.to_owned()),
-                                                regex: Some(
-                                                    p.regex
-                                                        .unwrap_or(DEFAULT_PARAM_REGEX)
-                                                        .to_owned(),
-                                                ),
-                                                required: Some(p.required),
-                                                param_type: match p.param_type {
-                                                    ParamType::Boolean => {
-                                                        Some(pb::ParamType::PfBoolean as i32)
-                                                    }
-                                                    _ => Some(pb::ParamType::PfText as i32),
-                                                },
-                                                description: Some(p.description.to_owned()),
-                                            })
-                                            .collect(),
-                                        type_name: Some(c.command_type.to_string()),
-                                        ..Default::default()
-                                    });
-                                }
-                            });
-                            debug!("list command returning {} entries", commands.len());
-                            return Poll::Ready(Some(pb::RemoteExecResponse {
-                                agent_id: Some(self.agent_id.read().deref().into()),
-                                request_id: msg.request_id,
-                                commands,
-                                ..Default::default()
-                            }));
-                        }
-                        pb::ExecutionType::ListNamespace => {
-                            trace!("pending list namespace");
-                            self.pending_lsns = Some((msg.request_id, Box::pin(ls_netns())));
-                            continue;
-                        }
-                        pb::ExecutionType::RunCommand => {
-                            if let Some(batch_len) = msg.batch_len {
-                                self.batch_len = MIN_BATCH_LEN.max(batch_len as usize);
-                            }
-                            let Some(cmd_id) = msg.command_ident else {
-                                return self.command_failed_helper(
-                                    msg.request_id,
-                                    None,
-                                    "command_ident not specified in run command request",
-                                );
-                            };
-                            let Some(cmd) = get_cmd(&cmd_id) else {
-                                return self.command_failed_helper(
-                                    msg.request_id,
-                                    None,
-                                    format!("command not found for id {}", cmd_id),
-                                );
-                            };
-                            let cmdline = &cmd.cmdline;
-                            let params =
-                                Params(&msg.params[..msg.params.len().min(max_param_nums())]);
-                            if let Err(e) = cmd.check_params(&params) {
-                                return self.command_failed_helper(
-                                    msg.request_id,
-                                    None,
-                                    format!(
-                                        "rejected run command '{}' with invalid params: {}",
-                                        cmdline, e
-                                    ),
-                                );
-                            }
+            match self.handle_pending_lsns(ctx) {
+                ControlFlow::Return(response) => return Poll::Ready(response),
+                ControlFlow::Continue => continue,
+                ControlFlow::Fallthrough => (),
+            }
 
-                            let nsfile_fp = match msg.linux_ns_pid {
-                                Some(pid) if pid != process::id() => {
-                                    let path: PathBuf =
-                                        ["/proc", &pid.to_string(), "ns", "net"].iter().collect();
-                                    match File::open(&path) {
-                                        Ok(fp) => Some(fp),
-                                        Err(e) => {
-                                            return self.command_failed_helper(
-                                                msg.request_id,
-                                                None,
-                                                format!(
-                                                    "open namespace file {} failed: {}",
-                                                    path.display(),
-                                                    e
-                                                ),
-                                            )
-                                        }
-                                    }
-                                }
-                                _ => None,
-                            };
-
-                            trace!(
-                                "pending run command '{}', ns_pid: {:?}, params: {:?}",
-                                cmdline,
-                                msg.linux_ns_pid,
-                                params
-                            );
-
-                            if let Some(f) = nsfile_fp.as_ref() {
-                                if let Err(e) = set_netns(f) {
-                                    warn!("set_netns failed when executing {}: {}", cmdline, e);
-                                }
-                            }
-
-                            let output = if let Some(func) = cmd.override_cmdline.as_ref() {
-                                func(&params)
-                            } else {
-                                // split the whole command line to enable PATH lookup
-                                let mut args = cmdline.split_whitespace();
-                                let mut cmd = TokioCommand::new(args.next().unwrap());
-                                for arg in args {
-                                    if arg.starts_with('$') {
-                                        let name = arg.split_at(1).1;
-                                        cmd.arg(params.get(name).unwrap());
-                                    } else {
-                                        cmd.arg(arg);
-                                    }
-                                }
-                                Box::pin(cmd.output().map_err(|e| e.into()))
-                            };
-
-                            if nsfile_fp.is_some() {
-                                if let Err(e) = reset_netns() {
-                                    warn!("reset_netns failed when executing {}: {}", cmdline, e);
-                                }
-                            }
-                            self.pending_command = Some((msg.request_id, cmd_id, output));
-                            continue;
-                        }
-                    }
-                }
-                _ => (),
+            match self.handle_message(ctx) {
+                ControlFlow::Return(response) => return Poll::Ready(response),
+                ControlFlow::Continue => continue,
+                ControlFlow::Fallthrough => (),
             }
 
             return match self.heartbeat.poll_tick(ctx) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(_) => Poll::Ready(Some(pb::RemoteExecResponse {
-                    agent_id: Some(self.agent_id.read().deref().into()),
-                    ..Default::default()
-                })),
+                Poll::Ready(_) => {
+                    trace!("heartbeat sent");
+                    Poll::Ready(Some(pb::RemoteExecResponse {
+                        agent_id: Some(self.agent_id.read().deref().into()),
+                        ..Default::default()
+                    }))
+                }
             };
         }
     }
@@ -1039,7 +1358,7 @@ struct DescribePod {
 }
 
 async fn kubectl_describe_pod(namespace: String, pod_name: String) -> Result<Output> {
-    let mut config = Config::infer()
+    let mut config = KubeConfig::infer()
         .map_err(|e| kube::Error::InferConfig(e))
         .await?;
     config.accept_invalid_certs = true;
@@ -1085,7 +1404,7 @@ async fn kubectl_describe_pod(namespace: String, pod_name: String) -> Result<Out
 const LOG_LINES: usize = 10000;
 
 async fn kubectl_log(namespace: String, pod: String, previous: bool) -> Result<Output> {
-    let mut config = Config::infer()
+    let mut config = KubeConfig::infer()
         .map_err(|e| kube::Error::InferConfig(e))
         .await?;
     config.accept_invalid_certs = true;
@@ -1107,4 +1426,80 @@ async fn kubectl_log(namespace: String, pod: String, previous: bool) -> Result<O
         stdout: logs.into_bytes(),
         stderr: vec![],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::Arc,
+    };
+
+    use arc_swap::{access::Map, ArcSwap};
+    use futures::StreamExt;
+    use parking_lot::RwLock;
+
+    use super::*;
+    use crate::config::ModuleConfig;
+
+    fn test_config() -> Config {
+        let current_config = Arc::new(ArcSwap::from_pointee(ModuleConfig::default()));
+        Config {
+            flow: Map::new(current_config.clone(), |config| &config.flow),
+            log_parser: Map::new(current_config, |config| &config.log_parser),
+        }
+    }
+
+    fn test_agent_id() -> Arc<RwLock<AgentId>> {
+        Arc::new(RwLock::new(AgentId {
+            ipmac: (IpAddr::V4(Ipv4Addr::LOCALHOST), Default::default()).into(),
+            ..Default::default()
+        }))
+    }
+
+    async fn next_response_for(exec_type: i32) -> pb::RemoteExecResponse {
+        let (sender, receiver) = mpsc::channel(1);
+        let mut responser = Responser::new(test_agent_id(), receiver, test_config());
+        sender
+            .send(pb::RemoteExecRequest {
+                request_id: Some(42),
+                exec_type: Some(exec_type),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        responser.next().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn unsupported_exec_type_returns_error_response() {
+        let response = next_response_for(99).await;
+
+        assert_eq!(response.request_id, Some(42));
+        assert_eq!(
+            response.errmsg.as_deref(),
+            Some("unsupported execution type: 99")
+        );
+        assert!(response.agent_id.is_some());
+        assert!(response.command_result.is_some());
+        assert!(response.commands.is_empty());
+        assert!(response.linux_namespaces.is_empty());
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    #[tokio::test]
+    async fn dry_replay_pcap_returns_error_without_enterprise_feature() {
+        let response = next_response_for(pb::ExecutionType::DryReplayPcap as i32).await;
+
+        assert_eq!(response.request_id, Some(42));
+        assert_eq!(
+            response.errmsg.as_deref(),
+            Some("unsupported execution type: DryReplayPcap")
+        );
+        assert!(response.agent_id.is_some());
+        assert!(response.command_result.is_some());
+        assert!(response.commands.is_empty());
+        assert!(response.linux_namespaces.is_empty());
+    }
 }

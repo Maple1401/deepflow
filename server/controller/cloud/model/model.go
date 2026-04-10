@@ -26,11 +26,19 @@ type Region struct {
 	Name   string `json:"name" binding:"required"`
 }
 
+func (r Region) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type AZ struct {
 	Lcuuid       string `json:"lcuuid" binding:"required"`
 	Label        string `json:"label"`
 	Name         string `json:"name" binding:"required"`
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
+}
+
+func (r AZ) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type Host struct {
@@ -45,6 +53,10 @@ type Host struct {
 	ExtraInfo    string `json:"extra_info"`
 	AZLcuuid     string `json:"az_lcuuid" binding:"required"`
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
+}
+
+func (r Host) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type VM struct {
@@ -64,6 +76,10 @@ type VM struct {
 	NetworkLcuuid string            `json:"network_lcuuid"`
 }
 
+func (r VM) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type VMPodNodeConnection struct {
 	Lcuuid          string `json:"lcuuid" binding:"required"`
 	VMLcuuid        string `json:"vm_lcuuid" binding:"required"`
@@ -71,13 +87,22 @@ type VMPodNodeConnection struct {
 	SubDomainLcuuid string `json:"sub_domain_lcuuid" binding:"required"`
 }
 
+func (r VMPodNodeConnection) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type VPC struct {
 	Lcuuid       string `json:"lcuuid" binding:"required"`
 	Name         string `json:"name" binding:"required"`
 	Label        string `json:"label"`
+	Owner        string `json:"owner"`
 	TunnelID     int    `json:"tunnel_id"`
 	CIDR         string `json:"cidr"`
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
+}
+
+func (r VPC) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type Network struct {
@@ -96,6 +121,10 @@ type Network struct {
 	SubDomainLcuuid string `json:"sub_domain_lcuuid"`
 }
 
+func (r Network) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type Subnet struct {
 	Lcuuid          string `json:"lcuuid" binding:"required"`
 	Name            string `json:"name" binding:"required"`
@@ -107,6 +136,10 @@ type Subnet struct {
 	SubDomainLcuuid string `json:"sub_domain_lcuuid"`
 }
 
+func (r Subnet) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type VRouter struct {
 	Lcuuid         string `json:"lcuuid" binding:"required"`
 	Name           string `json:"name" binding:"required"`
@@ -114,6 +147,10 @@ type VRouter struct {
 	GWLaunchServer string `json:"gw_launch_server" binding:"required"`
 	VPCLcuuid      string `json:"vpc_lcuuid" binding:"required"`
 	RegionLcuuid   string `json:"region_lcuuid" binding:"required"`
+}
+
+func (r VRouter) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type RoutingTable struct {
@@ -124,6 +161,10 @@ type RoutingTable struct {
 	Nexthop       string `json:"nexthop" binding:"required"`
 }
 
+func (r RoutingTable) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type ThirdPartyDevice struct {
 	Lcuuid       string `json:"lcuuid" binding:"required"`
 	Name         string `json:"name" binding:"required"`
@@ -132,12 +173,20 @@ type ThirdPartyDevice struct {
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
 }
 
+func (r ThirdPartyDevice) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type DHCPPort struct {
 	Lcuuid       string `json:"lcuuid" binding:"required"`
 	Name         string `json:"name" binding:"required"`
 	VPCLcuuid    string `json:"vpc_lcuuid" binding:"required"`
 	AZLcuuid     string `json:"az_lcuuid" binding:"required"`
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
+}
+
+func (r DHCPPort) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type VInterface struct {
@@ -157,6 +206,10 @@ type VInterface struct {
 	VPCID           int    // TODO @zhengya remove
 }
 
+func (r VInterface) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type IP struct {
 	Lcuuid           string `json:"lcuuid" binding:"required"`
 	VInterfaceLcuuid string `json:"vinterface_lcuuid" binding:"required"`
@@ -166,10 +219,18 @@ type IP struct {
 	SubDomainLcuuid  string `json:"sub_domain_lcuuid"`
 }
 
+func (r IP) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type VIP struct {
 	Lcuuid string `json:"lcuuid" binding:"required"`
 	IP     string `json:"ip" binding:"required"`
 	VTapID uint32 `json:"vtap_id" binding:"required"`
+}
+
+func (r VIP) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type FloatingIP struct {
@@ -179,6 +240,10 @@ type FloatingIP struct {
 	NetworkLcuuid string `json:"network_lcuuid" binding:"required"`
 	VPCLcuuid     string `json:"vpc_lcuuid" binding:"required"`
 	RegionLcuuid  string `json:"region_lcuuid" binding:"required"`
+}
+
+func (r FloatingIP) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type LB struct {
@@ -191,6 +256,10 @@ type LB struct {
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
 }
 
+func (r LB) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type LBListener struct {
 	Lcuuid   string `json:"lcuuid" binding:"required"`
 	LBLcuuid string `json:"lb_lcuuid" binding:"required"`
@@ -200,6 +269,10 @@ type LBListener struct {
 	SNATIPs  string `json:"snat_ips"`
 	Protocol string `json:"protocol" binding:"required"`
 	Port     int    `json:"port" binding:"required"`
+}
+
+func (r LBListener) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type LBTargetServer struct {
@@ -214,10 +287,18 @@ type LBTargetServer struct {
 	VPCLcuuid        string `json:"vpc_lcuuid" binding:"required"`
 }
 
+func (r LBTargetServer) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type LBVMConnection struct {
 	Lcuuid   string `json:"lcuuid" binding:"required"`
 	LBLcuuid string `json:"lb_lcuuid" binding:"required"`
 	VMLcuuid string `json:"vm_lcuuid" binding:"required"`
+}
+
+func (r LBVMConnection) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type NATGateway struct {
@@ -227,6 +308,10 @@ type NATGateway struct {
 	FloatingIPs  string `json:"floating_ips"`
 	VPCLcuuid    string `json:"vpc_lcuuid" binding:"required"`
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
+}
+
+func (r NATGateway) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type NATRule struct {
@@ -241,10 +326,18 @@ type NATRule struct {
 	VInterfaceLcuuid string `json:"vinterface_lcuuid"`
 }
 
+func (r NATRule) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type NATVMConnection struct {
 	Lcuuid           string `json:"lcuuid" binding:"required"`
 	NATGatewayLcuuid string `json:"nat_gateway_lcuuid" binding:"required"`
 	VMLcuuid         string `json:"vm_lcuuid" binding:"required"`
+}
+
+func (r NATVMConnection) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type PeerConnection struct {
@@ -257,11 +350,19 @@ type PeerConnection struct {
 	RemoteRegionLcuuid string `json:"remote_region_lcuuid" binding:"required"`
 }
 
+func (r PeerConnection) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type CEN struct {
 	Lcuuid     string   `json:"lcuuid" binding:"required"`
 	Name       string   `json:"name" binding:"required"`
 	Label      string   `json:"label"`
 	VPCLcuuids []string `json:"vpc_lcuuids"`
+}
+
+func (r CEN) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type RedisInstance struct {
@@ -275,6 +376,10 @@ type RedisInstance struct {
 	VPCLcuuid    string `json:"vpc_lcuuid" binding:"required"`
 	AZLcuuid     string `json:"az_lcuuid"`
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
+}
+
+func (r RedisInstance) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type RDSInstance struct {
@@ -291,6 +396,10 @@ type RDSInstance struct {
 	RegionLcuuid string `json:"region_lcuuid" binding:"required"`
 }
 
+func (r RDSInstance) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type SubDomain struct {
 	TeamID        int    `json:"team_id" binding:"required"`
 	Lcuuid        string `json:"lcuuid" binding:"required"`
@@ -302,6 +411,10 @@ type SubDomain struct {
 	Config        string `json:"config" binding:"required"`
 }
 
+func (r SubDomain) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type PodCluster struct {
 	Lcuuid          string `json:"lcuuid" binding:"required"`
 	Name            string `json:"name" binding:"required"`
@@ -311,6 +424,10 @@ type PodCluster struct {
 	AZLcuuid        string `json:"az_lcuuid" binding:"required"`
 	RegionLcuuid    string `json:"region_lcuuid" binding:"required"`
 	SubDomainLcuuid string `json:"sub_domain_lcuuid" binding:"required"`
+}
+
+func (r PodCluster) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type PodNode struct {
@@ -330,6 +447,10 @@ type PodNode struct {
 	SubDomainLcuuid  string `json:"sub_domain_lcuuid" binding:"required"`
 }
 
+func (r PodNode) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type PodNamespace struct {
 	Lcuuid           string            `json:"lcuuid" binding:"required"`
 	Name             string            `json:"name" binding:"required"`
@@ -338,6 +459,10 @@ type PodNamespace struct {
 	RegionLcuuid     string            `json:"region_lcuuid" binding:"required"`
 	SubDomainLcuuid  string            `json:"sub_domain_lcuuid" binding:"required"`
 	CloudTags        map[string]string `json:"cloud_tags"`
+}
+
+func (r PodNamespace) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type PodService struct {
@@ -362,6 +487,10 @@ type PodService struct {
 	SubDomainLcuuid    string `json:"sub_domain_lcuuid" binding:"required"`
 }
 
+func (r PodService) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 func (p PodService) ToLoggable() interface{} {
 	copied := p
 	copied.Metadata = "**HIDDEN**"
@@ -380,6 +509,10 @@ type PodServicePort struct {
 	SubDomainLcuuid  string `json:"sub_domain_lcuuid" binding:"required"`
 }
 
+func (r PodServicePort) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type PodGroup struct {
 	Lcuuid             string `json:"lcuuid" binding:"required"`
 	Name               string `json:"name" binding:"required"`
@@ -388,6 +521,7 @@ type PodGroup struct {
 	Spec               string `json:"-"`
 	SpecHash           string `json:"spec_hash"`
 	Label              string `json:"label"`
+	NetworkMode        int    `json:"network_mode"`
 	Type               int    `json:"type" binding:"required"`
 	PodNum             int    `json:"pod_num" binding:"required"`
 	PodNamespaceLcuuid string `json:"pod_namespace_lcuuid" binding:"required"`
@@ -395,6 +529,10 @@ type PodGroup struct {
 	AZLcuuid           string `json:"az_lcuuid" binding:"required"`
 	RegionLcuuid       string `json:"region_lcuuid" binding:"required"`
 	SubDomainLcuuid    string `json:"sub_domain_lcuuid" binding:"required"`
+}
+
+func (r PodGroup) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 func (p PodGroup) ToLoggable() interface{} {
@@ -414,6 +552,10 @@ type PodGroupPort struct {
 	SubDomainLcuuid  string `json:"sub_domain_lcuuid" binding:"required"`
 }
 
+func (r PodGroupPort) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type PodIngress struct {
 	Lcuuid             string `json:"lcuuid" binding:"required"`
 	Name               string `json:"name" binding:"required"`
@@ -422,6 +564,10 @@ type PodIngress struct {
 	AZLcuuid           string `json:"az_lcuuid" binding:"required"`
 	RegionLcuuid       string `json:"region_lcuuid" binding:"required"`
 	SubDomainLcuuid    string `json:"sub_domain_lcuuid" binding:"required"`
+}
+
+func (r PodIngress) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type PodIngressRule struct {
@@ -433,6 +579,10 @@ type PodIngressRule struct {
 	SubDomainLcuuid  string `json:"sub_domain_lcuuid"`
 }
 
+func (r PodIngressRule) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type PodIngressRuleBackend struct {
 	Lcuuid               string `json:"lcuuid" binding:"required"`
 	Path                 string `json:"path"`
@@ -441,6 +591,10 @@ type PodIngressRuleBackend struct {
 	PodIngressRuleLcuuid string `json:"pod_ingress_rule_lcuuid" binding:"required"`
 	PodIngressLcuuid     string `json:"pod_ingress_lcuuid" binding:"required"`
 	SubDomainLcuuid      string `json:"sub_domain_lcuuid"`
+}
+
+func (r PodIngressRuleBackend) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type PodReplicaSet struct {
@@ -454,6 +608,10 @@ type PodReplicaSet struct {
 	AZLcuuid           string `json:"az_lcuuid" binding:"required"`
 	RegionLcuuid       string `json:"region_lcuuid" binding:"required"`
 	SubDomainLcuuid    string `json:"sub_domain_lcuuid" binding:"required"`
+}
+
+func (r PodReplicaSet) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type Pod struct {
@@ -477,6 +635,10 @@ type Pod struct {
 	SubDomainLcuuid     string    `json:"sub_domain_lcuuid" binding:"required"`
 }
 
+func (r Pod) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type ConfigMap struct {
 	Lcuuid             string    `json:"lcuuid" binding:"required"`
 	Name               string    `json:"name" binding:"required"`
@@ -497,11 +659,19 @@ func (c ConfigMap) ToLoggable() interface{} {
 	return copied
 }
 
+func (r ConfigMap) GetLcuuid() string {
+	return r.Lcuuid
+}
+
 type PodGroupConfigMapConnection struct {
 	Lcuuid          string `json:"lcuuid" binding:"required"`
 	PodGroupLcuuid  string `json:"pod_group_lcuuid" binding:"required"`
 	ConfigMapLcuuid string `json:"config_map_lcuuid" binding:"required"`
 	SubDomainLcuuid string `json:"sub_domain_lcuuid" binding:"required"`
+}
+
+func (r PodGroupConfigMapConnection) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type Process struct {
@@ -517,6 +687,10 @@ type Process struct {
 	NetnsID         uint32    `json:"netns_id"`
 	ContainerID     string    `json:"container_id"`
 	SubDomainLcuuid string    `json:"sub_domain_lcuuid"`
+}
+
+func (r Process) GetLcuuid() string {
+	return r.Lcuuid
 }
 
 type SubDomainResource struct {

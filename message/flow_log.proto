@@ -55,6 +55,8 @@ message Flow {
     string request_domain = 26;
 
     repeated uint64 aggregated_flow_ids = 27;
+
+    uint32 init_ipid = 28;
 }
 
 message FlowKey {
@@ -152,11 +154,14 @@ message TCPPerfStats {
     uint32 cit_max = 19;
     uint32 cit_sum = 20;
     uint32 cit_count = 21;
+
+    uint32 fin_count = 22;
 }
 
 message TcpPerfCountsPeer {
     uint32 retrans_count = 1;
     uint32 zero_win_count = 2;
+    uint32 ooo_count = 3;
 }
 
 message L7PerfStats {
@@ -189,6 +194,7 @@ message TraceInfo {
     string trace_id = 1;
     string span_id = 2;
     string parent_span_id = 3;
+    repeated string trace_ids = 4;
 }
 
 message ExtendedInfo {
@@ -208,6 +214,13 @@ message ExtendedInfo {
     repeated double metrics_values = 19;
 }
 
+enum FlagBits {
+  FLAG_NONE = 0;
+  FLAG_TLS = 1;      // 1<<0
+  FLAG_ASYNC = 2;    // 1<<1
+  FLAG_REVERSED = 4; // 1<<2
+}
+
 message AppProtoLogsData {
     AppProtoLogsBaseInfo base = 1;
 
@@ -221,15 +234,18 @@ message AppProtoLogsData {
 
     uint32 row_effect = 16;
     uint32 direction_score = 17;
-    // Flags Bimmap:
-    // 32                                  1     0
-    // +-----------------------------------+-----+
-    // | Reserve                           | TLS |
+    // Flags Bitmap (enum FlagBits):
+    // 32                 3         2       1     0
+    // +------------------------------------+-----+
+    // | Reserve          |reversed | async | TLS |
     // +-----------------------------------+-----+
     uint32 flags = 18;
     // Excluding L2-L4 packet header
     uint32 captured_request_byte = 19;
     uint32 captured_response_byte = 20;
+    string biz_code = 21;
+    string biz_scenario = 22;
+    string biz_response_code = 23;
 }
 
 message AppProtoLogsBaseInfo {

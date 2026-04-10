@@ -26,6 +26,16 @@
 
 #include "../config.h"
 
+#define INVALID_OFFSET 0xFFFF
+
+// Structure used to store kernel mount information for adaptation purposes.
+// Helps to infer kernel structure offsets for different kernel versions.
+struct adapt_kern_data {
+	__u64 id;       // Combined identifier, e.g., {tgid, pid} of the process
+	int mnt_id;     // Mount ID corresponding to the file
+	__u32 mntns_id; // Mount namespace ID corresponding to the file
+};
+
 enum endpoint_role {
 	ROLE_UNKNOWN,
 	ROLE_CLIENT,
@@ -68,17 +78,55 @@ struct __socket_data {
 	__u64 thread_trace_id;
 
 	/* 追踪数据信息 */
-	__u64 timestamp;	// 数据捕获时间戳
+
+	/*
+	 * Semantic timestamp of the data (Event / Logical Time).
+	 *
+	 * Represents the time point to which this event logically belongs,
+	 * which is not necessarily the time when the data was actually captured.
+	 *
+	 * Timestamp selection rules by system call type:
+	 *   - Socket send–type system calls:
+	 *     Uses the system call entry time to ensure that the send event
+	 *     is ordered before the corresponding packets captured later via
+	 *     af_packet.
+	 *   - File I/O system calls:
+	 *     Uses the system call entry time, representing when the I/O
+	 *     operation started. The operation duration is expressed separately.
+	 *   - Socket recv–type system calls:
+	 *     Uses the system call exit time, indicating when received data
+	 *     becomes visible to user space.
+	 *
+	 * Note:
+	 * Data is always captured at system call exit, but this field may
+	 * refer to the entry time, which can cause timestamp rollback.
+	 */
+	__u64 timestamp;
+
+	/*
+	 * Capture timestamp of the data (Capture / Processing Time).
+	 *
+	 * Indicates the actual time when this data was captured and reported
+	 * by the eBPF tracer. This timestamp always corresponds to the
+	 * system call exit time.
+	 *
+	 * This field reflects the true observation order and is typically
+	 * monotonically increasing within a single CPU or trace stream.
+	 *
+	 * This timestamp should be preferred for:
+	 *   - Time windowing and aggregation
+	 *   - Event ordering and deduplication
+	 *   - Latency and performance analysis
+	 */
+	__u64 cap_timestamp;	// ns since Unix epoch
 	__u8 direction:1;	// bits[0]: 方向，值为T_EGRESS(0), T_INGRESS(1)
 	__u8 msg_type:6;	// bits[1-6]: 信息类型，值为MSG_UNKNOWN(0), MSG_REQUEST(1), MSG_RESPONSE(2)
 	__u8 is_tls:1;
 
 	__u64 syscall_len;	// 本次系统调用读、写数据的总长度
-	union {
-		__u64 data_seq;		// cap_data在Socket中的相对顺序号
-		__u32 fd;
-	};
-	__u16 data_type;	// HTTP, DNS, MySQL
+	__u64 data_seq;		// cap_data在Socket中的相对顺序号
+	__u32 fd;
+	__u16 data_type;	// HTTP, DNS, MySQL ...
 	__u16 data_len;		// 数据长度
 	__u8 socket_role;	// this message is created by: 0:unkonwn 1:client(connect) 2:server(accept)
 	char data[BURST_DATA_BUF_SIZE];
@@ -132,7 +180,8 @@ struct socket_info_s {
 	 * participate in tracing.
 	 */
 	__u16 no_trace:1;
-	__u16 unused_bits:11;
+	__u16 data_source:4; // The source of the stored data, defined in the 'enum process_data_extra_source'. 
+	__u16 unused_bits:7;
 	__u32 reasm_bytes;	// The amount of data bytes that have been reassembled.
 
 	/*
@@ -155,8 +204,9 @@ struct socket_info_s {
 	};
 	__u8 direction:1;
 	__u8 pre_direction:1;
-	__u8 unused:2;
+	__u8 unused:1;
 	__u8 role:3;		// Socket role identifier: ROLE_CLIENT, ROLE_SERVER, ROLE_UNKNOWN
+	__u8 is_tls:1;		// Identify whether it is a TLS connection
 	__u8 tls_end:1;		// Use the Identity TLS protocol to infer whether it has been completed
 	bool need_reconfirm;	// L7 protocol inference requiring confirmation.
 	union {
@@ -190,6 +240,7 @@ struct tracer_ctx_s {
 	__u32 go_tracing_timeout; /**< Go tracing timeout */
 	__u32 io_event_collect_mode; /**< IO event collection mode */
 	__u64 io_event_minimal_duration; /**< Minimum duration for IO events */
+	bool virtual_file_collect_enabled;    /**< Enable virtual file collection */
 	int push_buffer_refcnt;	/**< Reference count of the data push buffer */
 	__u64 last_period_timestamp; /**< Record the timestamp of the last periodic check of the push buffer. */
 	__u64 period_timestamp;	/**< Record the timestamp of the periodic check of the push buffer. */
@@ -234,11 +285,16 @@ struct __io_event_buffer {
 	// The number of bytes of offset within the file content
 	__u64 offset;
 
+	// Mount ID of the file’s mount
+	int mnt_id;
+	// Mount namespace ID of the file’s mount
+	__u32 mntns_id;
+
 	// filename length
 	__u32 len;
 
 	// strings terminated with \0
-	char filename[IO_FILEPATH_BUFF_SIZE];
+	char filename[FILE_PATH_SZ];
 } __attribute__ ((packed));
 
 struct user_io_event_buffer {
@@ -254,8 +310,14 @@ struct user_io_event_buffer {
 	// The number of bytes of offset within the file content
 	__u64 offset;
 
+	__u32 file_type;
 	// strings terminated with \0
-	char filename[IO_FILEPATH_BUFF_SIZE];
+	char filename[FILE_NAME_SZ];
+	char mount_source[MOUNT_SOURCE_SZ];
+	char mount_point[MOUNT_POINT_SZ];
+	char file_dir[FILE_PATH_SZ];
+	int mnt_id;
+	__u32 mntns_id;
 } __attribute__ ((packed));
 
 // struct ebpf_proc_info -> offsets[]  arrays index.
@@ -340,7 +402,9 @@ struct member_fields_offset {
 	__u8 ready;
 	__u8 kprobe_invalid:1;			// This indicates that the KPROBE feature has been disabled.
 	__u8 enable_unix_socket:1;		// Enable flag for Unix socket tracing
-	__u8 reserved:6;
+	__u8 files_infer_done:1;		// 0: file-related structure offset inference not completed
+						// 1: file-related structure offset inference completed
+	__u8 reserved:5;
 	__u16 struct_dentry_d_parent_offset;    // offsetof(struct dentry, d_parent)
 	__u32 task__files_offset;
 	__u32 sock__flags_offset;
@@ -349,7 +413,9 @@ struct member_fields_offset {
 
 	__u16 struct_files_struct_fdt_offset;	// offsetof(struct files_struct, fdt)
 	__u16 struct_file_f_pos_offset;		// offsetof(struct file, f_pos)
-	__u32 struct_files_private_data_offset;	// offsetof(struct file, private_data)
+	__u32 struct_file_private_data_offset;	// offsetof(struct file, private_data)
+	__u32 struct_file_f_op_offset;		// offsetof(struct file, f_op)
+	__u32 struct_file_operations_read_iter_offset; // offsetof(struct file_operations, read_iter)
 	__u32 struct_file_f_inode_offset;	// offsetof(struct file, f_inode)
 	__u32 struct_inode_i_mode_offset;	// offsetof(struct inode, i_mode)
 	__u32 struct_inode_i_sb_offset;		// offsetof(struct inode, i_sb)
@@ -365,6 +431,17 @@ struct member_fields_offset {
 	__u32 struct_sock_sport_offset;	// offsetof(struct sock_common, skc_num)
 	__u32 struct_sock_skc_state_offset;	// offsetof(struct sock_common, skc_state)
 	__u32 struct_sock_common_ipv6only_offset;	// offsetof(struct sock_common, skc_flags)
+
+	/*
+ 	 * Mount information related offsets
+ 	 */
+	__u16 struct_file_f_path_offset;      // offsetof(struct file, f_path)
+	__u16 struct_path_mnt_offset;         // offsetof(struct path, mnt)
+	__u16 struct_mount_mnt_offset;	      // offsetof(struct mount, mnt)
+	__u16 struct_mount_mnt_ns_offset;     // offsetof(struct mount, mnt_ns)
+	__u16 struct_mnt_namespace_ns_offset; // offsetof(struct mnt_namespace, ns)
+	__u16 struct_ns_common_inum_offset;   // offsetof(struct mnt_common, inum)
+	__u16 struct_mount_mnt_id_offset;     // offsetof(struct mount, mnt_id)
 };
 
 typedef struct member_fields_offset bpf_offset_param_t;

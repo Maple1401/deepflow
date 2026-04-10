@@ -23,8 +23,15 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
+#[cfg(feature = "extended_observability")]
+use std::ffi::CString;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use envmnt::{ExpandOptions, ExpansionType};
+#[cfg(feature = "extended_observability")]
+use libc::c_int;
+#[cfg(feature = "extended_observability")]
+use log::warn;
 use log::{debug, error, info};
 use md5::{Digest, Md5};
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -37,8 +44,11 @@ use serde::{
 use thiserror::Error;
 use tokio::runtime::Runtime;
 
-use crate::common::l7_protocol_log::L7ProtocolParser;
+use crate::common::l7_protocol_log::{L7ProtocolBitmap, L7ProtocolParser};
 use crate::dispatcher::recv_engine::DEFAULT_BLOCK_SIZE;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(feature = "extended_observability")]
+use crate::ebpf;
 use crate::flow_generator::{DnsLog, MemcachedLog};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::platform::{OsAppTag, ProcessData};
@@ -48,24 +58,13 @@ use crate::{
 
 use public::{
     bitmap::Bitmap,
-    enums::{Charset, FieldType, TrafficDirection},
-    l7_protocol::L7Protocol,
+    l7_protocol::{L7Protocol, L7ProtocolChecker},
     proto::agent,
     utils::bitmap::parse_u16_range_list_to_bitmap,
 };
 
-cfg_if::cfg_if! {
-if #[cfg(feature = "enterprise")] {
-        use public::{
-            enums::MatchType,
-            l7_protocol::L7ProtocolEnum,
-            segment_map::{parse_u16_range_list_to_port_pairs, SegmentBuilder, SegmentMap},
-        };
-        use enterprise_utils::l7::plugin::custom_field_policy::{
-            ExtraCustomFieldPolicy, ExtraProtocolCharacters, ExtraCustomProtocolConfig, ExtraField, KeywordMatcher,
-        };
-    }
-}
+#[cfg(feature = "enterprise")]
+use enterprise_utils::l7::custom_policy::config::CustomProtocolConfig;
 
 pub const K8S_CA_CRT_PATH: &str = "/run/secrets/kubernetes.io/serviceaccount/ca.crt";
 const MINUTE: Duration = Duration::from_secs(60);
@@ -136,6 +135,8 @@ pub struct Config {
     pub pid_file: String,
     pub team_id: String,
     pub cgroups_disabled: bool,
+    pub liveness_probe_enabled: bool,
+    pub liveness_probe_port: u16,
 }
 
 impl Config {
@@ -220,6 +221,8 @@ impl Config {
         };
 
         loop {
+            session.update_current_server().await;
+
             match session
                 .grpc_get_kubernetes_cluster_id_with_statsd(request.clone())
                 .await
@@ -231,6 +234,7 @@ impl Config {
                             "get_kubernetes_cluster_id grpc call from server error: {}",
                             cluster_id_response.error_msg()
                         );
+                        session.set_request_failed(true);
                         tokio::time::sleep(MINUTE).await;
                         continue;
                     }
@@ -240,6 +244,7 @@ impl Config {
                                 error!(
                                     "call get_kubernetes_cluster_id return cluster_id is empty string"
                                 );
+                                session.set_request_failed(true);
                                 tokio::time::sleep(MINUTE).await;
                                 continue;
                             }
@@ -251,11 +256,15 @@ impl Config {
                             return Some(id);
                         }
                         None => {
-                            error!("call get_kubernetes_cluster_id return response is none")
+                            error!("call get_kubernetes_cluster_id return response is none");
+                            session.set_request_failed(true);
                         }
                     }
                 }
-                Err(e) => error!("get_kubernetes_cluster_id grpc call error: {}", e),
+                Err(e) => {
+                    error!("get_kubernetes_cluster_id grpc call error: {}", e);
+                    session.set_request_failed(true);
+                }
             }
             tokio::time::sleep(MINUTE).await;
         }
@@ -290,6 +299,8 @@ impl Default for Config {
             pid_file: Default::default(),
             team_id: "".into(),
             cgroups_disabled: false,
+            liveness_probe_enabled: true,
+            liveness_probe_port: 39090,
         }
     }
 }
@@ -609,7 +620,47 @@ impl Default for Proc {
                     ..Default::default()
                 },
                 ProcessMatcher {
+                    match_regex: Regex::new(
+                        r"\bjava( +\S+)* +-(?:cp|classpath) +\S+ +(?P<CLASS_NAME>[$_A-Za-z][$_0-9A-Za-z]*(?:\.[$_A-Za-z][$_0-9A-Za-z]*)*)",
+                    )
+                    .unwrap(),
+                    only_in_container: false,
+                    match_type: ProcessMatchType::CmdWithArgs,
+                    rewrite_name: "${CLASS_NAME}".to_string(),
+                    enabled_features: vec![
+                        "ebpf.profile.on_cpu".to_string(),
+                        "proc.gprocess_info".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                ProcessMatcher {
                     match_regex: Regex::new(r"\bpython(\S)*( +-\S+)* +(\S*/)*([^ /]+)").unwrap(),
+                    only_in_container: false,
+                    match_type: ProcessMatchType::CmdWithArgs,
+                    rewrite_name: "$4".to_string(),
+                    enabled_features: vec![
+                        "ebpf.profile.on_cpu".to_string(),
+                        "proc.gprocess_info".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                ProcessMatcher {
+                    match_regex: Regex::new(
+                        r"\bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)",
+                    )
+                    .unwrap(),
+                    only_in_container: false,
+                    match_type: ProcessMatchType::CmdWithArgs,
+                    rewrite_name: "$5".to_string(),
+                    enabled_features: vec![
+                        "ebpf.profile.on_cpu".to_string(),
+                        "proc.gprocess_info".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                ProcessMatcher {
+                    match_regex: Regex::new(r"\b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)")
+                        .unwrap(),
                     only_in_container: false,
                     match_type: ProcessMatchType::CmdWithArgs,
                     rewrite_name: "$4".to_string(),
@@ -876,7 +927,7 @@ impl Default for CbpfTunning {
 pub struct PreProcess {
     pub tunnel_decap_protocols: Vec<u8>,
     pub tunnel_trim_protocols: Vec<String>,
-    pub packet_segmentation_reassembly: Vec<u16>,
+    pub packet_segmentation_reassembly: Vec<String>,
 }
 
 impl Default for PreProcess {
@@ -992,6 +1043,7 @@ pub struct EbpfSocketTunning {
     pub max_capture_rate: u64,
     pub syscall_trace_id_disabled: bool,
     pub map_prealloc_disabled: bool,
+    pub fentry_enabled: bool,
 }
 
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
@@ -999,8 +1051,39 @@ pub struct EbpfSocketTunning {
 pub struct EbpfSocket {
     pub uprobe: EbpfSocketUprobe,
     pub kprobe: EbpfSocketKprobe,
+    pub sock_ops: EbpfSocketSockOps,
     pub tunning: EbpfSocketTunning,
     pub preprocess: EbpfSocketPreprocess,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EbpfSocketSockOps {
+    pub tcp_option_trace: EbpfTcpOptionTrace,
+}
+
+impl Default for EbpfSocketSockOps {
+    fn default() -> Self {
+        Self {
+            tcp_option_trace: EbpfTcpOptionTrace::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EbpfTcpOptionTrace {
+    pub enabled: bool,
+    pub sampling_window_bytes: u32,
+}
+
+impl Default for EbpfTcpOptionTrace {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sampling_window_bytes: 16 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -1009,6 +1092,7 @@ pub struct EbpfFileIoEvent {
     pub collect_mode: usize,
     #[serde(with = "humantime_serde")]
     pub minimal_duration: Duration,
+    pub enable_virtual_file_collect: bool,
 }
 
 impl Default for EbpfFileIoEvent {
@@ -1016,6 +1100,7 @@ impl Default for EbpfFileIoEvent {
         Self {
             collect_mode: 1,
             minimal_duration: Duration::from_millis(1),
+            enable_virtual_file_collect: false,
         }
     }
 }
@@ -1070,6 +1155,10 @@ pub struct EbpfProfileMemory {
     #[serde(with = "humantime_serde")]
     pub report_interval: Duration,
     pub allocated_addresses_lru_len: u32,
+    pub sort_length: u32,
+    #[serde(with = "humantime_serde")]
+    pub sort_interval: Duration,
+    pub queue_size: usize,
 }
 
 impl Default for EbpfProfileMemory {
@@ -1078,6 +1167,9 @@ impl Default for EbpfProfileMemory {
             disabled: true,
             report_interval: Duration::from_secs(10),
             allocated_addresses_lru_len: 131072,
+            sort_length: 16384,
+            sort_interval: Duration::from_millis(1500),
+            queue_size: 32768,
         }
     }
 }
@@ -1116,6 +1208,24 @@ impl Default for Unwinding {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EbpfProfileLanguages {
+    pub python_disabled: bool,
+    pub php_disabled: bool,
+    pub nodejs_disabled: bool,
+}
+
+impl Default for EbpfProfileLanguages {
+    fn default() -> Self {
+        Self {
+            python_disabled: false,
+            php_disabled: false,
+            nodejs_disabled: false,
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EbpfProfile {
@@ -1124,6 +1234,7 @@ pub struct EbpfProfile {
     pub memory: EbpfProfileMemory,
     pub unwinding: Unwinding,
     pub preprocess: EbpfProfilePreprocess,
+    pub languages: EbpfProfileLanguages,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -1131,6 +1242,7 @@ pub struct EbpfProfile {
 pub struct EbpfTunning {
     pub collector_queue_size: usize,
     pub userspace_worker_threads: i32,
+    pub kick_kern_nice: i32,
     pub perf_pages_count: u32,
     pub kernel_ring_size: u32,
     pub max_socket_entries: u32,
@@ -1143,6 +1255,7 @@ impl Default for EbpfTunning {
         Self {
             collector_queue_size: 65535,
             userspace_worker_threads: 1,
+            kick_kern_nice: 0,
             perf_pages_count: 128,
             kernel_ring_size: 65536,
             max_socket_entries: 131072,
@@ -1152,21 +1265,168 @@ impl Default for EbpfTunning {
     }
 }
 
+impl EbpfTunning {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !(-20..=19).contains(&self.kick_kern_nice) {
+            return Err(format!(
+                "kick_kern_nice {} not in [-20, 19]",
+                self.kick_kern_nice
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NicOptimizeConfig {
+    pub interface: String,
+    pub rx_ring_size: u64,
+    pub rss_channel_count: u64,
+    pub irq_cpu_list: String,
+    pub xdp_cpu_redirect: bool,
+    pub xdp_queue_size: u64,
+    pub xdp_cpu_redirect_list: String,
+}
+
+const XDP_QUEUE_SIZE_MIN: u64 = 512;
+const XDP_QUEUE_SIZE_MAX: u64 = 8192;
+
+impl Default for NicOptimizeConfig {
+    fn default() -> Self {
+        Self {
+            interface: "".to_string(),
+            rx_ring_size: 0,
+            rss_channel_count: 0,
+            irq_cpu_list: "".to_string(),
+            xdp_cpu_redirect: false,
+            xdp_queue_size: 2048,
+            xdp_cpu_redirect_list: "".to_string(),
+        }
+    }
+}
+
+impl NicOptimizeConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !(XDP_QUEUE_SIZE_MIN..=XDP_QUEUE_SIZE_MAX).contains(&self.xdp_queue_size) {
+            return Err(format!(
+                "xdp_queue_size {} for interface {} not in [{}, {}]",
+                self.xdp_queue_size, self.interface, XDP_QUEUE_SIZE_MIN, XDP_QUEUE_SIZE_MAX,
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(feature = "extended_observability")]
+    pub fn apply(&self) {
+        if let Err(e) = self.validate() {
+            warn!(
+                "Skip NIC optimization for interface '{}': {}",
+                self.interface, e
+            );
+            return;
+        }
+
+        let to_cstring = |field: &str, value: &str| {
+            CString::new(value)
+                .map_err(|_| {
+                    warn!(
+                        "Skip NIC optimization for interface {:?}: {} contains NUL byte",
+                        self.interface, field
+                    );
+                })
+                .ok()
+        };
+
+        let Some(nic_name) = to_cstring("interface", self.interface.as_str()) else {
+            return;
+        };
+        let Some(irq_cpu) = to_cstring("irq_cpu_list", self.irq_cpu_list.as_str()) else {
+            return;
+        };
+        let Some(xdp_cpu) =
+            to_cstring("xdp_cpu_redirect_list", self.xdp_cpu_redirect_list.as_str())
+        else {
+            return;
+        };
+
+        let ret = unsafe {
+            ebpf::nic_optimize_config(
+                nic_name.as_ptr(),
+                self.rx_ring_size as c_int,
+                self.rss_channel_count as c_int,
+                irq_cpu.as_ptr(),
+                self.xdp_cpu_redirect,
+                self.xdp_queue_size as c_int,
+                xdp_cpu.as_ptr(),
+            )
+        };
+
+        if ret != 0 {
+            warn!(
+                "Failed to configure NIC optimization for interface '{}' \
+                (ret={}, rx_ring_size={}, rss_channel_count={}, \
+                xdp_cpu_redirect={}, xdp_queue_size={})",
+                self.interface,
+                ret,
+                self.rx_ring_size,
+                self.rss_channel_count,
+                self.xdp_cpu_redirect,
+                self.xdp_queue_size,
+            );
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct EbpfNetwork {
+    pub nic_opt_enabled: bool,
+    pub nic_optimize: Vec<NicOptimizeConfig>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct EbpfSocketPreprocess {
     pub out_of_order_reassembly_cache_size: usize,
     pub out_of_order_reassembly_protocols: Vec<String>,
+    pub out_of_order_reassembly_timeout: Duration,
     pub segmentation_reassembly_protocols: Vec<String>,
 }
 
 impl Default for EbpfSocketPreprocess {
     fn default() -> Self {
         Self {
-            out_of_order_reassembly_cache_size: 16,
+            out_of_order_reassembly_cache_size: 256,
             out_of_order_reassembly_protocols: vec![],
+            out_of_order_reassembly_timeout: Duration::from_millis(100),
             segmentation_reassembly_protocols: vec![],
         }
+    }
+}
+
+impl EbpfSocketPreprocess {
+    fn adjust_http2(protocols: &mut Vec<String>) {
+        let bitmap = L7ProtocolBitmap::from(protocols.as_slice());
+
+        if bitmap.is_enabled(L7Protocol::Http2)
+            || bitmap.is_enabled(L7Protocol::Grpc)
+            || bitmap.is_enabled(L7Protocol::Triple)
+        {
+            protocols.push("HTTP2".to_string());
+            protocols.push("Triple".to_string());
+            protocols.push("gRPC".to_string());
+        }
+        protocols.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        protocols.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    }
+
+    fn adjust(&mut self) {
+        Self::adjust_http2(&mut self.out_of_order_reassembly_protocols);
+        Self::adjust_http2(&mut self.segmentation_reassembly_protocols);
     }
 }
 
@@ -1178,6 +1438,7 @@ pub struct Ebpf {
     pub file: EbpfFile,
     pub profile: EbpfProfile,
     pub tunning: EbpfTunning,
+    pub network: EbpfNetwork,
     #[serde(skip)]
     pub java_symbol_file_refresh_defer_interval: i32,
 }
@@ -1190,6 +1451,7 @@ impl Default for Ebpf {
             file: EbpfFile::default(),
             profile: EbpfProfile::default(),
             tunning: EbpfTunning::default(),
+            network: EbpfNetwork::default(),
             java_symbol_file_refresh_defer_interval: 60,
         }
     }
@@ -1315,6 +1577,10 @@ impl Default for Kubernetes {
                 },
                 ApiResources {
                     name: "ingresses".to_string(),
+                    ..Default::default()
+                },
+                ApiResources {
+                    name: "configmaps".to_string(),
                     ..Default::default()
                 },
             ],
@@ -1449,6 +1715,23 @@ pub struct Inputs {
     pub vector: Vector,
 }
 
+impl Inputs {
+    fn adjust(&mut self) {
+        // DPDK from eBPF
+        if self.ebpf.tunning.userspace_worker_threads as usize
+            != self.cbpf.af_packet.tunning.packet_fanout_count
+            && self.cbpf.special_network.dpdk.source == DpdkSource::Ebpf
+        {
+            debug!("Update inputs.cbpf.af_packet.tunning.packet_fanout_count with self.inputs.ebpf.tunning.userspace_worker_threads({}) when self.inputs.cbpf.special_network.dpdk.source is {:?}",
+                self.ebpf.tunning.userspace_worker_threads, self.cbpf.special_network.dpdk.source);
+            self.cbpf.af_packet.tunning.packet_fanout_count =
+                self.ebpf.tunning.userspace_worker_threads as usize;
+        }
+
+        self.ebpf.socket.preprocess.adjust();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Policy {
@@ -1519,6 +1802,7 @@ impl Default for TcpHeader {
 #[serde(default)]
 pub struct PcapStream {
     pub receiver_queue_size: usize,
+    pub sender_queue_size: usize,
     pub buffer_size_per_flow: u32,
     pub total_buffer_size: u64,
     #[serde(with = "humantime_serde")]
@@ -1529,6 +1813,7 @@ impl Default for PcapStream {
     fn default() -> Self {
         Self {
             receiver_queue_size: 65536,
+            sender_queue_size: 8192,
             buffer_size_per_flow: 65536,
             total_buffer_size: 88304,
             flush_interval: Duration::from_secs(60),
@@ -1579,16 +1864,54 @@ impl Default for OracleConfig {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Iso8583Config {
+    pub extract_fields: String,
+    pub translation_enabled: bool,
+    pub pan_obfuscate: bool,
+}
+
+impl Default for Iso8583Config {
+    fn default() -> Self {
+        Self {
+            extract_fields: "2,7,11,32,33".to_string(),
+            translation_enabled: true,
+            pan_obfuscate: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WebSphereMqConfig {
+    pub parse_xml_enabled: bool,
+    pub decompress_enabled: bool,
+    pub filter_attributes_enabled: bool,
+}
+
+impl Default for WebSphereMqConfig {
+    fn default() -> Self {
+        Self {
+            parse_xml_enabled: true,
+            decompress_enabled: true,
+            filter_attributes_enabled: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct MysqlConfig {
     pub decompress_payload: bool,
+    pub endpoint_disabled: bool,
 }
 
 impl Default for MysqlConfig {
     fn default() -> Self {
         Self {
             decompress_payload: true,
+            endpoint_disabled: true,
         }
     }
 }
@@ -1607,10 +1930,54 @@ impl Default for GrpcConfig {
     }
 }
 
-#[derive(Clone, Copy, Default, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct InferenceWhitelist {
+    pub process_name: String,
+    pub port_list: Vec<u16>,
+}
+
+impl InferenceWhitelist {
+    fn format_name(name: &[u8]) -> &[u8] {
+        for i in (0..name.len()).rev() {
+            if name[i] == 0 {
+                return &name[..i];
+            }
+        }
+
+        name
+    }
+
+    pub fn is_matched(&self, name: &[u8], src_port: u16, dst_port: u16) -> bool {
+        if Self::format_name(name) != self.process_name.as_bytes() {
+            return false;
+        }
+
+        for p in self.port_list.iter() {
+            if *p == src_port || *p == dst_port {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+impl Default for InferenceWhitelist {
+    fn default() -> Self {
+        Self {
+            process_name: "envoy".to_string(),
+            port_list: vec![15001, 15006],
+        }
+    }
+}
+
+#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ProtocolSpecialConfig {
     pub oracle: OracleConfig,
+    pub iso8583: Iso8583Config,
+    pub web_sphere_mq: WebSphereMqConfig,
     pub mysql: MysqlConfig,
     pub grpc: GrpcConfig,
 }
@@ -1621,16 +1988,20 @@ pub struct ApplicationProtocolInference {
     pub inference_max_retries: usize,
     #[serde(with = "humantime_serde")]
     pub inference_result_ttl: Duration,
+    pub inference_whitelist: Vec<InferenceWhitelist>,
     pub enabled_protocols: Vec<String>,
     pub protocol_special_config: ProtocolSpecialConfig,
+    #[deprecated]
+    #[cfg(feature = "enterprise")]
     pub custom_protocols: Vec<CustomProtocolConfig>,
 }
 
 impl Default for ApplicationProtocolInference {
     fn default() -> Self {
         Self {
-            inference_max_retries: 5,
+            inference_max_retries: 128,
             inference_result_ttl: Duration::from_secs(60),
+            inference_whitelist: vec![InferenceWhitelist::default()],
             enabled_protocols: vec![
                 "HTTP".to_string(),
                 "HTTP2".to_string(),
@@ -1641,7 +2012,8 @@ impl Default for ApplicationProtocolInference {
                 "TLS".to_string(),
             ],
             protocol_special_config: ProtocolSpecialConfig::default(),
-            custom_protocols: vec![],
+            #[cfg(feature = "enterprise")]
+            custom_protocols: Default::default(),
         }
     }
 }
@@ -1675,6 +2047,8 @@ impl Default for Filters {
                 ("bRPC".to_string(), "1-65535".to_string()),
                 ("Tars".to_string(), "1-65535".to_string()),
                 ("SomeIP".to_string(), "1-65535".to_string()),
+                ("ISO8583".to_string(), "1-65535".to_string()),
+                ("Triple".to_string(), "1-65535".to_string()),
                 ("MySQL".to_string(), "1-65535".to_string()),
                 ("PostgreSQL".to_string(), "1-65535".to_string()),
                 ("Oracle".to_string(), "1521".to_string()),
@@ -1689,6 +2063,7 @@ impl Default for Filters {
                 ("Pulsar".to_string(), "1-65535".to_string()),
                 ("ZMTP".to_string(), "1-65535".to_string()),
                 ("RocketMQ".to_string(), "1-65535".to_string()),
+                ("WebSphereMQ".to_string(), "1-65535".to_string()),
                 ("DNS".to_string(), "53,5353".to_string()),
                 ("TLS".to_string(), "443,6443".to_string()),
                 ("PING".to_string(), "1-65535".to_string()),
@@ -1704,6 +2079,8 @@ impl Default for Filters {
                 ("bRPC".to_string(), vec![]),
                 ("Tars".to_string(), vec![]),
                 ("SomeIP".to_string(), vec![]),
+                ("ISO8583".to_string(), vec![]),
+                ("Triple".to_string(), vec![]),
                 ("MySQL".to_string(), vec![]),
                 ("PostgreSQL".to_string(), vec![]),
                 ("Oracle".to_string(), vec![]),
@@ -1718,6 +2095,7 @@ impl Default for Filters {
                 ("Pulsar".to_string(), vec![]),
                 ("ZMTP".to_string(), vec![]),
                 ("RocketMQ".to_string(), vec![]),
+                ("WebSphereMQ".to_string(), vec![]),
                 ("DNS".to_string(), vec![]),
                 ("TLS".to_string(), vec![]),
                 ("PING".to_string(), vec![]),
@@ -1791,6 +2169,8 @@ impl Timeouts {
 pub struct TracingTag {
     pub http_real_client: Vec<String>,
     pub x_request_id: Vec<String>,
+    pub multiple_trace_id_collection: bool,
+    pub copy_apm_trace_id: bool,
     pub apm_trace_id: Vec<String>,
     pub apm_span_id: Vec<String>,
 }
@@ -1800,6 +2180,8 @@ impl Default for TracingTag {
         Self {
             http_real_client: vec!["X_Forwarded_For".to_string()],
             x_request_id: vec!["X_Request_ID".to_string()],
+            multiple_trace_id_collection: true,
+            copy_apm_trace_id: false,
             apm_trace_id: vec!["traceparent".to_string(), "sw8".to_string()],
             apm_span_id: vec!["traceparent".to_string(), "sw8".to_string()],
         }
@@ -1838,338 +2220,30 @@ impl Default for HttpEndpoint {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct PortFilter {
-    pub port_list: String,
-}
-
-fn to_match_type<'de: 'a, 'a, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let match_type = <&'a str>::deserialize(deserializer)?.to_lowercase();
-    match match_type.as_str() {
-        "string" | "hex" => Ok(match_type),
-        other => Err(de::Error::invalid_value(
-            Unexpected::Str(other),
-            &"[string|hex]",
-        )),
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct Matcher {
-    pub match_keyword: String,
-    #[serde(deserialize_with = "to_match_type")]
-    pub match_type: String,
-    pub match_ignore_case: bool,
-    pub match_from_begining: bool,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct Character {
-    pub character: Vec<Matcher>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct CustomProtocolConfig {
-    pub protocol_name: String,
-    pub pre_filter: PortFilter,
-    pub request_characters: Vec<Character>,
-    pub response_characters: Vec<Character>,
-}
-
-fn to_traffic_direction<'de: 'a, 'a, D>(deserializer: D) -> Result<TrafficDirection, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    match <&'a str>::deserialize(deserializer)?
-        .to_lowercase()
-        .as_str()
-    {
-        "request" => Ok(TrafficDirection::Request),
-        "response" => Ok(TrafficDirection::Response),
-        "both" => Ok(TrafficDirection::Both),
-        other => Err(de::Error::invalid_value(
-            Unexpected::Str(other),
-            &"[request|response|both]",
-        )),
-    }
-}
-
-fn to_charset_arr<'de, D>(deserializer: D) -> Result<Vec<Charset>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let charset: Vec<&str> = Vec::deserialize(deserializer)?;
-    let mut charsets = Vec::with_capacity(charset.len());
-    for c in charset {
-        match c.to_lowercase().as_str() {
-            "digits" => charsets.push(Charset::Digits),
-            "alphabets" => charsets.push(Charset::Alphabets),
-            "chinese" => charsets.push(Charset::Chinese),
-            other => {
-                return Err(de::Error::invalid_value(
-                    Unexpected::Str(other),
-                    &"[digits|alphabets|chinese]",
-                ))
-            }
-        }
-    }
-    Ok(charsets)
-}
-
-fn to_rewrite_native_tag<'de: 'a, 'a, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let deserialize_str = <&'a str>::deserialize(deserializer)?.to_lowercase();
-    match deserialize_str.as_str() {
-        "version" | "request_type" | "request_domain" | "request_resource" | "request_id"
-        | "endpoint" | "response_code" | "response_exception" | "response_result" | "trace_id"
-        | "span_id" | "x_request_id" | "http_proxy_client" => Ok(deserialize_str),
-        other => Err(de::Error::invalid_value(
-            Unexpected::Str(other),
-            &format!(
-                "[{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}]",
-                "version",
-                "request_type",
-                "request_domain",
-                "request_resource",
-                "request_id",
-                "endpoint",
-                "response_code",
-                "response_exception",
-                "response_result",
-                "trace_id",
-                "span_id",
-                "x_request_id",
-                "http_proxy_client"
-            )
-            .as_str(),
-        )),
-    }
-}
-
-fn to_field_type<'de: 'a, 'a, D>(deserializer: D) -> Result<FieldType, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    match <&'a str>::deserialize(deserializer)?.to_lowercase().as_str() {
-        "header_field" => Ok(FieldType::Header),
-        "http_url_field" => Ok(FieldType::HttpUrl),
-        "payload_json_value" => Ok(FieldType::PayloadJson),
-        "payload_xml_value" => Ok(FieldType::PayloadXml),
-        "payload_hessian2_value" => Ok(FieldType::PayloadHessian2),
-        other => Err(de::Error::invalid_value(
-            Unexpected::Str(other),
-            &"[header_field|http_url_field|payload_json_value|payload_xml_value|payload_hessian2_value]"
-        )),
-    }
-}
-
-#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct RewriteResponseStatus {
-    pub success_values: Vec<String>,
-}
-
-#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct Field {
-    pub field_name: String,
-    #[serde(deserialize_with = "to_match_type")]
-    pub field_match_type: String,
-    pub field_match_keyword: String,
-    pub field_match_ignore_case: bool,
-    pub subfield_match_keyword: Option<String>,
-    pub separator_between_subfield_kv_pair: Option<String>,
-    pub separator_between_subfield_key_and_value: Option<String>,
-    #[serde(deserialize_with = "to_field_type")]
-    pub field_type: FieldType,
-    #[serde(deserialize_with = "to_traffic_direction")]
-    pub traffic_direction: TrafficDirection,
-    pub check_value_charset: bool,
-    #[serde(deserialize_with = "to_charset_arr")]
-    pub value_primary_charset: Vec<Charset>,
-    pub value_special_charset: String,
-    pub attribute_name: Option<String>,
-    #[serde(deserialize_with = "to_rewrite_native_tag")]
-    pub rewrite_native_tag: String,
-    pub rewrite_response_status: RewriteResponseStatus,
-    pub metric_name: Option<String>,
-}
-
-#[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct CustomFieldPolicy {
-    pub policy_name: String,
-    pub protocol_name: String,
-    // only for custom protocol
-    pub custom_protocol_name: Option<String>,
-    pub port_list: String,
-    pub fields: Vec<Field>,
-}
-
-#[cfg(feature = "enterprise")]
-#[derive(Clone, Default, Debug, PartialEq, Eq)]
-pub struct ExtraCustomFieldPolicyMap {
-    pub indices: SegmentMap<usize>,
-    pub policies: Vec<ExtraCustomFieldPolicy>,
-}
-
-#[cfg(feature = "enterprise")]
-impl From<&Field> for ExtraField {
-    fn from(v: &Field) -> ExtraField {
-        ExtraField {
-            // default: match string with case sensitive
-            field_match_type: match v.field_match_type.as_str() {
-                "string" => MatchType::String(v.field_match_ignore_case),
-                _ => MatchType::String(false),
-            },
-            field_match_keyword: v.field_match_keyword.clone(),
-            subfield_match_keyword: v.subfield_match_keyword.clone(),
-            separator_between_subfield_kv_pair: v.separator_between_subfield_kv_pair.clone(),
-            separator_between_subfield_key_and_value: v
-                .separator_between_subfield_key_and_value
-                .clone(),
-            check_value_charset: v.check_value_charset,
-            value_primary_charset: v.value_primary_charset.clone(),
-            value_special_charset: v.value_special_charset.clone(),
-            attribute_name: v.attribute_name.clone(),
-            rewrite_native_tag: v.rewrite_native_tag.clone(),
-            response_success_values: v.rewrite_response_status.success_values.clone(),
-            metric_name: v.metric_name.clone(),
-        }
-    }
-}
-
-#[cfg(feature = "enterprise")]
-impl From<Matcher> for KeywordMatcher {
-    fn from(value: Matcher) -> KeywordMatcher {
-        let (match_keyword_bytes, match_type) = match value.match_type.as_str() {
-            "string" => (
-                value.match_keyword.as_bytes().to_vec(),
-                MatchType::String(value.match_ignore_case),
-            ),
-            "hex" => match hex::decode(&value.match_keyword) {
-                Ok(v) => (v, MatchType::Hex),
-                Err(e) => {
-                    error!(
-                        "custom protocol match hex string: {} failed. error: {}",
-                        value.match_keyword, e,
-                    );
-                    (vec![], MatchType::Hex)
-                }
-            },
-            _ => (vec![], MatchType::String(value.match_ignore_case)),
-        };
-        KeywordMatcher {
-            match_type,
-            match_keyword_bytes,
-            match_from_begining: value.match_from_begining,
-        }
-    }
-}
-
-#[cfg(feature = "enterprise")]
-impl From<&CustomProtocolConfig> for ExtraProtocolCharacters {
-    fn from(v: &CustomProtocolConfig) -> ExtraProtocolCharacters {
-        ExtraProtocolCharacters {
-            protocol_name: v.protocol_name.clone(),
-            request_characters: v
-                .request_characters
-                .iter()
-                .map(|r| {
-                    r.character
-                        .iter()
-                        .map(|c| KeywordMatcher::from(c.clone()))
-                        .collect()
-                })
-                .collect(),
-            response_characters: v
-                .response_characters
-                .iter()
-                .map(|r| {
-                    r.character
-                        .iter()
-                        .map(|c| KeywordMatcher::from(c.clone()))
-                        .collect()
-                })
-                .collect(),
-        }
-    }
-}
-
-#[cfg(feature = "enterprise")]
-impl From<&CustomFieldPolicy> for ExtraCustomFieldPolicy {
-    fn from(v: &CustomFieldPolicy) -> ExtraCustomFieldPolicy {
-        let mut extra_field_policy = ExtraCustomFieldPolicy::default();
-        for field in &v.fields {
-            if field.traffic_direction & TrafficDirection::Request == TrafficDirection::Request {
-                match field.field_type {
-                    FieldType::Header | FieldType::HttpUrl | FieldType::PayloadHessian2 => {
-                        extra_field_policy
-                            .from_req_key
-                            .entry(field.field_type)
-                            .and_modify(|v: &mut HashMap<String, Vec<ExtraField>>| {
-                                v.entry(field.field_match_keyword.to_lowercase())
-                                    .and_modify(|e: &mut Vec<ExtraField>| e.push(field.into()))
-                                    .or_insert_with(|| vec![field.into()]);
-                            })
-                            .or_insert(HashMap::from([(
-                                field.field_match_keyword.to_lowercase(),
-                                vec![field.into()],
-                            )]));
-                    }
-                    _ => {
-                        extra_field_policy
-                            .from_req_body
-                            .entry(field.field_type)
-                            .and_modify(|v: &mut Vec<ExtraField>| v.push(field.into()))
-                            .or_insert_with(|| vec![field.into()]);
-                    }
-                }
-            }
-
-            if field.traffic_direction & TrafficDirection::Response == TrafficDirection::Response {
-                match field.field_type {
-                    FieldType::Header | FieldType::HttpUrl | FieldType::PayloadHessian2 => {
-                        extra_field_policy
-                            .from_req_key
-                            .entry(field.field_type)
-                            .and_modify(|v: &mut HashMap<String, Vec<ExtraField>>| {
-                                v.entry(field.field_match_keyword.to_lowercase())
-                                    .and_modify(|e: &mut Vec<ExtraField>| e.push(field.into()))
-                                    .or_insert_with(|| vec![field.into()]);
-                            })
-                            .or_insert(HashMap::from([(
-                                field.field_match_keyword.to_lowercase(),
-                                vec![field.into()],
-                            )]));
-                    }
-                    _ => {
-                        extra_field_policy
-                            .from_resp_body
-                            .entry(field.field_type)
-                            .and_modify(|v: &mut Vec<ExtraField>| v.push(field.into()))
-                            .or_insert_with(|| vec![field.into()]);
-                    }
-                }
-            }
-        }
-        extra_field_policy
-    }
-}
-
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CustomFields {
     pub field_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RequestLogTagExtractionRaw {
+    pub error_request_header: usize,
+    pub error_response_header: usize,
+    pub error_request_payload: usize,
+    pub error_response_payload: usize,
+}
+
+impl Default for RequestLogTagExtractionRaw {
+    fn default() -> Self {
+        Self {
+            error_request_header: 0,
+            error_response_header: 0,
+            error_request_payload: 0,
+            error_response_payload: 256,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -2179,7 +2253,10 @@ pub struct RequestLogTagExtraction {
     pub http_endpoint: HttpEndpoint,
     pub obfuscate_protocols: Vec<String>,
     pub custom_fields: HashMap<String, Vec<CustomFields>>,
-    pub custom_field_policies: Vec<CustomFieldPolicy>,
+    #[deprecated]
+    #[cfg(feature = "enterprise")]
+    pub custom_field_policies: Vec<enterprise_utils::l7::custom_policy::config::CustomFieldPolicy>,
+    pub raw: RequestLogTagExtractionRaw,
 }
 
 impl Default for RequestLogTagExtraction {
@@ -2192,7 +2269,9 @@ impl Default for RequestLogTagExtraction {
                 ("HTTP2".to_string(), vec![]),
             ]),
             obfuscate_protocols: vec!["Redis".to_string()],
-            custom_field_policies: vec![],
+            #[cfg(feature = "enterprise")]
+            custom_field_policies: Default::default(),
+            raw: RequestLogTagExtractionRaw::default(),
         }
     }
 }
@@ -2299,6 +2378,7 @@ impl Default for Conntrack {
 #[serde(default)]
 pub struct ProcessorsFlowLogTunning {
     pub flow_map_hash_slots: u32,
+    pub rrt_cache_capacity: u32,
     pub concurrent_flow_limit: u32,
     pub memory_pool_size: usize,
     pub max_batched_buffer_size: usize,
@@ -2311,6 +2391,7 @@ impl Default for ProcessorsFlowLogTunning {
     fn default() -> Self {
         Self {
             flow_map_hash_slots: 131072,
+            rrt_cache_capacity: 16000,
             concurrent_flow_limit: 65535,
             memory_pool_size: 65536,
             max_batched_buffer_size: 131072,
@@ -2503,7 +2584,7 @@ pub struct CircuitBreakers {
 #[serde(default)]
 pub struct Tunning {
     pub cpu_affinity: Vec<usize>,
-    pub process_scheduling_priority: usize,
+    pub process_scheduling_priority: isize,
     pub idle_memory_trimming: bool,
     pub swap_disabled: bool,
     pub page_cache_reclaim_percentage: u8,
@@ -2580,7 +2661,7 @@ pub struct Communication {
     pub max_escape_duration: Duration,
     pub ingester_ip: String,
     pub ingester_port: u16,
-    #[serde(deserialize_with = "deser_usize_with_mega_unit")]
+    #[serde(skip)]
     pub grpc_buffer_size: usize,
     pub max_throughput_to_ingester: u64,
     #[serde(deserialize_with = "to_traffic_overflow_action")]
@@ -2589,6 +2670,8 @@ pub struct Communication {
     pub proxy_controller_ip: String,
     pub proxy_controller_port: u16,
 }
+
+pub const GRPC_BUFFER_SIZE_MIN: usize = 1 << 20;
 
 impl Default for Communication {
     fn default() -> Self {
@@ -2599,7 +2682,7 @@ impl Default for Communication {
             proxy_controller_port: 30035,
             ingester_ip: "".to_string(),
             ingester_port: 30033,
-            grpc_buffer_size: 5 << 20,
+            grpc_buffer_size: GRPC_BUFFER_SIZE_MIN,
             max_throughput_to_ingester: 100,
             ingester_traffic_overflow_action: TrafficOverflowAction::Waiting,
             request_via_nat_ip: false,
@@ -2618,7 +2701,7 @@ pub struct Log {
 impl Default for Log {
     fn default() -> Self {
         Self {
-            log_level: "info".to_string(),
+            log_level: "INFO".to_string(),
             log_file: "/var/log/deepflow-agent/deepflow-agent.log".to_string(),
             log_backhaul_enabled: true,
         }
@@ -2636,14 +2719,12 @@ pub struct Profile {
 pub struct Debug {
     pub enabled: bool,
     pub local_udp_port: u16,
-    pub debug_metrics_enabled: bool,
 }
 
 impl Default for Debug {
     fn default() -> Self {
         Self {
             local_udp_port: 0,
-            debug_metrics_enabled: false,
             enabled: true,
         }
     }
@@ -3029,6 +3110,20 @@ pub struct UserConfig {
     pub processors: Processors,
     pub plugins: Plugins,
     pub dev: Dev,
+    #[serde(skip)]
+    #[cfg(feature = "enterprise")]
+    pub custom_app: CustomApp,
+}
+
+#[cfg(feature = "enterprise")]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct CustomApp {
+    pub version: u64,
+    // used in UserConfig::get_protocol_port()
+    pub custom_protocol_port_ranges: String,
+    // used in L7LogDynamicConfig
+    pub extra_headers: std::collections::HashSet<String>,
+    pub config: Option<enterprise_utils::l7::custom_policy::config::CustomApp>,
 }
 
 const MB: u64 = 1048576;
@@ -3041,16 +3136,7 @@ impl UserConfig {
     const PACKET_FANOUT_MODE_MAX: u32 = 7;
 
     pub fn adjust(&mut self) {
-        // DPDK from eBPF
-        if self.inputs.ebpf.tunning.userspace_worker_threads as usize
-            != self.inputs.cbpf.af_packet.tunning.packet_fanout_count
-            && self.inputs.cbpf.special_network.dpdk.source == DpdkSource::Ebpf
-        {
-            debug!("Update inputs.cbpf.af_packet.tunning.packet_fanout_count with self.inputs.ebpf.tunning.userspace_worker_threads({}) when self.inputs.cbpf.special_network.dpdk.source is {:?}",
-                self.inputs.ebpf.tunning.userspace_worker_threads, self.inputs.cbpf.special_network.dpdk.source);
-            self.inputs.cbpf.af_packet.tunning.packet_fanout_count =
-                self.inputs.ebpf.tunning.userspace_worker_threads as usize;
-        }
+        self.inputs.adjust();
     }
 
     pub fn get_fast_path_map_size(&self, mem_size: u64) -> usize {
@@ -3144,24 +3230,18 @@ impl UserConfig {
 
         #[cfg(feature = "enterprise")]
         {
-            let custom_str = L7ProtocolParser::Custom(
-                crate::flow_generator::protocol_logs::plugin::custom_wrap::CustomWrapLog::default(),
-            )
-            .as_str();
-            let custom_ports = self
-                .processors
-                .request_log
-                .application_protocol_inference
-                .custom_protocols
-                .iter()
-                .map(|p| p.pre_filter.port_list.clone())
-                .collect::<Vec<String>>()
-                .join(",");
-
+            let custom_ports = &self.custom_app.custom_protocol_port_ranges;
             if !custom_ports.is_empty() {
-                new.entry(custom_str.to_string())
-                    .and_modify(|v| *v = format!("{},{}", v, custom_ports))
-                    .or_insert(custom_ports);
+                let custom_str = L7ProtocolParser::Custom(Default::default()).as_str();
+                let ranges = new
+                    .entry(custom_str.to_string())
+                    .or_insert_with(|| custom_ports.clone());
+                if ranges.is_empty() {
+                    *ranges = custom_ports.clone();
+                } else {
+                    ranges.push(',');
+                    ranges.push_str(custom_ports);
+                }
             }
         }
 
@@ -3187,125 +3267,6 @@ impl UserConfig {
         }
         port_bitmap.sort_unstable_by_key(|p| p.0.clone());
         port_bitmap
-    }
-
-    #[cfg(feature = "enterprise")]
-    pub fn get_custom_protocol_config(&self) -> ExtraCustomProtocolConfig {
-        let custom_protocol_config = &self
-            .processors
-            .request_log
-            .application_protocol_inference
-            .custom_protocols;
-        let mut port_segmentmap = SegmentBuilder::new();
-        let mut protocol_characters = Vec::new();
-        for c in custom_protocol_config {
-            let port_pairs = if c.pre_filter.port_list.is_empty() {
-                vec![(u16::MIN, u16::MAX)]
-            } else {
-                let Some(port_pairs) =
-                    parse_u16_range_list_to_port_pairs(c.pre_filter.port_list.as_str(), false)
-                else {
-                    error!(
-                        "invalid port list in custom protocol config: {}",
-                        c.pre_filter.port_list,
-                    );
-                    continue;
-                };
-                port_pairs
-            };
-            protocol_characters.push(ExtraProtocolCharacters::from(c));
-            let index_of_characters = protocol_characters.len() - 1;
-            for (start, end) in port_pairs {
-                port_segmentmap.add_range(start, end, index_of_characters);
-            }
-        }
-        ExtraCustomProtocolConfig {
-            port_segmentmap: port_segmentmap.merge_segments(),
-            protocol_characters,
-        }
-    }
-
-    #[cfg(feature = "enterprise")]
-    pub fn get_extra_field_policies(&self) -> HashMap<L7ProtocolEnum, ExtraCustomFieldPolicyMap> {
-        let mut extra_policy_map: HashMap<
-            L7ProtocolEnum,
-            (Vec<ExtraCustomFieldPolicy>, SegmentBuilder<usize>),
-        > = HashMap::new();
-
-        for p in &self
-            .processors
-            .request_log
-            .tag_extraction
-            .custom_field_policies
-        {
-            let protocol = L7Protocol::from(p.protocol_name.clone());
-            if protocol == L7Protocol::Unknown {
-                continue;
-            }
-            let l7_protocol = if protocol == L7Protocol::Custom {
-                let Some(custom_protocol_name) = p.custom_protocol_name.as_ref() else {
-                    error!(
-                        "policy: {} not set custom_protocol_name, cannot parse correctly",
-                        p.policy_name
-                    );
-                    continue;
-                };
-                L7ProtocolEnum::Custom(public::l7_protocol::CustomProtocol::CustomPolicy(
-                    custom_protocol_name.to_owned(),
-                ))
-            } else {
-                L7ProtocolEnum::L7Protocol(protocol)
-            };
-
-            if let Some((policies, segment_builder)) = extra_policy_map.get_mut(&l7_protocol) {
-                build_extra_policy(p, policies, segment_builder);
-            } else {
-                let mut policies = vec![ExtraCustomFieldPolicy::default()];
-                let mut segment_builder = SegmentBuilder::new();
-                build_extra_policy(p, &mut policies, &mut segment_builder);
-                extra_policy_map.insert(l7_protocol, (policies, segment_builder));
-            }
-        }
-
-        #[inline]
-        fn build_extra_policy(
-            custom_field_policy: &CustomFieldPolicy,
-            extra_field_policy: &mut Vec<ExtraCustomFieldPolicy>,
-            segment_builder: &mut SegmentBuilder<usize>,
-        ) {
-            let port_pairs = if custom_field_policy.port_list.is_empty() {
-                vec![(u16::MIN, u16::MAX)]
-            } else {
-                let Some(port_pairs) = parse_u16_range_list_to_port_pairs(
-                    custom_field_policy.port_list.as_str(),
-                    false,
-                ) else {
-                    error!(
-                        "invalid port list in extra policy config: {}",
-                        custom_field_policy.port_list
-                    );
-                    return;
-                };
-                port_pairs
-            };
-            extra_field_policy.push(ExtraCustomFieldPolicy::from(custom_field_policy));
-            let index_of_policy = extra_field_policy.len() - 1;
-            for (start, end) in port_pairs {
-                segment_builder.add_range(start, end, index_of_policy);
-            }
-        }
-
-        let mut extra_policy_config = HashMap::with_capacity(extra_policy_map.len());
-        for (l7_protocol, (policies, mut builder)) in extra_policy_map {
-            extra_policy_config.insert(
-                l7_protocol,
-                ExtraCustomFieldPolicyMap {
-                    policies,
-                    indices: builder.merge_segments(),
-                },
-            );
-        }
-        extra_policy_config
     }
 
     pub fn load_from_file<T: AsRef<Path>>(path: T) -> Result<Self, io::Error> {
@@ -3419,6 +3380,15 @@ impl UserConfig {
             )));
         }
 
+        for nic in &self.inputs.ebpf.network.nic_optimize {
+            nic.validate().map_err(ConfigError::RuntimeConfigInvalid)?;
+        }
+        self.inputs
+            .ebpf
+            .tunning
+            .validate()
+            .map_err(ConfigError::RuntimeConfigInvalid)?;
+
         Ok(())
     }
 
@@ -3444,7 +3414,11 @@ impl UserConfig {
         config
     }
 
-    pub fn set_dynamic_config(&mut self, dynamic_config: &agent::DynamicConfig) {
+    pub fn set_dynamic_config_and_grpc_buffer_size(
+        &mut self,
+        dynamic_config: &agent::DynamicConfig,
+        new_grpc_buffer_size: u64,
+    ) {
         self.global.common.kubernetes_api_enabled = dynamic_config.kubernetes_api_enabled();
         self.global.common.enabled = dynamic_config.enabled();
         self.global.common.region_id = dynamic_config.region_id();
@@ -3456,6 +3430,7 @@ impl UserConfig {
         self.global.common.agent_type = dynamic_config.agent_type();
         self.global.common.secret_key = dynamic_config.secret_key().to_string();
         self.global.self_monitoring.hostname = dynamic_config.hostname().to_string();
+        self.global.communication.grpc_buffer_size = new_grpc_buffer_size as usize;
     }
 }
 
@@ -3704,6 +3679,40 @@ pub struct OracleParseConfig {
     pub resp_0x04_extra_byte: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Iso8583ParseConfig {
+    pub extract_fields: Bitmap,
+    pub translation_enabled: bool,
+    pub pan_obfuscate: bool,
+}
+
+impl Default for Iso8583ParseConfig {
+    fn default() -> Self {
+        Iso8583ParseConfig {
+            extract_fields: Bitmap::new(0, false),
+            translation_enabled: true,
+            pan_obfuscate: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebSphereMqParseConfig {
+    pub parse_xml_enabled: bool,
+    pub decompress_enabled: bool,
+    pub filter_attributes_enabled: bool,
+}
+
+impl Default for WebSphereMqParseConfig {
+    fn default() -> Self {
+        Self {
+            parse_xml_enabled: true,
+            decompress_enabled: true,
+            filter_attributes_enabled: true,
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct BondGroup {
@@ -3946,6 +3955,23 @@ mod tests {
 
     use std::fs;
 
+    fn process_data_for_cmdline(cmdline: &str) -> ProcessData {
+        ProcessData {
+            name: "java".to_string(),
+            pid: 1,
+            ppid: 0,
+            process_name: "java".to_string(),
+            cmd: "/usr/bin/java".to_string(),
+            cmd_with_args: cmdline.split(' ').map(ToString::to_string).collect(),
+            user_id: 0,
+            user: "root".to_string(),
+            start_time: Duration::ZERO,
+            os_app_tags: vec![],
+            netns_id: 0,
+            container_id: "".to_string(),
+        }
+    }
+
     #[test]
     fn read_yaml_file() {
         // TODO: improve test cases
@@ -3953,6 +3979,8 @@ mod tests {
             .expect("failed loading config file");
         assert_eq!(c.controller_ips.len(), 1);
         assert_eq!(&c.controller_ips[0], "127.0.0.1");
+        assert!(c.liveness_probe_enabled);
+        assert_eq!(c.liveness_probe_port, 39090);
     }
 
     #[test]
@@ -4035,6 +4063,51 @@ enabled: true
 "#;
         let proc: Proc = serde_yaml::from_str(default_matcher_yaml).unwrap();
         assert_eq!(proc.process_matcher, Proc::default().process_matcher);
+    }
+
+    #[test]
+    fn java_classpath_process_matcher_rewrites_to_class_name() {
+        let matcher = &Proc::default().process_matcher[1];
+        let cmdlines = [
+            "/usr/bin/java -Xms512m -classpath /app/app.jar:/app/lib/* com.example.Main arg1",
+            "/usr/bin/java -Xms512m -cp /app/app.jar:/app/lib/* com.example.Main arg1",
+        ];
+
+        for cmdline in cmdlines {
+            let rewritten = matcher
+                .get_process_data(&process_data_for_cmdline(cmdline), &HashMap::new())
+                .unwrap();
+            assert_eq!(rewritten.name, "com.example.Main");
+        }
+    }
+
+    #[test]
+    fn parse_java_classpath_process_matcher_and_rewrite() {
+        let yaml = r#"
+process_matcher:
+- match_regex: \bjava( +\S+)* +-(?:cp|classpath) +\S+ +(?P<CLASS_NAME>[$_A-Za-z][$_0-9A-Za-z]*(?:\.[$_A-Za-z][$_0-9A-Za-z]*)*)
+  match_type: cmdline_with_args
+  match_languages: []
+  match_usernames: []
+  only_in_container: false
+  only_with_tag: false
+  ignore: false
+  rewrite_name: ${CLASS_NAME}
+  enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+"#;
+        let proc: Proc = serde_yaml::from_str(yaml).unwrap();
+        let matcher = &proc.process_matcher[0];
+
+        assert_eq!(matcher.rewrite_name, "${CLASS_NAME}");
+        let rewritten = matcher
+            .get_process_data(
+                &process_data_for_cmdline(
+                    "/usr/bin/java -classpath /app/app.jar:/app/lib/* com.example.Main arg1",
+                ),
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(rewritten.name, "com.example.Main");
     }
 
     #[test]

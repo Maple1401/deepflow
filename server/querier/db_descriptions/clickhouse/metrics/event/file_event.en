@@ -1,0 +1,6 @@
+# Field              , DisplayName             , Unit , Description
+log_count            , Log Count               ,      ,
+bytes                , Bytes                   , Byte ,
+
+duration             , Total Duration          , us   ,
+row                  , Row Count               ,      ,

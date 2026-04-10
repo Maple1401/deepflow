@@ -25,6 +25,7 @@ l4_byte_tx                  , 发送传输层载荷          , 字节 , 客户�
 l4_byte_rx                  , 接收传输层载荷          , 字节 , 服务端发往客户端的包传输层载荷字节数总和（不含 TCP/UDP 头）
 direction_score             , 方向得分                ,      , 算法推理传输层连接方向（客户端、服务端角色）的准确性得分值，得分越高连接方向的准确性越高，得分最高 255
 log_count                   , 日志总量                , 个   , 
+fin_count                   , TCP FIN 包数            , 包   ,
 
 retrans_syn                 , SYN 重传                , 包   , SYN 包的重传次数
 retrans_synack              , SYN-ACK 重传            , 包   , SYN-ACK 包的重传次数
@@ -65,35 +66,38 @@ server_queue_lack           , 传输-服务端队列溢出     , 连接 ,
 tcp_timeout                 , 传输-TCP 连接超时       , 连接 ,
 client_half_close_flow      , 断连-客户端半关         , 连接 , TCP 断连异常的场景之一，见文档描述。
 server_half_close_flow      , 断连-服务端半关         , 连接 , TCP 断连异常的场景之一，见文档描述。
+ooo                         , TCP 乱序                , 包   ,
+ooo_tx                      , TCP 客户端乱序           , 包   ,
+ooo_rx                      , TCP 服务端乱序           , 包   ,
 
-rtt                         , 平均 TCP 建连时延       , 微秒 ,
-tls_rtt                     , 平均 TLS 建连时延       , 微秒 ,
-rtt_client                  , 平均 TCP 建连客户端时延 , 微秒 ,
-rtt_server                  , 平均 TCP 建连服务端时延 , 微秒 ,
-srt                         , 平均 TCP/ICMP 系统时延  , 微秒 ,
-art                         , 平均数据时延            , 微秒 ,
-cit                         , 平均客户端等待时延      , 微秒 ,
-rtt_max                     , 最大 TCP 建连时延       , 微秒 ,
-tls_rtt_max                 , 最大 TLS 建连时延       , 微秒 ,
-rtt_client_max              , 最大 TCP 建连客户端时延 , 微秒 ,
-rtt_server_max              , 最大 TCP 建连服务端时延 , 微秒 ,
-srt_max                     , 最大 TCP/ICMP 系统时延  , 微秒 ,
-art_max                     , 最大数据时延            , 微秒 ,
-cit_max                     , 最大客户端等待时延      , 微秒 ,
-srt_sum                     , 累计 TCP/ICMP 系统时延  , 微秒 , 采集周期内全部`TCP/ICMP 系统时延`的加和
+rtt                         , 平均 TCP 建连时延       , us ,
+tls_rtt                     , 平均 TLS 建连时延       , us ,
+rtt_client                  , 平均 TCP 建连客户端时延 , us ,
+rtt_server                  , 平均 TCP 建连服务端时延 , us ,
+srt                         , 平均 TCP/ICMP 系统时延  , us ,
+art                         , 平均数据时延            , us ,
+cit                         , 平均客户端等待时延      , us ,
+rtt_max                     , 最大 TCP 建连时延       , us ,
+tls_rtt_max                 , 最大 TLS 建连时延       , us ,
+rtt_client_max              , 最大 TCP 建连客户端时延 , us ,
+rtt_server_max              , 最大 TCP 建连服务端时延 , us ,
+srt_max                     , 最大 TCP/ICMP 系统时延  , us ,
+art_max                     , 最大数据时延            , us ,
+cit_max                     , 最大客户端等待时延      , us ,
+srt_sum                     , 累计 TCP/ICMP 系统时延  , us , 采集周期内全部`TCP/ICMP 系统时延`的加和
 srt_count                   , TCP/ICMP 系统时延次数   , 次   , 采集周期内`TCP/ICMP 系统时延`的次数
-art_sum                     , 累计数据时延            , 微秒 , 采集周期内全部`数据时延`的加和
+art_sum                     , 累计数据时延            , us , 采集周期内全部`数据时延`的加和
 art_count                   , 数据时延次数            , 次   , 采集周期内`数据时延`的次数
-cit_sum                     , 累计客户端等待时延      , 微秒 , 采集周期内全部`客户端等待时延`的加和
+cit_sum                     , 累计客户端等待时延      , us , 采集周期内全部`客户端等待时延`的加和
 cit_count                   , 客户端等待时延次数      , 次   , 采集周期内`客户端等待时延`的次数
-duration                    , 流持续时间              , 微秒 , 表示流的首包到尾包（注意不是 end_time）的时长。
+duration                    , 流持续时间              , us , 表示流的首包到尾包（注意不是 end_time）的时长。
 
 l7_request                  , 应用请求                , 个   ,
 l7_response                 , 应用响应                , 个   ,
-rrt                         , 平均应用时延            , 微秒 ,
-rrt_sum                     , 累计应用时延            , 微秒 , 采集周期内全部`应用时延`的加和
+rrt                         , 平均应用时延            , us ,
+rrt_sum                     , 累计应用时延            , us , 采集周期内全部`应用时延`的加和
 rrt_count                   , 应用时延次数            , 次   , 采集周期内`应用时延`的次数
-rrt_max                     , 最大应用时延            , 微秒 ,
+rrt_max                     , 最大应用时延            , us ,
 l7_error                    , 应用异常                , 个   ,
 l7_client_error             , 应用客户端异常          , 个   , 根据具体应用协议的响应码判断异常，不同协议的定义见 `l7_flow_log` 中 response_status 字段的说明 
 l7_server_error             , 应用服务端异常          , 个   , 根据具体应用协议的响应码判断异常，不同协议的定义见 `l7_flow_log` 中 response_status 字段的说明

@@ -57,28 +57,35 @@ use tokio::time;
 
 use super::{
     ntp::{NtpMode, NtpPacket, NtpTime},
-    RPC_RETRY_INTERVAL,
+    RPC_RECONNECT_INTERVAL, RPC_RETRY_INTERVAL,
 };
 
-use crate::common::endpoint::EPC_INTERNET;
-use crate::common::policy::Acl;
-use crate::common::policy::{Cidr, Container, IpGroupData, PeerConnection};
-use crate::common::NORMAL_EXIT_WITH_RESTART;
-use crate::common::{FlowAclListener, PlatformData as VInterface, DEFAULT_CONTROLLER_PORT};
-use crate::config::UserConfig;
-use crate::exception::ExceptionHandler;
-use crate::rpc::session::Session;
-use crate::trident::{self, AgentId, AgentState, ChangedConfig, RunningMode, State, VersionInfo};
 #[cfg(any(target_os = "linux"))]
 use crate::utils::environment::{get_current_k8s_image, get_k8s_namespace};
-use crate::utils::{
-    command::get_hostname,
-    environment::{
-        get_executable_path, is_tt_pod, running_in_container, running_in_k8s,
-        running_in_only_watch_k8s_mode, KubeWatchPolicy,
+use crate::{
+    common::{
+        endpoint::EPC_INTERNET,
+        policy::{Acl, Cidr, Container, IpGroupData, PeerConnection},
+        FlowAclListener, PlatformData as VInterface, DEFAULT_CONTROLLER_PORT,
+        NORMAL_EXIT_WITH_RESTART,
     },
-    stats,
+    config::{config, UserConfig},
+    exception::ExceptionHandler,
+    liveness::{self, ComponentId, ComponentSpec, LivenessRegistry},
+    platform,
+    rpc::session::Session,
+    trident::{self, AgentId, AgentState, ChangedConfig, RunningMode, State, VersionInfo},
+    utils::{
+        command::get_hostname,
+        environment::{
+            get_executable_path, is_tt_pod, running_in_container, running_in_k8s,
+            running_in_only_watch_k8s_mode, KubeWatchPolicy,
+        },
+        hasher::md5_to_string,
+        stats,
+    },
 };
+
 use public::{
     proto::agent::{
         self as pb, AgentIdentifier, AgentType, DynamicConfig, Exception, PacketCaptureType,
@@ -138,6 +145,15 @@ impl Default for StaticConfig {
     }
 }
 
+#[derive(Default)]
+struct CustomAppConfigInfo {
+    pub version: u64,
+
+    // keep some data for other configurations to use when server sends heartbeat or invalid custom_app_config
+    pub custom_protocol_port_ranges: String,
+    pub extra_headers: HashSet<String>,
+}
+
 pub struct Status {
     pub hostname: String,
 
@@ -161,6 +177,8 @@ pub struct Status {
     pub version_platform_data: u64,
     pub version_acls: u64,
     pub version_groups: u64,
+
+    custom_app: CustomAppConfigInfo,
 
     pub interfaces: Vec<Arc<VInterface>>,
     pub peers: Vec<Arc<PeerConnection>>,
@@ -192,6 +210,7 @@ impl Default for Status {
             version_platform_data: 0,
             version_acls: 0,
             version_groups: 0,
+            custom_app: Default::default(),
             interfaces: Default::default(),
             peers: Default::default(),
             cidrs: Default::default(),
@@ -541,6 +560,12 @@ impl Status {
         self.ntp_enabled = user_config.global.ntp.enabled;
         self.ntp_max_interval = user_config.global.ntp.max_drift;
         self.ntp_min_interval = user_config.global.ntp.min_drift;
+
+        let wait_ntp = self.ntp_enabled && self.first;
+        if resp.only_partial_fields() {
+            return (false, wait_ntp, has_invalid_log);
+        }
+
         let (updated_platform, invalid_log) = self.get_platform_data(resp, enabled_invalid_log);
         if updated_platform {
             self.modify_platform(
@@ -559,21 +584,7 @@ impl Status {
         updated |= updated_acl;
         has_invalid_log |= invalid_log;
 
-        updated = self.get_local_epc(&resp.dynamic_config.clone().unwrap_or(DynamicConfig {
-            kubernetes_api_enabled: None,
-            region_id: None,
-            pod_cluster_id: None,
-            vpc_id: None,
-            agent_id: None,
-            team_id: None,
-            organize_id: None,
-            secret_key: None,
-            enabled: None,
-            hostname: None,
-            agent_type: None,
-            group_id: None,
-        })) || updated;
-        let wait_ntp = self.ntp_enabled && self.first;
+        updated = self.get_local_epc(&resp.dynamic_config.clone().unwrap_or_default()) || updated;
 
         (updated, wait_ntp, has_invalid_log)
     }
@@ -602,10 +613,12 @@ pub struct Synchronizer {
     agent_mode: RunningMode,
     standalone_runtime_config: Option<PathBuf>,
     ipmac_tx: Arc<broadcast::Sender<IpMacPair>>,
+    liveness_registry: Option<LivenessRegistry>,
 }
 
 impl Synchronizer {
     const LOG_THRESHOLD: usize = 3;
+    const LIVENESS_TIMEOUT_MS: u64 = 90_000;
 
     pub fn new(
         runtime: Arc<Runtime>,
@@ -625,6 +638,7 @@ impl Synchronizer {
         standalone_runtime_config: Option<PathBuf>,
         ipmac_tx: Arc<broadcast::Sender<IpMacPair>>,
         ntp_diff: Arc<AtomicI64>,
+        liveness_registry: Option<LivenessRegistry>,
     ) -> Synchronizer {
         Synchronizer {
             static_config: Arc::new(StaticConfig {
@@ -659,6 +673,39 @@ impl Synchronizer {
             agent_mode,
             standalone_runtime_config,
             ipmac_tx,
+            liveness_registry,
+        }
+    }
+
+    fn sync_liveness_spec() -> ComponentSpec {
+        ComponentSpec {
+            id: ComponentId::new("synchronizer", 0),
+            display_name: "synchronizer sync".into(),
+            // Synchronizer already has escape/restart handling, so liveness here is kept only
+            // for debugging visibility and should not fail the global probe.
+            required: false,
+            timeout_ms: Self::LIVENESS_TIMEOUT_MS,
+            ..Default::default()
+        }
+    }
+
+    fn triggered_liveness_spec() -> ComponentSpec {
+        ComponentSpec {
+            id: ComponentId::new("synchronizer", 1),
+            display_name: "synchronizer triggered".into(),
+            required: false,
+            timeout_ms: Self::LIVENESS_TIMEOUT_MS,
+            ..Default::default()
+        }
+    }
+
+    fn standalone_liveness_spec() -> ComponentSpec {
+        ComponentSpec {
+            id: ComponentId::new("synchronizer", 2),
+            display_name: "synchronizer standalone".into(),
+            required: false,
+            timeout_ms: Self::LIVENESS_TIMEOUT_MS,
+            ..Default::default()
         }
     }
 
@@ -667,7 +714,8 @@ impl Synchronizer {
         status.version_acls = 0;
         status.version_groups = 0;
         status.version_platform_data = 0;
-        info!("Reset version of acls, groups and platform_data.");
+        status.custom_app = Default::default();
+        info!("Reset version of acls, groups, platform_data and custom_app_config.");
     }
 
     pub fn add_flow_acl_listener(&self, module: Box<dyn FlowAclListener>) {
@@ -692,12 +740,72 @@ impl Synchronizer {
         self.max_memory.clone()
     }
 
+    fn is_excluded_ip_addr(ip_addr: IpAddr) -> bool {
+        if ip_addr.is_loopback() || ip_addr.is_unspecified() || ip_addr.is_multicast() {
+            return true;
+        }
+        match ip_addr {
+            IpAddr::V4(addr) => addr.is_link_local(),
+            // Ipv6Addr::is_unicast_link_local()是实验API无法使用
+            IpAddr::V6(addr) => is_unicast_link_local(&addr),
+        }
+    }
+
+    fn host_ips() -> Vec<String> {
+        #[cfg(target_os = "linux")]
+        let (links, addrs) = (
+            public::netns::link_list_in_netns(&public::netns::NsFile::Root),
+            public::netns::addr_list_in_netns(&public::netns::NsFile::Root),
+        );
+        #[cfg(any(target_os = "windows", target_os = "android"))]
+        let (links, addrs) = (
+            public::utils::net::link_list(),
+            public::utils::net::addr_list(),
+        );
+
+        let (links, addrs) = match (links, addrs) {
+            (Ok(links), Ok(addrs)) => (links, addrs),
+            (Err(e), _) => {
+                warn!("get links failed: {}", e);
+                return vec![];
+            }
+            (_, Err(e)) => {
+                warn!("get addrs failed: {}", e);
+                return vec![];
+            }
+        };
+        // find ignored interface indices
+        let filtered_indices: HashSet<u32> = links
+            .into_iter()
+            .filter_map(|link| {
+                if platform::IGNORED_INTERFACES.contains(&link.name.as_str()) {
+                    Some(link.if_index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        addrs
+            .into_iter()
+            .filter_map(|addr| {
+                if Self::is_excluded_ip_addr(addr.ip_addr)
+                    || filtered_indices.contains(&addr.if_index)
+                {
+                    None
+                } else {
+                    Some(addr.ip_addr.to_string())
+                }
+            })
+            .collect()
+    }
+
     pub fn generate_sync_request(
         agent_id: &Arc<RwLock<AgentId>>,
         static_config: &Arc<StaticConfig>,
         status: &Arc<RwLock<Status>>,
         time_diff: i64,
         exception_handler: &ExceptionHandler,
+        grpc_buffer_size: u64,
     ) -> pb::SyncRequest {
         let status = status.read();
 
@@ -708,19 +816,8 @@ impl Synchronizer {
             .as_nanos();
         let boot_time = (boot_time as i64 + time_diff) / 1_000_000_000;
 
-        fn is_excluded_ip_addr(ip_addr: IpAddr) -> bool {
-            if ip_addr.is_loopback() || ip_addr.is_unspecified() || ip_addr.is_multicast() {
-                return true;
-            }
-            match ip_addr {
-                IpAddr::V4(addr) => addr.is_link_local(),
-                // Ipv6Addr::is_unicast_link_local()是实验API无法使用
-                IpAddr::V6(addr) => is_unicast_link_local(&addr),
-            }
-        }
-
         let agent_id = agent_id.read();
-
+        let (exception, exception_description) = exception_handler.take();
         pb::SyncRequest {
             boot_time: Some(boot_time as u32),
             config_accepted: Some(status.config_accepted),
@@ -730,30 +827,14 @@ impl Synchronizer {
             state: Some(pb::State::Running.into()),
             revision: Some(static_config.version_info.revision.to_owned()),
             current_k8s_image: static_config.current_k8s_image.clone(),
-            exception: Some(exception_handler.take()),
+            exception: Some(exception),
+            exception_description,
             process_name: Some(static_config.version_info.name.to_owned()),
             ctrl_mac: Some(agent_id.ipmac.mac.to_string()),
             ctrl_ip: Some(agent_id.ipmac.ip.to_string()),
             team_id: Some(agent_id.team_id.clone()),
             host: Some(status.hostname.clone()),
-            host_ips: {
-                #[cfg(target_os = "linux")]
-                let addrs = public::netns::addr_list_in_netns(&public::netns::NsFile::Root);
-                #[cfg(any(target_os = "windows", target_os = "android"))]
-                let addrs = public::utils::net::addr_list();
-
-                addrs.map_or(vec![], |xs| {
-                    xs.into_iter()
-                        .filter_map(|x| {
-                            if is_excluded_ip_addr(x.ip_addr) {
-                                None
-                            } else {
-                                Some(x.ip_addr.to_string())
-                            }
-                        })
-                        .collect()
-                })
-            },
+            host_ips: Self::host_ips(),
             cpu_num: Some(static_config.env.cpu_num),
             memory_size: Some(static_config.env.memory_size),
             arch: Some(static_config.env.arch.clone()),
@@ -770,6 +851,11 @@ impl Synchronizer {
             agent_unique_identifier: Some(pb::AgentIdentifier::from(
                 static_config.agent_unique_identifier,
             ) as i32),
+            current_grpc_buffer_size: Some(grpc_buffer_size),
+            custom_app_config: Some(pb::CustomAppConfig {
+                version: Some(status.custom_app.version),
+                ..Default::default()
+            }),
             ..Default::default()
         }
     }
@@ -818,6 +904,10 @@ impl Synchronizer {
         resp: &pb::SyncResponse,
         enabled_invalid_log: bool,
     ) -> (Vec<pb::Segment>, Vec<MacAddr>, Vec<MacAddr>, bool) {
+        if resp.only_partial_fields() {
+            return (vec![], vec![], vec![], false);
+        }
+
         let segments = if capture_mode == PacketCaptureType::Analyzer {
             resp.remote_segments.clone()
         } else {
@@ -875,16 +965,14 @@ impl Synchronizer {
             }
             if !invalid_mac.is_empty() {
                 warn!(
-                    "Invalid mac {:?}, The mac address is invalid and cannot be resolved to MacAddr
-    .",
+                    "Invalid mac {:?}, The mac address is invalid and cannot be resolved to MacAddr.",
                     invalid_mac
                 );
                 has_invalid_log = true;
             }
             if !invalid_vmac.is_empty() {
                 warn!(
-                    "Invalid vmac {:?}, The vmac address is invalid and cannot be resolved to MacAddr
-    .",
+                    "Invalid vmac {:?}, The vmac address is invalid and cannot be resolved to MacAddr.",
                     invalid_vmac
                 );
                 has_invalid_log = true;
@@ -892,6 +980,154 @@ impl Synchronizer {
         }
 
         return (segments, macs, gateway_vmacs, has_invalid_log);
+    }
+
+    #[cfg(not(feature = "enterprise"))]
+    fn parse_custom_app_config(
+        status: &RwLock<Status>,
+        config: &Option<pb::CustomAppConfig>,
+        _: &mut UserConfig,
+    ) -> Result<bool, config::ConfigError> {
+        // only do version updates
+        if let Some(version) = config.as_ref().and_then(|c| c.version) {
+            let mut sg = status.write();
+            if sg.custom_app.version != version {
+                info!(
+                    "Grpc custom_app_config version changed from {} to {version}",
+                    sg.custom_app.version
+                );
+                sg.custom_app.version = version;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(feature = "enterprise")]
+    fn parse_custom_app_config(
+        status: &RwLock<Status>,
+        config: &Option<pb::CustomAppConfig>,
+        user_config: &mut UserConfig,
+    ) -> Result<bool, config::ConfigError> {
+        use enterprise_utils::l7::custom_policy::{
+            config::{CustomApp, CustomField},
+            custom_protocol_policy::ExtraCustomProtocolConfig,
+        };
+
+        let Some(config) = config.as_ref() else {
+            // no custom_app_config, use cached extra_headers
+            let sg = status.read();
+            let ca = &mut user_config.custom_app;
+            ca.custom_protocol_port_ranges = sg.custom_app.custom_protocol_port_ranges.clone();
+            ca.extra_headers = sg.custom_app.extra_headers.clone();
+
+            // TODO: remove backward compatibility code
+            {
+                let mut ca_config = CustomApp::default();
+                let request_log = &mut user_config.processors.request_log;
+
+                #[allow(deprecated)]
+                std::mem::swap(
+                    &mut ca_config.biz_protocol_policies,
+                    &mut request_log.application_protocol_inference.custom_protocols,
+                );
+                ca.custom_protocol_port_ranges = ExtraCustomProtocolConfig::port_range(
+                    ca_config.biz_protocol_policies.as_slice(),
+                )
+                .to_string();
+
+                let mut cfp = vec![];
+                #[allow(deprecated)]
+                std::mem::swap(
+                    &mut cfp,
+                    &mut request_log.tag_extraction.custom_field_policies,
+                );
+                ca_config.biz_field = CustomField::from(cfp);
+                for header in ca_config.biz_field.get_http2_headers() {
+                    ca.extra_headers.insert(header.to_string());
+                }
+
+                // calculate a fake version to trigger update
+                use std::hash::Hasher;
+                let mut hasher = ahash::AHasher::default();
+                if let Ok(json) = serde_json::to_string(&ca_config.biz_protocol_policies) {
+                    hasher.write(json.as_bytes());
+                }
+                if let Ok(json) = serde_json::to_string(&ca_config.biz_field) {
+                    hasher.write(json.as_bytes());
+                }
+                ca.version = hasher.finish();
+
+                ca.config = Some(ca_config);
+            }
+
+            return Ok(true);
+        };
+
+        let Some(version) = config.version else {
+            debug!("ignored message without version in custom_app_config");
+            return Ok(false);
+        };
+        let mut sg = status.write();
+        if version == sg.custom_app.version {
+            debug!("custom_app_config not updated, version: {version}");
+            return Ok(false);
+        }
+
+        let custom_app_config: CustomApp = if config.compressed() {
+            match zstd::stream::read::Decoder::new(config.configs()) {
+                Ok(reader) => match serde_yaml::from_reader(reader) {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        return Err(config::ConfigError::YamlConfigInvalid(format!(
+                            "Parse custom_app_config failed: {e}"
+                        )))
+                    }
+                },
+                Err(e) => {
+                    return Err(config::ConfigError::YamlConfigInvalid(format!(
+                        "Failed to create zstd decoder: {e}"
+                    )));
+                }
+            }
+        } else {
+            match serde_yaml::from_slice(config.configs()) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    return Err(config::ConfigError::YamlConfigInvalid(format!(
+                        "Parse custom_app_config failed: {e}"
+                    )))
+                }
+            }
+        };
+
+        let custom_protocol_port_ranges = ExtraCustomProtocolConfig::port_range(
+            custom_app_config.biz_protocol_policies.as_slice(),
+        )
+        .to_string();
+        let extra_headers: HashSet<String> = custom_app_config
+            .biz_field
+            .get_http2_headers()
+            .map(|h| h.to_string())
+            .collect();
+        user_config.custom_app = config::CustomApp {
+            version,
+            custom_protocol_port_ranges: custom_protocol_port_ranges.clone(),
+            extra_headers: extra_headers.clone(),
+            config: Some(custom_app_config),
+        };
+
+        info!(
+            "Grpc custom_app_config version changed from {} to {version}",
+            sg.custom_app.version
+        );
+        sg.custom_app = CustomAppConfigInfo {
+            version,
+            custom_protocol_port_ranges,
+            extra_headers,
+        };
+
+        Ok(true)
     }
 
     // Note that both 'status' and 'flow_acl_listener' will be locked here, and other places where 'status'
@@ -928,16 +1164,20 @@ impl Synchronizer {
         }
         let user_config = serde_yaml::from_str(&config.unwrap());
         if let Err(e) = user_config {
-            warn!(
+            let error_msg = format!(
                 "invalid response from {:?} with invalid config: {}",
                 remote, e
             );
-            exception_handler.set(Exception::InvalidConfiguration);
+            warn!("{}", error_msg);
+            exception_handler.set(Exception::InvalidConfiguration, Some(error_msg));
             return;
         }
         let mut user_config: UserConfig = user_config.unwrap();
         if let Some(dynamic_config) = resp.dynamic_config.as_ref() {
-            user_config.set_dynamic_config(dynamic_config);
+            user_config.set_dynamic_config_and_grpc_buffer_size(
+                dynamic_config,
+                resp.new_grpc_buffer_size(),
+            );
             match &dynamic_config.group_id {
                 Some(id) if !id.is_empty() => {
                     agent_id.write().group_id = id.to_owned();
@@ -946,6 +1186,33 @@ impl Synchronizer {
             }
         }
         user_config.adjust();
+        match Self::parse_custom_app_config(status, &resp.custom_app_config, &mut user_config) {
+            #[cfg(feature = "enterprise")]
+            Ok(false) => {
+                // no update, need to copy old data from cache
+                let sg = status.read();
+                user_config.custom_app = config::CustomApp {
+                    version: sg.custom_app.version,
+                    custom_protocol_port_ranges: sg.custom_app.custom_protocol_port_ranges.clone(),
+                    extra_headers: sg.custom_app.extra_headers.clone(),
+                    config: None,
+                };
+            }
+            Err(e) => {
+                let error_msg = format!("parse custom_app_config failed: {e}");
+                warn!("{}", error_msg);
+                exception_handler.set(Exception::InvalidConfiguration, Some(error_msg));
+                return;
+            }
+            _ => (),
+        }
+
+        if resp.only_partial_fields() {
+            info!(
+                "Grpc recv only_partial_fields message and update grpc_buffer_size to {}.",
+                user_config.global.communication.grpc_buffer_size
+            );
+        }
 
         // FIXME: Confirm the kvm resource classification and then cancel the comment
         // When the ee version compiles the ce crate, it will be false, only ce version
@@ -1016,7 +1283,7 @@ impl Synchronizer {
             }
             if policy_error {
                 warn!("OnPolicyChange error, set exception TOO_MANY_POLICIES.");
-                exception_handler.set(Exception::TooManyPolicies);
+                exception_handler.set(Exception::TooManyPolicies, None);
             } else {
                 exception_handler.clear(Exception::TooManyPolicies);
             }
@@ -1038,17 +1305,23 @@ impl Synchronizer {
         }
 
         let mut status_guard = status.write();
-        let blacklist = status_guard.get_blacklist(&resp);
         status_guard.first = false;
-        drop(status_guard);
+        if resp.only_partial_fields() {
+            drop(status_guard);
 
-        agent_state.update_config(ChangedConfig {
-            user_config,
-            blacklist,
-            vm_mac_addrs: macs,
-            gateway_vmac_addrs,
-            tap_types: resp.capture_network_types,
-        });
+            agent_state.update_partial_config(user_config);
+        } else {
+            let blacklist = status_guard.get_blacklist(&resp);
+            drop(status_guard);
+
+            agent_state.update_config(ChangedConfig {
+                user_config,
+                blacklist,
+                vm_mac_addrs: macs,
+                gateway_vmac_addrs,
+                tap_types: resp.capture_network_types,
+            });
+        }
     }
 
     fn grpc_failed_log(grpc_failed_count: &mut usize, detail: String) {
@@ -1075,10 +1348,14 @@ impl Synchronizer {
         let flow_acl_listener = self.flow_acl_listener.clone();
         let exception_handler = self.exception_handler.clone();
         let ntp_diff = self.ntp_diff.clone();
+        let liveness_registry = self.liveness_registry.clone();
         let mut ntp_receiver = ntp_receiver.take().unwrap();
         self.threads.lock().push(self.runtime.spawn(async move {
+            let liveness =
+                liveness::register(liveness_registry.as_ref(), Self::triggered_liveness_spec());
             let mut grpc_failed_count = 0;
             while running.load(Ordering::SeqCst) {
+                liveness.heartbeat();
                 let response = session
                     .grpc_push_with_statsd(Synchronizer::generate_sync_request(
                         &agent_id,
@@ -1086,51 +1363,60 @@ impl Synchronizer {
                         &status,
                         ntp_diff.load(Ordering::Relaxed),
                         &exception_handler,
+                        session.get_rx_size(),
                     ))
                     .await;
                 let version = session.get_version();
 
                 if let Err(m) = response {
-                    exception_handler.set(Exception::ControllerSocketError);
-                    session.set_request_failed(true);
-                    Self::grpc_failed_log(&mut grpc_failed_count, format!("from trigger {:?}", m));
+                    let error_msg = format!("from trigger {:?}", m);
+                    exception_handler
+                        .set(Exception::ControllerSocketError, Some(error_msg.clone()));
+                    Self::grpc_failed_log(&mut grpc_failed_count, error_msg);
                     time::sleep(RPC_RETRY_INTERVAL).await;
                     continue;
                 }
-                session.set_request_failed(false);
                 grpc_failed_count = 0;
 
                 let mut stream = response.unwrap().into_inner();
                 while running.load(Ordering::SeqCst) {
+                    liveness.heartbeat();
                     let message = stream.message().await;
                     if session.get_version() != version {
                         info!("grpc server or config changed");
+                        time::sleep(RPC_RECONNECT_INTERVAL).await;
                         break;
                     }
                     if let Err(m) = message {
-                        exception_handler.set(Exception::ControllerSocketError);
-                        Self::grpc_failed_log(
-                            &mut grpc_failed_count,
-                            format!("from trigger {:?}", m),
-                        );
+                        let error_msg = format!("from trigger {:?}", m);
+                        exception_handler
+                            .set(Exception::ControllerSocketError, Some(error_msg.clone()));
+                        Self::grpc_failed_log(&mut grpc_failed_count, error_msg);
+                        time::sleep(RPC_RECONNECT_INTERVAL).await;
                         break;
                     }
                     let message = message.unwrap();
                     if message.is_none() {
                         debug!("end of stream");
+                        time::sleep(RPC_RECONNECT_INTERVAL).await;
                         break;
                     }
                     let message = message.unwrap();
+
+                    session.update_message_counter(message.encoded_len());
+
                     match message.status() {
                         pb::Status::Failed => {
-                            exception_handler.set(Exception::ControllerSocketError);
                             let (ip, port) = session.get_current_server();
-                            warn!(
+                            let error_msg = format!(
                                 "server (ip: {} port: {}) responded with {:?}",
                                 ip,
                                 port,
                                 pb::Status::Failed
                             );
+                            warn!("{}", error_msg);
+                            exception_handler
+                                .set(Exception::ControllerSocketError, Some(error_msg));
                             time::sleep(RPC_RETRY_INTERVAL).await;
                             continue;
                         }
@@ -1155,6 +1441,7 @@ impl Synchronizer {
                         }
                     }
 
+                    liveness.heartbeat();
                     Self::on_response(
                         session.get_current_server(),
                         message,
@@ -1332,10 +1619,7 @@ impl Synchronizer {
         session: &Session,
         agent_id: &AgentId,
         current_k8s_image: &Option<String>,
-    ) -> Result<(), String> {
-        let Some(current_k8s_image) = current_k8s_image else {
-            return Err("empty current_k8s_image".to_owned());
-        };
+    ) -> Result<bool, String> {
         let response = session
             .grpc_upgrade_with_statsd(pb::UpgradeRequest {
                 ctrl_ip: Some(agent_id.ipmac.ip.to_string()),
@@ -1343,10 +1627,10 @@ impl Synchronizer {
                 team_id: Some(agent_id.team_id.clone()),
             })
             .await;
-        if let Err(m) = response {
-            return Err(format!("rpc error {:?}", m));
-        }
-        let mut stream = response.unwrap().into_inner();
+        let mut stream = match response {
+            Ok(stream) => stream.into_inner(),
+            Err(e) => return Err(format!("rpc error {:?}", e)),
+        };
         while let Some(message) = stream
             .message()
             .await
@@ -1355,57 +1639,69 @@ impl Synchronizer {
             if !running.load(Ordering::SeqCst) {
                 return Err("upgrade terminated".to_owned());
             }
+
+            session.update_message_counter(message.encoded_len());
+
             if message.status() != pb::Status::Success {
                 return Err("upgrade failed in server response".to_owned());
             }
-            let new_k8s_image = message.k8s_image().to_owned();
+
+            let new_k8s_image = message.k8s_image();
+            match current_k8s_image {
+                Some(image) if image == new_k8s_image => {
+                    info!("k8s_image '{image}' has not changed, not upgraded");
+                    return Ok(false);
+                }
+                _ => (),
+            }
             info!(
-                "current_k8s_image: {}, new_k8s_image: {}",
-                current_k8s_image, &new_k8s_image
+                "upgrading k8s_image from '{}' to '{new_k8s_image}'",
+                current_k8s_image
+                    .as_ref()
+                    .map(|s| s.as_str())
+                    .unwrap_or_default(),
             );
-            if current_k8s_image != &new_k8s_image {
-                let Ok(mut config) = Config::infer().await else {
-                    return Err("failed to infer kubernetes config".to_owned());
-                };
-                config.accept_invalid_certs = true;
 
-                let Ok(client) = Client::try_from(config) else {
-                    return Err("failed to create kubernetes client".to_owned());
-                };
+            let Ok(mut config) = Config::infer().await else {
+                return Err("failed to infer kubernetes config".to_owned());
+            };
+            config.accept_invalid_certs = true;
 
-                let daemonsets: Api<DaemonSet> = Api::namespaced(client, &get_k8s_namespace());
+            let Ok(client) = Client::try_from(config) else {
+                return Err("failed to create kubernetes client".to_owned());
+            };
 
-                // Referer: https://kubernetes.io/zh-cn/docs/reference/kubernetes-api/workload-resources/pod-v1/#Container
-                let patch = serde_json::json!({
-                    "apiVersion": "apps/v1",
-                    "kind": "DaemonSet",
-                    "spec": {
-                        "template":{
-                            "spec":{
-                                "containers": [{
-                                    "name": public::consts::CONTAINER_NAME,
-                                    "image": new_k8s_image,
-                                }],
-                            }
+            let daemonsets: Api<DaemonSet> = Api::namespaced(client, &get_k8s_namespace());
+
+            // Referer: https://kubernetes.io/zh-cn/docs/reference/kubernetes-api/workload-resources/pod-v1/#Container
+            let patch = serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "DaemonSet",
+                "spec": {
+                    "template":{
+                        "spec":{
+                            "containers": [{
+                                "name": public::consts::CONTAINER_NAME,
+                                "image": new_k8s_image,
+                            }],
                         }
                     }
-                });
-                let params = PatchParams::default();
-                let patch = Patch::Strategic(&patch);
-                if let Err(e) = daemonsets
-                    .patch(public::consts::DAEMONSET_NAME, &params, &patch)
-                    .await
-                {
-                    return Err(format!(
-                        "patch deepflow-agent k8s image failed, current_k8s_image: {:?}, error: {:?}",
-                        &current_k8s_image, e
-                    ));
                 }
-            } else {
-                info!("k8s_image has not changed, not upgraded");
+            });
+            let params = PatchParams::default();
+            let patch = Patch::Strategic(&patch);
+            if let Err(e) = daemonsets
+                .patch(public::consts::DAEMONSET_NAME, &params, &patch)
+                .await
+            {
+                return Err(format!(
+                    "patch deepflow-agent k8s image failed, current_k8s_image: {:?}, error: {:?}",
+                    &current_k8s_image, e
+                ));
             }
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn upgrade(
@@ -1493,10 +1789,7 @@ impl Synchronizer {
             ));
         }
 
-        let checksum = checksum
-            .finalize()
-            .into_iter()
-            .fold(String::new(), |s, c| s + &format!("{:02x}", c));
+        let checksum = md5_to_string(&mut checksum);
         if checksum != md5_sum {
             return Err(format!(
                 "Binary checksum mismatch, expected: {}, received: {}",
@@ -1558,8 +1851,12 @@ impl Synchronizer {
         let mut sync_interval = DEFAULT_SYNC_INTERVAL;
         let standalone_runtime_config = self.standalone_runtime_config.as_ref().unwrap().clone();
         let flow_acl_listener = self.flow_acl_listener.clone();
+        let liveness_registry = self.liveness_registry.clone();
         self.threads.lock().push(self.runtime.spawn(async move {
+            let liveness =
+                liveness::register(liveness_registry.as_ref(), Self::standalone_liveness_spec());
             while running.load(Ordering::SeqCst) {
+                liveness.heartbeat();
                 let mut user_config =
                     match UserConfig::load_from_file(standalone_runtime_config.as_path()) {
                         Ok(c) => c,
@@ -1580,7 +1877,7 @@ impl Synchronizer {
                     agent_type: Some(AgentType::TtProcess.into()),
                     ..Default::default()
                 };
-                user_config.set_dynamic_config(&dynamic_config);
+                user_config.set_dynamic_config_and_grpc_buffer_size(&dynamic_config, 5 << 20);
 
                 for listener in flow_acl_listener.lock().unwrap().iter_mut() {
                     let _ = listener.flow_acl_change(
@@ -1628,10 +1925,14 @@ impl Synchronizer {
         let max_memory = self.max_memory.clone();
         let exception_handler = self.exception_handler.clone();
         let ntp_diff = self.ntp_diff.clone();
+        let liveness_registry = self.liveness_registry.clone();
         let mut ntp_receiver = ntp_receiver.take().unwrap();
         self.threads.lock().push(self.runtime.spawn(async move {
+            let liveness =
+                liveness::register(liveness_registry.as_ref(), Self::sync_liveness_spec());
             let mut grpc_failed_count = 0;
             while running.load(Ordering::SeqCst) {
+                liveness.heartbeat();
                 let upgrade_hostname = |s: &str| {
                     let r = status.upgradable_read();
                     if s.ne(&r.hostname) {
@@ -1659,30 +1960,33 @@ impl Synchronizer {
                         status.hostname,
                     )
                 }
-
                 let request = Synchronizer::generate_sync_request(
                     &agent_id,
                     &static_config,
                     &status,
                     ntp_diff.load(Ordering::Relaxed),
                     &exception_handler,
+                    session.get_rx_size(),
                 );
                 debug!("grpc sync request: {:?}", request);
 
+                liveness.heartbeat();
                 let response = session.grpc_sync_with_statsd(request).await;
                 if let Err(m) = response {
-                    exception_handler.set(Exception::ControllerSocketError);
                     let (ip, port) = session.get_current_server();
+                    let error_msg = format!("from sync server {} {} unavailable {:?}\"",
+                                    ip, port, &m);
+                    exception_handler.set(Exception::ControllerSocketError, Some(error_msg.clone()));
                     session.set_request_failed(true);
                     Self::grpc_failed_log(&mut grpc_failed_count,
-                        format!("from sync server {} {} unavailable {:?}\"",
-                                    ip, port, &m));
+                        error_msg);
                     time::sleep(RPC_RETRY_INTERVAL).await;
                     continue;
                 }
                 session.set_request_failed(false);
                 grpc_failed_count = 0;
 
+                liveness.heartbeat();
                 Self::on_response(
                     session.get_current_server(),
                     response.unwrap().into_inner(),
@@ -1711,12 +2015,14 @@ impl Synchronizer {
                     if running_in_k8s() {
                         #[cfg(target_os = "linux")]
                         match Self::upgrade_k8s_image(&running, &session, &id, &static_config.current_k8s_image).await {
-                            Ok(_) => {
+                            Ok(true) => {
                                 warn!("agent upgrade is successful and don't ternimate or restart it, wait for the k8s to recreate it");
                             }
+                            Ok(false) => (), // same version or no valid message
                             Err(e) => {
-                                exception_handler.set(Exception::ControllerSocketError);
-                                error!("upgrade failed: {:?}", e);
+                                let error_msg = format!("upgrade failed: {:?}", e);
+                                error!("{}", error_msg);
+                                exception_handler.set(Exception::ControllerSocketError, Some(error_msg));
                             }
                         }
                         #[cfg(any(target_os = "windows", target_os = "android"))]
@@ -1730,8 +2036,9 @@ impl Synchronizer {
                             },
                             Ok(false) => (), // upgrade terminated
                             Err(e) => {
-                                exception_handler.set(Exception::ControllerSocketError);
-                                error!("upgrade failed: {:?}", e);
+                                let error_msg = format!("upgrade failed: {:?}", e);
+                                error!("{}", error_msg);
+                                exception_handler.set(Exception::ControllerSocketError, Some(error_msg));
                             },
                         }
                     }

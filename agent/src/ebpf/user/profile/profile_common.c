@@ -177,6 +177,14 @@ void set_bpf_rt_kern(struct bpf_tracer *t, struct profiler_context *ctx)
 	ebpf_info("%s%s() success, rt_flag:%d\n", ctx->tag, __func__, rt_flag);
 }
 
+/*
+ * Best-effort detection of masked kallsyms addresses.
+ *
+ * Under normal circumstances, /proc/kallsyms begins with core
+ * kernel text symbols and is ordered by address. Having the first
+ * 100 entries all show address 0 is therefore extremely unlikely
+ * and indicates that kallsyms addresses are unavailable.
+ */
 static bool check_kallsyms_addr_is_zero(void)
 {
 	const int check_num = 100;
@@ -190,20 +198,29 @@ static bool check_kallsyms_addr_is_zero(void)
 	}
 
 	char line[max_line_len];
-	int count = 0;
+	int count = 0, zero_count = 0;
+	// Output three lines of kallsyms content
+	static const int print_num = 3;
 
 	while (fgets(line, sizeof(line), file) != NULL && count < check_num) {
 		char address[17];	// 16 characters + null terminator
 		sscanf(line, "%16s", address);
+		if (count < print_num) {
+			ebpf_info("%s [address:%s]\n", line, address);
+		}
 
 		if (strcmp(address, check_str) == 0) {
-			count++;
+			zero_count++;
 		}
+		count++;
 	}
 
 	fclose(file);
 
-	return (count == check_num);
+	ebpf_info("Check kallsyms: count %d check_num %d zero_count %d\n",
+		  count, check_num, zero_count);
+
+	return (zero_count == check_num);
 }
 
 bool run_conditions_check(void)
@@ -442,15 +459,18 @@ static int push_and_free_msg_kvp_cb(stack_trace_msg_hash_kv * kv, void *arg)
 		cpdbg_process(msg);
 
 		tracer_callback_t fun = profiler_tracer->process_fn;
+		int r = 0;
 		/*
 		 * Execute callback function to hand over the data to the
 		 * higher level for processing. The higher level will se-
 		 * nd the data to the server for storage as required.
 		 */
 		if (likely(ctx->profiler_stop == 0))
-			fun(ctx->callback_ctx, 0, msg);
+			r = fun(ctx->callback_ctx, 0, msg);
 
-		clib_mem_free((void *)msg);
+		if (!(r & TRACER_CALLBACK_FLAG_KEEP_DATA))
+			clib_mem_free((void *)msg);
+
 		msg_kv->msg_ptr = 0;
 	}
 
@@ -671,6 +691,10 @@ static void set_stack_trace_msg(struct profiler_context *ctx,
 	msg->stime = stime;
 	msg->netns_id = ns_id;
 	msg->profiler_type = ctx->type;
+	msg->flags = 0;
+	if (ctx->type == PROFILER_TYPE_MEMORY && (v->flags & STACK_TRACE_FLAGS_CUDA_MEMORY)) {
+		msg->flags |= STACK_TRACE_FLAGS_CUDA_MEMORY;
+	}
 	if (ctx->type == PROFILER_TYPE_MEMORY) {
 		msg->mem_addr = v->memory.addr;
 	}
@@ -720,7 +744,7 @@ static void set_stack_trace_msg(struct profiler_context *ctx,
 		}
 	}
 
-	msg->time_stamp = gettime(CLOCK_REALTIME, TIME_TYPE_NAN);
+	msg->time_stamp = v->timestamp + get_sysboot_time_ns();
 	if (ctx->type == PROFILER_TYPE_MEMORY) {
 		msg->count = v->memory.size;
 	} else if (ctx->use_delta_time) {

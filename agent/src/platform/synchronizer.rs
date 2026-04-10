@@ -24,7 +24,7 @@ use std::{
 };
 
 use arc_swap::access::Access;
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use parking_lot::RwLock;
 
 use tokio::runtime::Runtime;
@@ -93,6 +93,8 @@ pub struct Synchronizer {
 }
 
 impl Synchronizer {
+    const VERSION_CHANGE_RESYNC_INTERVAL: Duration = Duration::from_secs(1);
+
     pub fn new(
         runtime: Arc<Runtime>,
         config: PlatformAccess,
@@ -276,10 +278,22 @@ impl Synchronizer {
                     }
                 };
 
-                debug!(
-                    "syncing version {} -> {} to remote",
-                    args.version, args.peer_version
-                );
+                if args.version == args.peer_version {
+                    debug!("version {} heartbeat to remote", args.version);
+                } else if log::log_enabled!(log::Level::Debug) {
+                    let n_interfaces = msg
+                        .platform_data
+                        .as_ref()
+                        .map(|p| p.interfaces.len())
+                        .unwrap_or(0);
+                    let n_processes = msg
+                        .process_data
+                        .as_ref()
+                        .map(|p| p.process_entries.len())
+                        .unwrap_or(0);
+                    debug!("syncing version {} -> {} to remote with {n_interfaces} interfaces and {n_processes} processes", args.version, args.peer_version);
+                }
+                trace!("genesis_sync request: {msg:?}");
                 match args
                     .runtime
                     .block_on(args.session.grpc_genesis_sync_with_statsd(msg))
@@ -288,6 +302,16 @@ impl Synchronizer {
                         let res = res.into_inner();
                         args.peer_version = res.version();
                         if args.version != args.peer_version {
+                            // server in initial state will return version 0, wait longer in this situation
+                            // otherwise (maybe a server switch), wait for a short time to avoid too frequent resync
+                            let wait_interval = if args.peer_version == 0 {
+                                config.sync_interval
+                            } else {
+                                Self::VERSION_CHANGE_RESYNC_INTERVAL
+                            };
+                            if !Self::wait_for_running(&args.running, &args.timer, wait_interval) {
+                                break 'outer;
+                            }
                             // resync when versions mismatch
                             info!(
                                 "local version {}, remote version {}, about to resync",
@@ -306,8 +330,7 @@ impl Synchronizer {
                         }
                     }
                     Err(e) => {
-                        args.exception_handler.set(Exception::ControllerSocketError);
-                        error!(
+                        let error_msg = format!(
                             "send platform {} with genesis_sync grpc call failed: {}",
                             if args.version == args.peer_version {
                                 "heartbeat"
@@ -316,6 +339,9 @@ impl Synchronizer {
                             },
                             e
                         );
+                        error!("{}", error_msg);
+                        args.exception_handler
+                            .set(Exception::ControllerSocketError, Some(error_msg));
                         if !Self::wait_for_running(&args.running, &args.timer, config.sync_interval)
                         {
                             break 'outer;

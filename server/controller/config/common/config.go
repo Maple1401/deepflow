@@ -27,7 +27,13 @@ type Warrant struct {
 	Timeout int    `default:"30" yaml:"timeout"`
 }
 
-// TODO use this
+type Manager struct {
+	Enabled bool   `default:"false" yaml:"enabled"`
+	Host    string `default:"manager" yaml:"host"`
+	Port    int    `default:"20403" yaml:"port"`
+	Timeout int    `default:"30" yaml:"timeout"`
+}
+
 type FPermit struct {
 	Enabled bool   `default:"false" yaml:"enabled"`
 	Host    string `default:"fpermit" yaml:"host"`
@@ -39,4 +45,16 @@ type IngesterApi struct {
 	Port     int `default:"20106" yaml:"port"`
 	NodePort int `default:"30106" yaml:"node-port"`
 	Timeout  int `default:"60" yaml:"timeout"`
+}
+
+type Querier struct {
+	ListenPort int `default:"20416" yaml:"listen_port"`
+}
+
+type Pcap struct {
+	PageSize       int     `default:"100000" yaml:"page-size"`
+	MaxPackets     int     `default:"5000" yaml:"max-packets"`
+	MaxTotalMemory int     `default:"128" yaml:"max-total-memory"` // in MB
+	MaxPacketSize  int     `default:"128" yaml:"max-packet-size"`  // in KB
+	Querier        Querier `yaml:"querier"`
 }

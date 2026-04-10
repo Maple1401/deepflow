@@ -86,23 +86,6 @@ func (c *ChVPC) sourceToTarget(md *message.Metadata, source *metadbmodel.VPC) (k
 
 // onResourceUpdated implements SubscriberDataGenerator
 func (c *ChVPC) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedVPC) {
-	db := md.GetDB()
-	fieldsUpdate := updateMessage.GetFields().(*message.UpdatedVPCFields)
-	newSource := updateMessage.GetNewMetadbItem().(*metadbmodel.VPC)
-	sourceID := newSource.ID
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.UID.IsDifferent() {
-		updateInfo["uid"] = fieldsUpdate.UID.GetNew()
-	}
-	if len(updateInfo) > 0 {
-		var chItem metadbmodel.ChVPC
-		db.Where("id = ?", sourceID).First(&chItem)
-		c.SubscriberComponent.dbOperator.update(chItem, updateInfo, IDKey{ID: sourceID}, db)
-	}
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

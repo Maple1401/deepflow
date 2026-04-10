@@ -1071,6 +1071,8 @@ impl QuadrupleGenerator {
                     retrans_syn: stats.tcp.retrans_syn_count,
                     retrans_synack: stats.tcp.retrans_synack_count,
                 };
+                flow_meter.anomaly.client_ooo = src_perf.ooo_count as u64;
+                flow_meter.anomaly.server_ooo = dst_perf.ooo_count as u64;
             } else {
                 flow_meter.latency.art_max = stats.tcp.art_max;
                 flow_meter.latency.art_sum = stats.tcp.art_sum as u64;

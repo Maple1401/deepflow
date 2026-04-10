@@ -18,13 +18,13 @@ package model
 
 import (
 	"bytes"
-	"compress/zlib"
 	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
 	"time"
 
+	"github.com/klauspost/compress/zlib"
 	"gorm.io/gorm"
 
 	"github.com/deepflowio/deepflow/server/libs/logger"
@@ -166,49 +166,51 @@ func (AZAnalyzerConnection) TableName() string {
 }
 
 type VTap struct {
-	ID                  int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
-	Name                string    `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
-	RawHostname         string    `gorm:"column:raw_hostname;type:varchar(256);" json:"RAW_HOSTNAME"`
-	Owner               string    `gorm:"column:owner;type:varchar(64);default:''" json:"OWNER"`
-	State               int       `gorm:"column:state;type:int;default:1" json:"STATE"`   // 0.not-connected 1.normal
-	Enable              int       `gorm:"column:enable;type:int;default:1" json:"ENABLE"` // 0: stop 1: running
-	Type                int       `gorm:"column:type;type:int;default:0" json:"TYPE"`     // 1: process 2: vm 3: public cloud 4: analyzer 5: physical machine 6: dedicated physical machine 7: host pod 8: vm pod
-	CtrlIP              string    `gorm:"column:ctrl_ip;type:char(64);not null" json:"CTRL_IP"`
-	CtrlMac             string    `gorm:"column:ctrl_mac;type:char(64);default:null" json:"CTRL_MAC"`
-	TapMac              string    `gorm:"column:tap_mac;type:char(64);default:null" json:"TAP_MAC"`
-	AnalyzerIP          string    `gorm:"column:analyzer_ip;type:char(64);not null" json:"ANALYZER_IP"`
-	CurAnalyzerIP       string    `gorm:"column:cur_analyzer_ip;type:char(64);not null" json:"CUR_ANALYZER_IP"`
-	ControllerIP        string    `gorm:"column:controller_ip;type:char(64);not null" json:"CONTROLLER_IP"`
-	CurControllerIP     string    `gorm:"column:cur_controller_ip;type:char(64);not null" json:"CUR_CONTROLLER_IP"`
-	LaunchServer        string    `gorm:"column:launch_server;type:char(64);not null" json:"LAUNCH_SERVER"`
-	LaunchServerID      int       `gorm:"column:launch_server_id;type:int;default:null" json:"LAUNCH_SERVER_ID"`
-	AZ                  string    `gorm:"column:az;type:char(64);default:''" json:"AZ"`
-	Region              string    `gorm:"column:region;type:char(64);default:''" json:"REGION"`
-	Revision            string    `gorm:"column:revision;type:varchar(256);default:null" json:"REVISION"`
-	SyncedControllerAt  time.Time `gorm:"column:synced_controller_at;type:datetime;not null;default:CURRENT_TIMESTAMP" json:"SYNCED_CONTROLLER_AT"`
-	SyncedAnalyzerAt    time.Time `gorm:"column:synced_analyzer_at;type:datetime;not null;default:CURRENT_TIMESTAMP" json:"SYNCED_ANALYZER_AT"`
-	CreatedAt           time.Time `gorm:"column:created_at;type:datetime;not null;default:CURRENT_TIMESTAMP" json:"CREATED_AT"`
-	BootTime            int       `gorm:"column:boot_time;type:int;default:0" json:"BOOT_TIME"`
-	Exceptions          int64     `gorm:"column:exceptions;type:bigint unsigned;default:0" json:"EXCEPTIONS"`
-	VTapLcuuid          string    `gorm:"column:vtap_lcuuid;type:char(64);default:null" json:"VTAP_LCUUID"`
-	VtapGroupLcuuid     string    `gorm:"column:vtap_group_lcuuid;type:char(64);default:null" json:"VTAP_GROUP_LCUUID"`
-	CPUNum              int       `gorm:"column:cpu_num;type:int;default:0" json:"CPU_NUM"` // logical number of cpu
-	MemorySize          int64     `gorm:"column:memory_size;type:bigint;default:0" json:"MEMORY_SIZE"`
-	Arch                string    `gorm:"column:arch;type:varchar(256);default:null" json:"ARCH"`
-	Os                  string    `gorm:"column:os;type:varchar(256);default:null" json:"OS"`
-	KernelVersion       string    `gorm:"column:kernel_version;type:varchar(256);default:null" json:"KERNEL_VERSION"`
-	ProcessName         string    `gorm:"column:process_name;type:varchar(256);default:null" json:"PROCESS_NAME"`
-	CurrentK8sImage     string    `gorm:"column:current_k8s_image;type:varchar(512);default:null" json:"CURRENT_K8S_IMAGE"`
-	LicenseType         int       `gorm:"column:license_type;type:int;default:null" json:"LICENSE_TYPE"`           // 1: A类 2: B类 3: C类
-	LicenseFunctions    string    `gorm:"column:license_functions;type:char(64)" json:"LICENSE_FUNCTIONS"`         // separated by ,; 1: 流量分发 2: 网络监控 3: 应用监控
-	EnableFeatures      string    `gorm:"column:enable_features;type:char(64)" json:"ENABLE_FEATURES"`             // separated by ,
-	DisableFeatures     string    `gorm:"column:disable_features;type:char(64)" json:"DISABLE_FEATURES"`           // separated by ,
-	FollowGroupFeatures string    `gorm:"column:follow_group_features;type:char(64)" json:"FOLLOW_GROUP_FEATURES"` // separated by ,
-	TapMode             int       `gorm:"column:tap_mode;type:int;default:null" json:"TAP_MODE"`
-	ExpectedRevision    string    `gorm:"column:expected_revision;type:text;default null" json:"EXPECTED_REVISION"`
-	UpgradePackage      string    `gorm:"column:upgrade_package;type:text;default null" json:"UPGRADE_PACKAGE"`
-	TeamID              int       `gorm:"column:team_id;type:int;default:0" json:"TEAM_ID"`
-	Lcuuid              string    `gorm:"column:lcuuid;type:char(64);not null" json:"LCUUID"`
+	ID                   int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name                 string    `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
+	RawHostname          string    `gorm:"column:raw_hostname;type:varchar(256);" json:"RAW_HOSTNAME"`
+	Owner                string    `gorm:"column:owner;type:varchar(64);default:''" json:"OWNER"`
+	State                int       `gorm:"column:state;type:int;default:1" json:"STATE"`   // 0.not-connected 1.normal
+	Enable               int       `gorm:"column:enable;type:int;default:1" json:"ENABLE"` // 0: stop 1: running
+	Type                 int       `gorm:"column:type;type:int;default:0" json:"TYPE"`     // 1: process 2: vm 3: public cloud 4: analyzer 5: physical machine 6: dedicated physical machine 7: host pod 8: vm pod
+	CtrlIP               string    `gorm:"column:ctrl_ip;type:char(64);not null" json:"CTRL_IP"`
+	CtrlMac              string    `gorm:"column:ctrl_mac;type:char(64);default:null" json:"CTRL_MAC"`
+	TapMac               string    `gorm:"column:tap_mac;type:char(64);default:null" json:"TAP_MAC"`
+	AnalyzerIP           string    `gorm:"column:analyzer_ip;type:char(64);not null" json:"ANALYZER_IP"`
+	CurAnalyzerIP        string    `gorm:"column:cur_analyzer_ip;type:char(64);not null" json:"CUR_ANALYZER_IP"`
+	ControllerIP         string    `gorm:"column:controller_ip;type:char(64);not null" json:"CONTROLLER_IP"`
+	CurControllerIP      string    `gorm:"column:cur_controller_ip;type:char(64);not null" json:"CUR_CONTROLLER_IP"`
+	LaunchServer         string    `gorm:"column:launch_server;type:char(64);not null" json:"LAUNCH_SERVER"`
+	LaunchServerID       int       `gorm:"column:launch_server_id;type:int;default:null" json:"LAUNCH_SERVER_ID"`
+	AZ                   string    `gorm:"column:az;type:char(64);default:''" json:"AZ"`
+	Region               string    `gorm:"column:region;type:char(64);default:''" json:"REGION"`
+	Revision             string    `gorm:"column:revision;type:varchar(256);default:null" json:"REVISION"`
+	SyncedControllerAt   time.Time `gorm:"column:synced_controller_at;type:datetime;not null;default:CURRENT_TIMESTAMP" json:"SYNCED_CONTROLLER_AT"`
+	SyncedAnalyzerAt     time.Time `gorm:"column:synced_analyzer_at;type:datetime;not null;default:CURRENT_TIMESTAMP" json:"SYNCED_ANALYZER_AT"`
+	CreatedAt            time.Time `gorm:"column:created_at;type:datetime;not null;default:CURRENT_TIMESTAMP" json:"CREATED_AT"`
+	BootTime             int       `gorm:"column:boot_time;type:int;default:0" json:"BOOT_TIME"`
+	Exceptions           int64     `gorm:"column:exceptions;type:bigint unsigned;default:0" json:"EXCEPTIONS"`
+	ExceptionDescription string    `gorm:"column:exception_description;type:text" json:"EXCEPTION_DESCRIPTION"`
+	VTapLcuuid           string    `gorm:"column:vtap_lcuuid;type:char(64);default:null" json:"VTAP_LCUUID"`
+	VtapGroupLcuuid      string    `gorm:"column:vtap_group_lcuuid;type:char(64);default:null" json:"VTAP_GROUP_LCUUID"`
+	CPUNum               int       `gorm:"column:cpu_num;type:int;default:0" json:"CPU_NUM"` // logical number of cpu
+	MemorySize           int64     `gorm:"column:memory_size;type:bigint;default:0" json:"MEMORY_SIZE"`
+	GRPCBufferSize       uint64    `gorm:"column:grpc_buffer_size;type:bigint;default:0" json:"GRPC_BUFFER_SIZE"`
+	Arch                 string    `gorm:"column:arch;type:varchar(256);default:null" json:"ARCH"`
+	Os                   string    `gorm:"column:os;type:varchar(256);default:null" json:"OS"`
+	KernelVersion        string    `gorm:"column:kernel_version;type:varchar(256);default:null" json:"KERNEL_VERSION"`
+	ProcessName          string    `gorm:"column:process_name;type:varchar(256);default:null" json:"PROCESS_NAME"`
+	CurrentK8sImage      string    `gorm:"column:current_k8s_image;type:varchar(512);default:null" json:"CURRENT_K8S_IMAGE"`
+	LicenseType          int       `gorm:"column:license_type;type:int;default:null" json:"LICENSE_TYPE"`           // 1: A类 2: B类 3: C类
+	LicenseFunctions     string    `gorm:"column:license_functions;type:char(64)" json:"LICENSE_FUNCTIONS"`         // separated by ,; 1: 流量分发 2: 网络监控 3: 应用监控
+	EnableFeatures       string    `gorm:"column:enable_features;type:char(64)" json:"ENABLE_FEATURES"`             // separated by ,
+	DisableFeatures      string    `gorm:"column:disable_features;type:char(64)" json:"DISABLE_FEATURES"`           // separated by ,
+	FollowGroupFeatures  string    `gorm:"column:follow_group_features;type:char(64)" json:"FOLLOW_GROUP_FEATURES"` // separated by ,
+	TapMode              int       `gorm:"column:tap_mode;type:int;default:null" json:"TAP_MODE"`
+	ExpectedRevision     string    `gorm:"column:expected_revision;type:text;default:null" json:"EXPECTED_REVISION"`
+	UpgradePackage       string    `gorm:"column:upgrade_package;type:text;default:null" json:"UPGRADE_PACKAGE"`
+	TeamID               int       `gorm:"column:team_id;type:int;default:0" json:"TEAM_ID"`
+	Lcuuid               string    `gorm:"column:lcuuid;type:char(64);not null" json:"LCUUID"`
 }
 
 func (VTap) TableName() string {
@@ -290,23 +292,25 @@ type KubernetesCluster struct {
 }
 
 type ACL struct {
-	ID           int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
-	BusinessID   int       `gorm:"column:business_id;type:int;not null" json:"BUSINESS_ID"`
-	Name         string    `gorm:"column:name;type:char(64);default:null" json:"NAME"`
-	Type         int       `gorm:"column:type;type:int;default:2" json:"TYPE"`                     // 1-epc; 2-custom
-	TapType      int       `gorm:"column:tap_type;type:int;default:3" json:"TAP_TYPE"`             // 1-WAN; 3-LAN
-	State        int       `gorm:"column:state;type:int;default:null;default:0" json:"STATE"`      // 0-disable; 1-enable
-	Applications string    `gorm:"column:applications;type:char(64);not null" json:"APPLICATIONS"` // separated by , (1-performance analysis; 2-backpacking; 6-npb)
-	EpcID        int       `gorm:"column:epc_id;type:int;default:null" json:"EPC_ID"`
-	SrcGroupIDs  string    `gorm:"column:src_group_ids;type:text;default:null" json:"SRC_GROUP_IDS"` // separated by ,
-	DstGroupIDs  string    `gorm:"column:dst_group_ids;type:text;default:null" json:"DST_GROUP_IDS"` // separated by ,
-	Protocol     *int      `gorm:"column:protocol;type:int;default:null" json:"PROTOCOL"`
-	SrcPorts     string    `gorm:"column:src_ports;type:text;default:null" json:"SRC_PORTS"` // separated by ,
-	DstPorts     string    `gorm:"column:dst_ports;type:text;default:null" json:"DST_PORTS"` // separated by ,
-	Vlan         int       `gorm:"column:vlan;type:int;default:null" json:"VLAN"`
-	CreatedAt    time.Time `gorm:"column:created_at;type:timestamp;not null;default:CURRENT_TIMESTAMP" json:"CREATED_AT"`
-	UpdatedAt    time.Time `gorm:"column:updated_at;type:timestamp;not null;default:CURRENT_TIMESTAMP" json:"UPDATED_AT"`
-	Lcuuid       string    `gorm:"column:lcuuid;type:char(64);default:null" json:"LCUUID"`
+	ID                 int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	BusinessID         int       `gorm:"column:business_id;type:int;not null" json:"BUSINESS_ID"`
+	Name               string    `gorm:"column:name;type:char(255);default:null" json:"NAME"`
+	Type               int       `gorm:"column:type;type:int;default:2" json:"TYPE"`                // 1-epc; 2-custom
+	TapType            int       `gorm:"column:tap_type;type:int;default:3" json:"TAP_TYPE"`        // 1-WAN; 3-LAN
+	State              int       `gorm:"column:state;type:int;default:null;default:0" json:"STATE"` // 0-disable; 1-enable
+	Valid              int       `gorm:"column:valid;type:tinyint(1);default:1" json:"VALID"`       // 0-invalid; 1-valid
+	InvalidDescription string    `gorm:"column:invalid_description;type:text;default:null" json:"INVALID_DESCRIPTION"`
+	Applications       string    `gorm:"column:applications;type:char(64);not null" json:"APPLICATIONS"` // separated by , (1-performance analysis; 2-backpacking; 6-npb)
+	EpcID              int       `gorm:"column:epc_id;type:int;default:null" json:"EPC_ID"`
+	SrcGroupIDs        string    `gorm:"column:src_group_ids;type:text;default:null" json:"SRC_GROUP_IDS"` // separated by ,
+	DstGroupIDs        string    `gorm:"column:dst_group_ids;type:text;default:null" json:"DST_GROUP_IDS"` // separated by ,
+	Protocol           *int      `gorm:"column:protocol;type:int;default:null" json:"PROTOCOL"`
+	SrcPorts           string    `gorm:"column:src_ports;type:text;default:null" json:"SRC_PORTS"` // separated by ,
+	DstPorts           string    `gorm:"column:dst_ports;type:text;default:null" json:"DST_PORTS"` // separated by ,
+	Vlan               int       `gorm:"column:vlan;type:int;default:null" json:"VLAN"`
+	CreatedAt          time.Time `gorm:"column:created_at;type:timestamp;not null;default:CURRENT_TIMESTAMP" json:"CREATED_AT"`
+	UpdatedAt          time.Time `gorm:"column:updated_at;type:timestamp;not null;default:CURRENT_TIMESTAMP" json:"UPDATED_AT"`
+	Lcuuid             string    `gorm:"column:lcuuid;type:char(64);default:null" json:"LCUUID"`
 }
 
 func (ACL) TableName() string {
@@ -349,7 +353,7 @@ func (ResourceGroupExtraInfo) TableName() string {
 // NpbPolicy [...]
 type NpbPolicy struct {
 	ID               int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
-	Name             string    `gorm:"column:name;type:char(64);default:null" json:"NAME"`
+	Name             string    `gorm:"column:name;type:char(255);default:null" json:"NAME"`
 	State            int       `gorm:"column:state;type:int;default:0" json:"STATE"` // 0-disable; 1-enable
 	BusinessID       int       `gorm:"column:business_id;type:int;not null" json:"BUSINESS_ID"`
 	Direction        int       `gorm:"column:direction;type:int;default:1" json:"DIRECTION"` // 1-two way; 2-server to client
@@ -525,10 +529,13 @@ func (MailServer) TableName() string {
 }
 
 type AlarmPolicy struct {
-	ID     int    `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
-	Name   string `gorm:"column:name;type:char(128)" json:"NAME"`
-	UserID int    `gorm:"column:user_id;type:int" json:"USER_ID"`
-	TeamID int    `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID"`
+	ID                 int            `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	Name               string         `gorm:"column:name;type:char(128)" json:"NAME"`
+	QueryConditions    string         `gorm:"column:query_conditions;type:text" json:"QUERY_CONDITIONS"`
+	MonitoringInterval string         `gorm:"column:monitoring_interval;type:char(64)" json:"MONITORING_INTERVAL"`
+	UserID             int            `gorm:"column:user_id;type:int" json:"USER_ID"`
+	TeamID             int            `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID"`
+	DeletedAt          gorm.DeletedAt `gorm:"column:deleted_at;type:timestamp;default:null" json:"DELETED_AT" mapstructure:"DELETED_AT"`
 }
 
 func (AlarmPolicy) TableName() string {
@@ -570,5 +577,50 @@ type ResourceVersion struct {
 	Name      string    `gorm:"column:name;type:varchar(255)" json:"RESOURCE"`
 	Version   uint32    `gorm:"column:version;type:int unsigned" json:"VERSION"`
 	CreatedAt time.Time `gorm:"autoCreateTime;column:created_at;type:datetime" json:"CREATED_AT"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime;column:updated_at;type:datetime" json:"UPDATED_AT"`
+}
+
+type BizDecodePolicy struct {
+	ID        int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	TeamID    int       `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID"`
+	Name      string    `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
+	Yaml      string    `gorm:"column:yaml;type:mediumtext" json:"YAML"`
+	CreatedAt time.Time `gorm:"autoCreateTime;column:created_at;type:datetime;not null" json:"CREATED_AT"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime;column:updated_at;type:datetime" json:"UPDATED_AT"`
+}
+
+type BizDecodePolicyField struct {
+	ID        int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	PolicyID  int       `gorm:"column:policy_id;type:int;not null" json:"POLICY_ID"`
+	Type      int       `gorm:"column:type;type:tinyint(1);not null" json:"TYPE"`
+	Name      string    `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
+	Yaml      string    `gorm:"column:yaml;type:text" json:"YAML"`
+	CreatedAt time.Time `gorm:"autoCreateTime;column:created_at;type:datetime;not null" json:"CREATED_AT"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime;column:updated_at;type:datetime" json:"UPDATED_AT"`
+}
+
+type BizDecodePolicyAgentGroupConnection struct {
+	ID           int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	PolicyID     int       `gorm:"column:policy_id;type:int;not null" json:"POLICY_ID"`
+	AgentGroupID int       `gorm:"column:agent_group_id;type:int;not null" json:"AGENT_GROUP_ID"`
+	CreatedAt    time.Time `gorm:"autoCreateTime;column:created_at;type:datetime;not null" json:"CREATED_AT"`
+	UpdatedAt    time.Time `gorm:"autoUpdateTime;column:updated_at;type:datetime" json:"UPDATED_AT"`
+}
+
+type BizDecodeDictionary struct {
+	ID        int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	TeamID    int       `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID"`
+	Name      string    `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
+	Yaml      string    `gorm:"column:yaml;type:mediumtext" json:"YAML"`
+	CreatedAt time.Time `gorm:"autoCreateTime;column:created_at;type:datetime;not null;" json:"CREATED_AT"`
+	UpdatedAt time.Time `gorm:"autoUpdateTime;column:updated_at;type:datetime" json:"UPDATED_AT"`
+}
+
+type BizDecodeCustomProtocol struct {
+	ID        int       `gorm:"primaryKey;column:id;type:int;not null" json:"ID"`
+	TeamID    int       `gorm:"column:team_id;type:int;default:1" json:"TEAM_ID"`
+	Name      string    `gorm:"column:name;type:varchar(256);not null" json:"NAME"`
+	Yaml      string    `gorm:"column:yaml;type:mediumtext" json:"YAML"`
+	CreatedAt time.Time `gorm:"autoCreateTime;column:created_at;type:datetime;not null" json:"CREATED_AT"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime;column:updated_at;type:datetime" json:"UPDATED_AT"`
 }

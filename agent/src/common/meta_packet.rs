@@ -20,22 +20,21 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(unix, feature = "libtrace"))]
 use std::{error::Error, net::Ipv6Addr, ptr};
 
 use bitflags::bitflags;
+use pcap::Linktype;
 use pnet::packet::{
     icmp::{IcmpType, IcmpTypes},
     icmpv6::{Icmpv6Type, Icmpv6Types},
     tcp::{TcpOptionNumber, TcpOptionNumbers},
 };
 
-use super::ebpf::EbpfType;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use super::enums::CaptureNetworkType;
 use super::{
     consts::*,
     decapsulate::TunnelInfo,
+    ebpf::EbpfType,
     endpoint::EndpointDataPov,
     enums::{EthernetType, HeaderType, IpProtocol, TcpFlags},
     flow::{L7Protocol, PacketDirection, SignalSource},
@@ -44,11 +43,11 @@ use super::{
 };
 
 use crate::error;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(unix, feature = "libtrace"))]
 use crate::{
     common::ebpf::{GO_HTTP2_UPROBE, GO_HTTP2_UPROBE_DATA},
     ebpf::{
-        MSG_REASM_SEG, MSG_REASM_START, MSG_REQUEST_END, MSG_RESPONSE_END,
+        MSG_CLOSE, MSG_REASM_SEG, MSG_REASM_START, MSG_REQUEST_END, MSG_RESPONSE_END,
         PACKET_KNAME_MAX_PADDING, SK_BPF_DATA, SOCK_DATA_HTTP2, SOCK_DATA_TLS_HTTP2, SOCK_DIR_RCV,
         SOCK_DIR_SND,
     },
@@ -63,6 +62,7 @@ use packet_segmentation_reassembly::Segment;
 use public::{
     buffer::BatchedBuffer,
     packet::Downcast,
+    proto::flow_log::FlagBits,
     utils::net::{is_unicast_link_local, MacAddr},
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -97,6 +97,14 @@ impl<'a> RawPacket<'a> {
             Self::Borrowed(b) => *self = Self::OwnedVec(b.to_vec()),
             Self::Owned(o) => *self = Self::OwnedVec(o.to_vec()),
             _ => {}
+        }
+    }
+
+    pub fn into_owned(self) -> RawPacket<'static> {
+        match self {
+            Self::Borrowed(b) => RawPacket::OwnedVec(b.to_vec()),
+            Self::Owned(o) => RawPacket::OwnedVec(o.to_vec()),
+            Self::OwnedVec(v) => RawPacket::OwnedVec(v),
         }
     }
 
@@ -140,28 +148,24 @@ impl<'a> From<BatchedBuffer<u8>> for RawPacket<'a> {
 
 bitflags! {
     #[derive(Default)]
-    pub struct EbpfFlags: u32 {
-        const NONE = 0;
-        const TLS = 1;
+    pub struct ApplicationFlags: u32 {
+        const NONE = FlagBits::FlagNone as u32;
+        const TLS = FlagBits::FlagTls as u32;
+        const ASYNC = FlagBits::FlagAsync as u32;
+        const REVERSED = FlagBits::FlagReversed as u32;
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[derive(PartialEq, Clone, Debug)]
+#[cfg(all(unix, feature = "libtrace"))]
+#[derive(PartialEq, Clone, Debug, Default)]
 pub enum SegmentFlags {
+    #[default]
     None,
     Start,
     Seg,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl Default for SegmentFlags {
-    fn default() -> Self {
-        SegmentFlags::None
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(unix, feature = "libtrace"))]
 impl From<u8> for SegmentFlags {
     fn from(value: u8) -> Self {
         match value {
@@ -236,6 +240,7 @@ pub struct MetaPacket<'a> {
     pub raw_from_ebpf_offset: usize,
     pub sub_packet_index: usize,
     pub sub_packets: Vec<SubPacket>,
+    pub is_socket_closed: bool,
 
     pub socket_id: u64,
     pub cap_start_seq: u64,
@@ -244,8 +249,8 @@ pub struct MetaPacket<'a> {
     //  流结束标识, 目前只有 go http2 uprobe 用到
     pub is_request_end: bool,
     pub is_response_end: bool,
-    pub ebpf_flags: EbpfFlags,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub ebpf_flags: ApplicationFlags,
+    #[cfg(all(unix, feature = "libtrace"))]
     pub segment_flags: SegmentFlags,
 
     pub process_id: u32,
@@ -254,7 +259,7 @@ pub struct MetaPacket<'a> {
     pub thread_id: u32,
     pub coroutine_id: u64,
     pub syscall_trace_id: u64,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(unix, feature = "libtrace"))]
     pub process_kname: [u8; PACKET_KNAME_MAX_PADDING], // kernel process name
     // for PcapAssembler
     pub flow_id: u64, // PCAP and L7 Log
@@ -264,6 +269,8 @@ pub struct MetaPacket<'a> {
     /********** for GPID **********/
     pub gpid_0: u32,
     pub gpid_1: u32,
+
+    pub ip_id: u16,
 }
 
 impl<'a> MetaPacket<'a> {
@@ -284,7 +291,7 @@ impl<'a> MetaPacket<'a> {
 
     #[inline]
     pub fn is_tls(&self) -> bool {
-        self.ebpf_flags.contains(EbpfFlags::TLS)
+        self.ebpf_flags.contains(ApplicationFlags::TLS)
     }
 
     #[inline]
@@ -338,6 +345,14 @@ impl<'a> MetaPacket<'a> {
     pub fn is_psh_ack(&self) -> bool {
         if let ProtocolData::TcpHeader(tcp_data) = &self.protocol_data {
             return tcp_data.flags & TcpFlags::MASK == TcpFlags::PSH_ACK && self.payload_len > 1;
+        }
+        false
+    }
+
+    #[inline]
+    pub fn is_fin(&self) -> bool {
+        if let ProtocolData::TcpHeader(tcp_data) = &self.protocol_data {
+            return tcp_data.flags & TcpFlags::FIN == TcpFlags::FIN;
         }
         false
     }
@@ -778,6 +793,7 @@ impl<'a> MetaPacket<'a> {
                 ip_protocol = IpProtocol::from(packet[IPV4_PROTO_OFFSET + vlan_tag_size]);
                 self.lookup_key.proto = ip_protocol;
 
+                self.ip_id = read_u16_be(&packet[FIELD_OFFSET_ID + vlan_tag_size..]);
                 let frag = read_u16_be(&packet[FIELD_OFFSET_FRAG + vlan_tag_size..]);
                 if frag & 0xFFF != 0 {
                     // fragment
@@ -940,33 +956,35 @@ impl<'a> MetaPacket<'a> {
                 }
             }
             IpProtocol::ICMPV6 => {
-                let mut icmp_data = IcmpData::default();
-                if size_checker > 0 {
-                    let icmpv6_type_index = ICMPV6_TYPE_OFFSET + self.l2_l3_opt_size as usize;
-                    icmp_data.icmp_type = packet[icmpv6_type_index];
-
-                    match Icmpv6Type::new(packet[icmpv6_type_index]) {
-                        Icmpv6Types::NeighborAdvert => {
-                            self.nd_reply_or_arp_request = true;
-                        }
-                        Icmpv6Types::EchoRequest => {
-                            icmp_data.echo_id_seq = read_u32_be(&packet[icmpv6_type_index + 4..]);
-                        }
-                        Icmpv6Types::EchoReply => {
-                            icmp_data.echo_id_seq = read_u32_be(&packet[icmpv6_type_index + 4..]);
-                            self.lookup_key.direction = PacketDirection::ServerToClient;
-                        }
-                        _ => {}
-                    }
-                    // 忽略link-local address并只考虑ND reply, i.e. neighbour advertisement
-                    if let IpAddr::V6(ip) = self.lookup_key.src_ip {
-                        self.nd_reply_or_arp_request =
-                            self.nd_reply_or_arp_request && !is_unicast_link_local(&ip);
-                    }
+                size_checker -= HeaderType::Ipv6Icmp.min_header_size() as isize;
+                if size_checker < 0 {
+                    return Ok(());
                 }
-                self.protocol_data = ProtocolData::IcmpData(icmp_data);
+                let mut icmp_data = IcmpData::default();
+                let icmpv6_type_index = ICMPV6_TYPE_OFFSET + self.l2_l3_opt_size as usize;
+                icmp_data.icmp_type = packet[icmpv6_type_index];
+                match Icmpv6Type::new(packet[icmpv6_type_index]) {
+                    Icmpv6Types::NeighborAdvert => {
+                        self.nd_reply_or_arp_request = true;
+                    }
+                    Icmpv6Types::EchoRequest => {
+                        icmp_data.echo_id_seq = read_u32_be(&packet[icmpv6_type_index + 4..]);
+                    }
+                    Icmpv6Types::EchoReply => {
+                        icmp_data.echo_id_seq = read_u32_be(&packet[icmpv6_type_index + 4..]);
+                        self.lookup_key.direction = PacketDirection::ServerToClient;
+                    }
+                    _ => {}
+                }
+                // 忽略link-local address并只考虑ND reply, i.e. neighbour advertisement
+                if let IpAddr::V6(ip) = self.lookup_key.src_ip {
+                    self.nd_reply_or_arp_request =
+                        self.nd_reply_or_arp_request && !is_unicast_link_local(&ip);
+                }
                 self.payload_len =
                     (self.packet_len - (packet.len() - size_checker as usize) as u32) as u16;
+                self.protocol_data = ProtocolData::IcmpData(icmp_data);
+                self.header_type = HeaderType::Ipv6Icmp;
                 return Ok(());
             }
             _ => {
@@ -1067,7 +1085,7 @@ impl<'a> MetaPacket<'a> {
         self.cap_end_seq = packet.cap_start_seq;
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(unix, feature = "libtrace"))]
     #[inline]
     pub unsafe fn from_ebpf(data: &mut SK_BPF_DATA) -> Result<MetaPacket<'a>, Box<dyn Error>> {
         let (local_ip, remote_ip) = if data.tuple.addr_len == 4 {
@@ -1095,7 +1113,7 @@ impl<'a> MetaPacket<'a> {
         };
 
         let mut packet = MetaPacket::default();
-        let timestamp = Timestamp::from_micros(data.timestamp);
+        let timestamp = Timestamp::from_nanos(data.timestamp);
 
         packet.lookup_key = LookupKey {
             timestamp,
@@ -1111,7 +1129,7 @@ impl<'a> MetaPacket<'a> {
             l2_end_0: data.direction == SOCK_DIR_SND,
             l2_end_1: data.direction == SOCK_DIR_RCV,
             proto: IpProtocol::try_from(data.tuple.protocol)?,
-            tap_type: CaptureNetworkType::Cloud,
+            tap_type: super::enums::CaptureNetworkType::Cloud,
             ..Default::default()
         };
 
@@ -1153,18 +1171,19 @@ impl<'a> MetaPacket<'a> {
         packet.ebpf_type = EbpfType::try_from(data.source)?;
         packet.l7_protocol_from_ebpf = L7Protocol::from(data.l7_protocol_hint as u8);
         packet.ebpf_flags = if data.is_tls {
-            EbpfFlags::TLS
+            ApplicationFlags::TLS
         } else {
-            EbpfFlags::NONE
+            ApplicationFlags::NONE
         };
         packet.segment_flags = SegmentFlags::from(data.msg_type);
+        packet.is_socket_closed = data.msg_type == MSG_CLOSE;
 
         // 目前只有 go uprobe http2 的方向判断能确保准确
         if data.source == GO_HTTP2_UPROBE || data.source == GO_HTTP2_UPROBE_DATA {
             if data.l7_protocol_hint == SOCK_DATA_HTTP2
                 || data.l7_protocol_hint == SOCK_DATA_TLS_HTTP2
             {
-                packet.lookup_key.direction = PacketDirection::from(data.msg_type);
+                packet.lookup_key.direction = Self::parse_direction(data.msg_type);
                 match data.msg_type {
                     MSG_REQUEST_END => packet.is_request_end = true,
                     MSG_RESPONSE_END => packet.is_response_end = true,
@@ -1173,6 +1192,20 @@ impl<'a> MetaPacket<'a> {
             }
         }
         return Ok(packet);
+    }
+
+    #[cfg(all(unix, feature = "libtrace"))]
+    #[inline]
+    fn parse_direction(msg_type: u8) -> PacketDirection {
+        match msg_type {
+            crate::ebpf::MSG_REQUEST | crate::ebpf::MSG_REQUEST_END => {
+                PacketDirection::ClientToServer
+            }
+            crate::ebpf::MSG_RESPONSE | crate::ebpf::MSG_RESPONSE_END => {
+                PacketDirection::ServerToClient
+            }
+            _ => panic!("ebpf direction({}) unknown.", msg_type),
+        }
     }
 
     #[inline]
@@ -1209,7 +1242,7 @@ impl<'a> MetaPacket<'a> {
             (self.lookup_key.dst_ip, self.lookup_key.dst_port),
         );
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         if self.signal_source == SignalSource::EBPF
             && (self.process_kname[..12]).eq(b"redis-server")
         {
@@ -1297,6 +1330,14 @@ impl<'a> MetaPacket<'a> {
             }
         }
     }
+
+    pub fn into_owned(mut self) -> MetaPacket<'static> {
+        let raw = match self.raw.take() {
+            Some(raw) => Some(raw.into_owned()),
+            None => None,
+        };
+        MetaPacket { raw, ..self }
+    }
 }
 
 impl<'a> Iterator for MetaPacket<'a> {
@@ -1382,8 +1423,14 @@ impl CacheItem for MetaPacket<'static> {
         self.l7_protocol_from_ebpf
     }
 
+    #[cfg(feature = "libtrace")]
     fn is_segment_start(&self) -> bool {
         self.segment_flags == SegmentFlags::Start
+    }
+
+    #[cfg(not(feature = "libtrace"))]
+    fn is_segment_start(&self) -> bool {
+        false
     }
 }
 
@@ -1450,6 +1497,76 @@ pub enum ProtocolData {
 impl Default for ProtocolData {
     fn default() -> Self {
         Self::TcpHeader(MetaPacketTcpHeader::default())
+    }
+}
+
+// used in remote exec pcap replay and unit tests
+pub struct PcapData<'a> {
+    pub link_type: pcap::Linktype,
+    pub timestamp: Duration,
+    pub data: &'a [u8],
+}
+
+impl<'a> TryFrom<PcapData<'a>> for MetaPacket<'a> {
+    type Error = error::Error;
+
+    fn try_from(packet: PcapData<'a>) -> Result<Self, Self::Error> {
+        match packet.link_type {
+            Linktype::ETHERNET => {
+                let mut meta = MetaPacket::empty();
+                meta.update(packet.data, true, true, packet.timestamp, 0)?;
+                return Ok(meta);
+            }
+            _ => (),
+        }
+
+        // hack other link types (sll/sll2) because MetaPacket cannot parse them (yet)
+
+        // change SLL header to look like ethernet header just before L3 header
+        let mut data = match packet.link_type {
+            // 2 bytes longer than ethernet header
+            Linktype::LINUX_SLL => (&packet.data[2..]).to_vec(),
+            Linktype::LINUX_SLL2 => {
+                // 6 bytes longer, and L3 type is in first 2 bytes
+                let mut data = (&packet.data[6..]).to_vec();
+                data[12..14].copy_from_slice(&packet.data[0..2]);
+                data
+            }
+            _ => {
+                return Err(error::Error::ParsePacketFailed(format!(
+                    "unsupported link type: {:?}",
+                    packet.link_type
+                )))
+            }
+        };
+
+        let mut meta = MetaPacket::empty();
+        meta.update(&data[..], true, true, packet.timestamp, 0)?;
+
+        let src_ip = meta.lookup_key.src_ip;
+        let dst_ip = meta.lookup_key.dst_ip;
+        // fake mac with ip
+        (&mut data[0..12]).fill(0);
+        match dst_ip {
+            IpAddr::V4(ip) => {
+                data[0..4].copy_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                data[0..6].copy_from_slice(&ip.octets()[0..6]);
+            }
+        }
+        match src_ip {
+            IpAddr::V4(ip) => {
+                data[6..10].copy_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                data[6..12].copy_from_slice(&ip.octets()[0..6]);
+            }
+        }
+
+        let mut meta = MetaPacket::empty();
+        meta.update(data, true, true, packet.timestamp, 0)?;
+        Ok(meta)
     }
 }
 

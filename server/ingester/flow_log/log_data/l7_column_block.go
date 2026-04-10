@@ -50,6 +50,9 @@ type L7BaseBlock struct {
 	ColGprocessId0            proto.ColUInt32
 	ColGprocessId1            proto.ColUInt32
 	ColBizType                proto.ColUInt8
+	ColBizCode                proto.ColStr
+	ColBizScenario            proto.ColStr
+	ColBizResponseCode        proto.ColStr
 	ColProcessId0             proto.ColInt32
 	ColProcessId1             proto.ColInt32
 	ColProcessKname0          proto.ColStr
@@ -91,6 +94,9 @@ func (b *L7BaseBlock) Reset() {
 	b.ColGprocessId0.Reset()
 	b.ColGprocessId1.Reset()
 	b.ColBizType.Reset()
+	b.ColBizCode.Reset()
+	b.ColBizScenario.Reset()
+	b.ColBizResponseCode.Reset()
 	b.ColProcessId0.Reset()
 	b.ColProcessId1.Reset()
 	b.ColProcessKname0.Reset()
@@ -133,6 +139,9 @@ func (b *L7BaseBlock) ToInput(input proto.Input) proto.Input {
 		proto.InputColumn{Name: ckdb.COLUMN_GPROCESS_ID_0, Data: &b.ColGprocessId0},
 		proto.InputColumn{Name: ckdb.COLUMN_GPROCESS_ID_1, Data: &b.ColGprocessId1},
 		proto.InputColumn{Name: ckdb.COLUMN_BIZ_TYPE, Data: &b.ColBizType},
+		proto.InputColumn{Name: ckdb.COLUMN_BIZ_CODE, Data: &b.ColBizCode},
+		proto.InputColumn{Name: ckdb.COLUMN_BIZ_SCENARIO, Data: &b.ColBizScenario},
+		proto.InputColumn{Name: ckdb.COLUMN_BIZ_RESPONSE_CODE, Data: &b.ColBizResponseCode},
 		proto.InputColumn{Name: ckdb.COLUMN_PROCESS_ID_0, Data: &b.ColProcessId0},
 		proto.InputColumn{Name: ckdb.COLUMN_PROCESS_ID_1, Data: &b.ColProcessId1},
 		proto.InputColumn{Name: ckdb.COLUMN_PROCESS_KNAME_0, Data: &b.ColProcessKname0},
@@ -183,6 +192,9 @@ func (n *L7Base) AppendToColumnBlock(b ckdb.CKColumnBlock) {
 	block.ColGprocessId0.Append(n.GPID0)
 	block.ColGprocessId1.Append(n.GPID1)
 	block.ColBizType.Append(n.BizType)
+	block.ColBizCode.Append(n.BizCode)
+	block.ColBizScenario.Append(n.BizScenario)
+	block.ColBizResponseCode.Append(n.BizResponseCode)
 	block.ColProcessId0.Append(int32(n.ProcessID0))
 	block.ColProcessId1.Append(int32(n.ProcessID1))
 	block.ColProcessKname0.Append(n.ProcessKName0)
@@ -201,10 +213,12 @@ type L7FlowLogBlock struct {
 	*L7BaseBlock
 	ColId                   proto.ColUInt64
 	ColL7Protocol           proto.ColUInt8
-	ColL7ProtocolStr        *proto.ColLowCardinality[string]
+	ColBizProtocol          *proto.ColLowCardinality[string]
 	ColVersion              *proto.ColLowCardinality[string]
 	ColType                 proto.ColUInt8
 	ColIsTls                proto.ColUInt8
+	ColIsAsync              proto.ColUInt8
+	ColIsReversed           proto.ColUInt8
 	ColRequestType          *proto.ColLowCardinality[string]
 	ColRequestDomain        proto.ColStr
 	ColRequestResource      proto.ColStr
@@ -218,6 +232,7 @@ type L7FlowLogBlock struct {
 	ColXRequestId0          proto.ColStr
 	ColXRequestId1          proto.ColStr
 	ColTraceId              proto.ColStr
+	ColTraceId2             proto.ColStr
 	ColTraceIdIndex         proto.ColUInt64
 	ColSpanId               proto.ColStr
 	ColParentSpanId         proto.ColStr
@@ -243,10 +258,12 @@ func (b *L7FlowLogBlock) Reset() {
 	b.L7BaseBlock.Reset()
 	b.ColId.Reset()
 	b.ColL7Protocol.Reset()
-	b.ColL7ProtocolStr.Reset()
+	b.ColBizProtocol.Reset()
 	b.ColVersion.Reset()
 	b.ColType.Reset()
 	b.ColIsTls.Reset()
+	b.ColIsAsync.Reset()
+	b.ColIsReversed.Reset()
 	b.ColRequestType.Reset()
 	b.ColRequestDomain.Reset()
 	b.ColRequestResource.Reset()
@@ -260,6 +277,7 @@ func (b *L7FlowLogBlock) Reset() {
 	b.ColXRequestId0.Reset()
 	b.ColXRequestId1.Reset()
 	b.ColTraceId.Reset()
+	b.ColTraceId2.Reset()
 	b.ColTraceIdIndex.Reset()
 	b.ColSpanId.Reset()
 	b.ColParentSpanId.Reset()
@@ -288,10 +306,12 @@ func (b *L7FlowLogBlock) ToInput(input proto.Input) proto.Input {
 	input = append(input,
 		proto.InputColumn{Name: ckdb.COLUMN__ID, Data: &b.ColId},
 		proto.InputColumn{Name: ckdb.COLUMN_L7_PROTOCOL, Data: &b.ColL7Protocol},
-		proto.InputColumn{Name: ckdb.COLUMN_L7_PROTOCOL_STR, Data: b.ColL7ProtocolStr},
+		proto.InputColumn{Name: ckdb.COLUMN_BIZ_PROTOCOL, Data: b.ColBizProtocol},
 		proto.InputColumn{Name: ckdb.COLUMN_VERSION, Data: b.ColVersion},
 		proto.InputColumn{Name: ckdb.COLUMN_TYPE, Data: &b.ColType},
 		proto.InputColumn{Name: ckdb.COLUMN_IS_TLS, Data: &b.ColIsTls},
+		proto.InputColumn{Name: ckdb.COLUMN_IS_ASYNC, Data: &b.ColIsAsync},
+		proto.InputColumn{Name: ckdb.COLUMN_IS_REVERSED, Data: &b.ColIsReversed},
 		proto.InputColumn{Name: ckdb.COLUMN_REQUEST_TYPE, Data: b.ColRequestType},
 		proto.InputColumn{Name: ckdb.COLUMN_REQUEST_DOMAIN, Data: &b.ColRequestDomain},
 		proto.InputColumn{Name: ckdb.COLUMN_REQUEST_RESOURCE, Data: &b.ColRequestResource},
@@ -305,6 +325,7 @@ func (b *L7FlowLogBlock) ToInput(input proto.Input) proto.Input {
 		proto.InputColumn{Name: ckdb.COLUMN_X_REQUEST_ID_0, Data: &b.ColXRequestId0},
 		proto.InputColumn{Name: ckdb.COLUMN_X_REQUEST_ID_1, Data: &b.ColXRequestId1},
 		proto.InputColumn{Name: ckdb.COLUMN_TRACE_ID, Data: &b.ColTraceId},
+		proto.InputColumn{Name: ckdb.COLUMN_TRACE_ID_2, Data: &b.ColTraceId2},
 		proto.InputColumn{Name: ckdb.COLUMN_TRACE_ID_INDEX, Data: &b.ColTraceIdIndex},
 		proto.InputColumn{Name: ckdb.COLUMN_SPAN_ID, Data: &b.ColSpanId},
 		proto.InputColumn{Name: ckdb.COLUMN_PARENT_SPAN_ID, Data: &b.ColParentSpanId},
@@ -333,7 +354,7 @@ func (b *L7FlowLogBlock) ToInput(input proto.Input) proto.Input {
 func (n *L7FlowLog) NewColumnBlock() ckdb.CKColumnBlock {
 	return &L7FlowLogBlock{
 		L7BaseBlock:        n.L7Base.NewColumnBlock().(*L7BaseBlock),
-		ColL7ProtocolStr:   new(proto.ColStr).LowCardinality(),
+		ColBizProtocol:     new(proto.ColStr).LowCardinality(),
 		ColVersion:         new(proto.ColStr).LowCardinality(),
 		ColRequestType:     new(proto.ColStr).LowCardinality(),
 		ColAppService:      new(proto.ColStr).LowCardinality(),
@@ -357,10 +378,12 @@ func (n *L7FlowLog) AppendToColumnBlock(b ckdb.CKColumnBlock) {
 	n.L7Base.AppendToColumnBlock(block.L7BaseBlock)
 	block.ColId.Append(n._id)
 	block.ColL7Protocol.Append(n.L7Protocol)
-	block.ColL7ProtocolStr.Append(n.L7ProtocolStr)
+	block.ColBizProtocol.Append(n.BizProtocol)
 	block.ColVersion.Append(n.Version)
 	block.ColType.Append(n.Type)
 	block.ColIsTls.Append(n.IsTLS)
+	block.ColIsAsync.Append(n.IsAsync)
+	block.ColIsReversed.Append(n.IsReversed)
 	block.ColRequestType.Append(n.RequestType)
 	block.ColRequestDomain.Append(n.RequestDomain)
 	block.ColRequestResource.Append(n.RequestResource)
@@ -374,6 +397,7 @@ func (n *L7FlowLog) AppendToColumnBlock(b ckdb.CKColumnBlock) {
 	block.ColXRequestId0.Append(n.XRequestId0)
 	block.ColXRequestId1.Append(n.XRequestId1)
 	block.ColTraceId.Append(n.TraceId)
+	block.ColTraceId2.Append(n.TraceId2)
 	block.ColTraceIdIndex.Append(n.TraceIdIndex)
 	block.ColSpanId.Append(n.SpanId)
 	block.ColParentSpanId.Append(n.ParentSpanId)

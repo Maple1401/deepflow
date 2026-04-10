@@ -37,8 +37,11 @@ var log = logging.MustGetLogger("clickhouse.metrics")
 
 const METRICS_OPERATOR_GTE = ">="
 const METRICS_OPERATOR_LTE = "<="
+const METRICS_OPERATOR_GT = ">"
+const METRICS_OPERATOR_LT = "<"
+const METRICS_OPERATOR_E = "="
 
-var METRICS_OPERATORS = []string{METRICS_OPERATOR_GTE, METRICS_OPERATOR_LTE}
+var METRICS_OPERATORS = []string{METRICS_OPERATOR_GTE, METRICS_OPERATOR_LTE, METRICS_OPERATOR_GT, METRICS_OPERATOR_LT, METRICS_OPERATOR_E}
 var DB_DESCRIPTIONS map[string]interface{}
 var letterRegexp = regexp.MustCompile("^[a-zA-Z]")
 
@@ -183,15 +186,15 @@ func GetTagTypeMetrics(tagDescriptions *common.Result, newAllMetrics map[string]
 					clientDisplayName   = displayName
 					serverDisplayNameZH = displayName
 					clientDisplayNameZH = displayName
-					serverDisplayNameEN = ckcommon.TagServerEnPrefix + " " + displayName
-					clientDisplayNameEN = ckcommon.TagClientEnPrefix + " " + displayName
+					serverDisplayNameEN = ckcommon.TAG_SERVER_EN_PREFIX + " " + displayName
+					clientDisplayNameEN = ckcommon.TAG_CLIENT_EN_PREFIX + " " + displayName
 				)
 				if letterRegexp.MatchString(serverName) {
-					serverDisplayNameZH = ckcommon.TagServerChPrefix + " " + displayName
-					clientDisplayNameZH = ckcommon.TagClientChPrefix + " " + displayName
+					serverDisplayNameZH = ckcommon.TAG_SERVER_CH_PREFIX + " " + displayName
+					clientDisplayNameZH = ckcommon.TAG_CLIENT_CH_PREFIX + " " + displayName
 				} else {
-					serverDisplayNameZH = ckcommon.TagServerChPrefix + displayName
-					clientDisplayNameZH = ckcommon.TagClientChPrefix + displayName
+					serverDisplayNameZH = ckcommon.TAG_SERVER_CH_PREFIX + displayName
+					clientDisplayNameZH = ckcommon.TAG_CLIENT_CH_PREFIX + displayName
 				}
 				if config.Cfg.Language == "en" {
 					serverDisplayName = serverDisplayNameEN
@@ -239,7 +242,7 @@ func GetMetrics(field, db, table, orgID string, nativeField map[string]*Metrics)
 		return metric, true
 	}
 	// dynamic metrics
-	if slices.Contains([]string{ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_APPLICATION_LOG, ckcommon.DB_NAME_EXT_METRICS}, db) || slices.Contains([]string{ckcommon.TABLE_NAME_L7_FLOW_LOG, ckcommon.TABLE_NAME_EVENT, ckcommon.TABLE_NAME_PERF_EVENT}, table) {
+	if slices.Contains([]string{ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_APPLICATION_LOG, ckcommon.DB_NAME_EXT_METRICS}, db) || slices.Contains([]string{ckcommon.TABLE_NAME_L7_FLOW_LOG, ckcommon.TABLE_NAME_EVENT, ckcommon.TABLE_NAME_FILE_EVENT}, table) {
 		fieldSplit := strings.Split(field, ".")
 		if len(fieldSplit) > 1 {
 			if fieldSplit[0] == "metrics" {
@@ -343,14 +346,16 @@ func GetMetricsByDBTableStatic(db string, table string) map[string]*Metrics {
 		switch table {
 		case "event":
 			return GetResourceEventMetrics()
-		case "perf_event":
-			return GetResourcePerfEventMetrics()
-		case "alert_event":
+		case "file_event":
+			return GetResourceFileEventMetrics()
+		case ckcommon.TABLE_NAME_ALERT_EVENT, ckcommon.TABLE_NAME_ALERT_RECORD:
 			return GetAlarmEventMetrics()
+		case ckcommon.TABLE_NAME_FILE_EVENT_METRICS:
+			return GetFileEventMetricsMetrics()
 		}
 	case ckcommon.DB_NAME_PROFILE:
 		switch table {
-		case "in_process":
+		case "in_process", ckcommon.TABLE_NAME_IN_PROCESS_METRICS:
 			return GetInProcessMetrics()
 		}
 	case ckcommon.DB_NAME_APPLICATION_LOG:
@@ -371,7 +376,7 @@ func GetMetricsDescriptionsByDBTable(db, table string, allMetrics map[string]*Me
 	values := make([]interface{}, len(allMetrics))
 	for field, metrics := range allMetrics {
 		// dynamic metrics
-		if (slices.Contains([]string{ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_APPLICATION_LOG, ckcommon.DB_NAME_EXT_METRICS}, db) || slices.Contains([]string{ckcommon.TABLE_NAME_L7_FLOW_LOG, ckcommon.TABLE_NAME_EVENT, ckcommon.TABLE_NAME_PERF_EVENT}, table)) && strings.Contains(field, "-") {
+		if (slices.Contains([]string{ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_APPLICATION_LOG, ckcommon.DB_NAME_EXT_METRICS}, db) || slices.Contains([]string{ckcommon.TABLE_NAME_L7_FLOW_LOG, ckcommon.TABLE_NAME_EVENT, ckcommon.TABLE_NAME_FILE_EVENT}, table)) && strings.Contains(field, "-") {
 			index := strings.LastIndex(field, "-")
 			field = field[:index]
 		}
@@ -452,22 +457,22 @@ func GetMetricsDescriptions(db, table, where, queryCacheTTL, orgID string, useQu
 func GetPrometheusSingleTagTranslator(tag, table, orgID string) (string, string, error) {
 	labelType := ""
 	TagTranslatorStr := ""
-	nameNoPreffix := strings.TrimPrefix(tag, "tag.")
+	nameNoPrefix := strings.TrimPrefix(tag, "tag.")
 	metricID, ok := trans_prometheus.ORGPrometheus[orgID].MetricNameToID[table]
 	if !ok {
 		errorMessage := fmt.Sprintf("%s not found", table)
 		return "", "", common.NewError(common.RESOURCE_NOT_FOUND, errorMessage)
 	}
-	labelNameID, ok := trans_prometheus.ORGPrometheus[orgID].LabelNameToID[nameNoPreffix]
+	labelNameID, ok := trans_prometheus.ORGPrometheus[orgID].LabelNameToID[nameNoPrefix]
 	if !ok {
-		errorMessage := fmt.Sprintf("%s not found", nameNoPreffix)
+		errorMessage := fmt.Sprintf("%s not found", nameNoPrefix)
 		return "", "", errors.New(errorMessage)
 	}
 	// Determine whether the tag is app_label or target_label
 	isAppLabel := false
 	if appLabels, ok := trans_prometheus.ORGPrometheus[orgID].MetricAppLabelLayout[table]; ok {
 		for _, appLabel := range appLabels {
-			if appLabel.AppLabelName == nameNoPreffix {
+			if appLabel.AppLabelName == nameNoPrefix {
 				isAppLabel = true
 				labelType = "app"
 				TagTranslatorStr = fmt.Sprintf("dictGet('flow_tag.app_label_map', 'label_value', (toUInt64(%d), toUInt64(app_label_value_id_%d)))", labelNameID, appLabel.AppLabelColumnIndex)
@@ -515,13 +520,15 @@ func GetTagDBField(name, db, table, orgID string) (string, string, error) {
 	if !ok {
 		name := strings.Trim(name, "`")
 		// map item tag
-		nameNoPreffix, _, transKey := common.TransMapItem(name, table)
+		nameNoPrefix, _, transKey := common.TransMapItem(name, table)
 		if transKey != "" {
 			tagItem, _ = tag.GetTag(transKey, db, table, "default")
 			if strings.HasPrefix(name, "os.app.") || strings.HasPrefix(name, "k8s.env.") {
-				tagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPreffix)
+				tagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPrefix)
+			} else if strings.HasPrefix(name, common.BIZ_SERVICE_GROUP) {
+				tagTranslatorStr = tagItem.TagTranslator
 			} else {
-				tagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPreffix, nameNoPreffix, nameNoPreffix)
+				tagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPrefix, nameNoPrefix, nameNoPrefix)
 			}
 		} else if strings.HasPrefix(name, "tag.") || strings.HasPrefix(name, "attribute.") {
 			if strings.HasPrefix(name, "tag.") {
@@ -533,9 +540,9 @@ func GetTagDBField(name, db, table, orgID string) (string, string, error) {
 			} else {
 				tagItem, ok = tag.GetTag("attribute.", db, table, "default")
 			}
-			nameNoPreffix := strings.TrimPrefix(name, "tag.")
-			nameNoPreffix = strings.TrimPrefix(nameNoPreffix, "attribute.")
-			tagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPreffix)
+			nameNoPrefix := strings.TrimPrefix(name, "tag.")
+			nameNoPrefix = strings.TrimPrefix(nameNoPrefix, "attribute.")
+			tagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPrefix)
 		}
 	} else {
 		if name == "metrics" {
@@ -655,16 +662,19 @@ func MergeMetrics(db string, table string, loadMetrics map[string]*Metrics) erro
 		case "event":
 			metrics = RESOURCE_EVENT_METRICS
 			replaceMetrics = RESOURCE_EVENT_METRICS_REPLACE
-		case "perf_event":
-			metrics = RESOURCE_PERF_EVENT_METRICS
-			replaceMetrics = RESOURCE_PERF_EVENT_METRICS_REPLACE
-		case "alert_event":
+		case "file_event":
+			metrics = RESOURCE_FILE_EVENT_METRICS
+			replaceMetrics = RESOURCE_FILE_EVENT_METRICS_REPLACE
+		case ckcommon.TABLE_NAME_ALERT_EVENT, ckcommon.TABLE_NAME_ALERT_RECORD:
 			metrics = ALARM_EVENT_METRICS
 			replaceMetrics = ALARM_EVENT_METRICS_REPLACE
+		case ckcommon.TABLE_NAME_FILE_EVENT_METRICS:
+			metrics = FILE_EVENT_METRICS_METRICS
+			replaceMetrics = FILE_EVENT_METRICS_METRICS_REPLACE
 		}
 	case ckcommon.DB_NAME_PROFILE:
 		switch table {
-		case "in_process":
+		case "in_process", ckcommon.TABLE_NAME_IN_PROCESS_METRICS:
 			metrics = IN_PROCESS_METRICS
 			replaceMetrics = IN_PROCESS_METRICS_REPLACE
 		}

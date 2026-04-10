@@ -37,11 +37,11 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 		"ClusterIP":    common.POD_SERVICE_TYPE_CLUSTERIP,
 		"LoadBalancer": common.POD_SERVICE_TYPE_LOADBALANCER,
 	}
-	servicesArrays := [][]string{k.k8sInfo["*v1.Service"]}
-	servicesArrays = append(servicesArrays, k.k8sInfo["*v1.ServiceRule"])
+	servicesArrays := [][][]byte{k.k8sEntries["*v1.Service"]}
+	servicesArrays = append(servicesArrays, k.k8sEntries["*v1.ServiceRule"])
 	for i, servicesArray := range servicesArrays {
 		for _, s := range servicesArray {
-			sData, sErr := simplejson.NewJson([]byte(s))
+			sData, sErr := simplejson.NewJson(s)
 			if sErr != nil {
 				err = sErr
 				log.Errorf("service initialization simplejson error: (%s)", sErr.Error(), logger.NewORGPrefix(k.orgID))
@@ -234,8 +234,9 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 				for _, tPort := range targetPorts {
 					targetPortsMap[tPort] = false
 				}
+				portString := strconv.Itoa(portInt)
 				for targetPort := range targetPortsMap {
-					key := strconv.Itoa(portInt) + portProtocol + strconv.Itoa(portNodePort) + strconv.Itoa(targetPort)
+					key := portString + portProtocol + strconv.Itoa(portNodePort) + strconv.Itoa(targetPort)
 					servicePort := model.PodServicePort{
 						Lcuuid:           common.GetUUIDByOrgID(k.orgID, uLcuuid+key),
 						Name:             portName,
@@ -254,7 +255,7 @@ func (k *KubernetesGather) getPodServices() (services []model.PodService, servic
 						continue
 					}
 					for targetPort := range targetPortsMap {
-						key := portProtocol + strconv.Itoa(targetPort)
+						key := portName + portString + portProtocol + strconv.Itoa(targetPort)
 						podGroupPort := model.PodGroupPort{
 							Lcuuid:           common.GetUUIDByOrgID(k.orgID, uLcuuid+podGroupLcuuid+key),
 							Name:             portName,

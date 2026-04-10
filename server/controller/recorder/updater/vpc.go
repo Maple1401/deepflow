@@ -25,7 +25,27 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// VPCMessageFactory VPC资源的消息工厂
+type VPCMessageFactory struct{}
+
+func (f *VPCMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedVPCs{}
+}
+
+func (f *VPCMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedVPC{}
+}
+
+func (f *VPCMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedVPCs{}
+}
+
+func (f *VPCMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedVPCFields{}
+}
 
 type VPC struct {
 	UpdaterBase[
@@ -33,36 +53,12 @@ type VPC struct {
 		*diffbase.VPC,
 		*metadbmodel.VPC,
 		metadbmodel.VPC,
-		*message.AddedVPCs,
-		message.AddedVPCs,
-		message.AddNoneAddition,
-		*message.UpdatedVPC,
-		message.UpdatedVPC,
-		*message.UpdatedVPCFields,
-		message.UpdatedVPCFields,
-		*message.DeletedVPCs,
-		message.DeletedVPCs,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewVPC(wholeCache *cache.Cache, cloudData []cloudmodel.VPC) *VPC {
 	updater := &VPC{
-		newUpdaterBase[
-			cloudmodel.VPC,
-			*diffbase.VPC,
-			*metadbmodel.VPC,
-			metadbmodel.VPC,
-			*message.AddedVPCs,
-			message.AddedVPCs,
-			message.AddNoneAddition,
-			*message.UpdatedVPC,
-			message.UpdatedVPC,
-			*message.UpdatedVPCFields,
-			message.UpdatedVPCFields,
-			*message.DeletedVPCs,
-			message.DeletedVPCs,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_VPC_EN,
 			wholeCache,
 			db.NewVPC().SetMetadata(wholeCache.GetMetadata()),
@@ -70,22 +66,23 @@ func NewVPC(wholeCache *cache.Cache, cloudData []cloudmodel.VPC) *VPC {
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
-	return updater
-}
+	updater.setDataGenerator(updater)
 
-func (v *VPC) getDiffBaseByCloudItem(cloudItem *cloudmodel.VPC) (diffBase *diffbase.VPC, exists bool) {
-	diffBase, exists = v.diffBaseData[cloudItem.Lcuuid]
-	return
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &VPCMessageFactory{})
+	}
+
+	return updater
 }
 
 func (v *VPC) generateDBItemToAdd(cloudItem *cloudmodel.VPC) (*metadbmodel.VPC, bool) {
 	if cloudItem.Label == "" {
-		cloudItem.Label = common.GenerateVPCShortUUID()
+		cloudItem.Label = common.GenerateResourceShortUUID(v.resourceType)
 	}
 	dbItem := &metadbmodel.VPC{
 		Name:         cloudItem.Name,
 		Label:        cloudItem.Label,
+		Owner:        cloudItem.Owner,
 		UID:          cloudItem.Label,
 		CreateMethod: ctrlrcommon.CREATE_METHOD_LEARN,
 		Domain:       v.metadata.GetDomainLcuuid(),
@@ -97,7 +94,7 @@ func (v *VPC) generateDBItemToAdd(cloudItem *cloudmodel.VPC) (*metadbmodel.VPC, 
 	return dbItem, true
 }
 
-func (v *VPC) generateUpdateInfo(diffBase *diffbase.VPC, cloudItem *cloudmodel.VPC) (*message.UpdatedVPCFields, map[string]interface{}, bool) {
+func (v *VPC) generateUpdateInfo(diffBase *diffbase.VPC, cloudItem *cloudmodel.VPC) (types.UpdatedFields, map[string]interface{}, bool) {
 	structInfo := new(message.UpdatedVPCFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
@@ -107,7 +104,7 @@ func (v *VPC) generateUpdateInfo(diffBase *diffbase.VPC, cloudItem *cloudmodel.V
 
 	if cloudItem.Label == "" {
 		if diffBase.Label == "" {
-			cloudItem.Label = common.GenerateVPCShortUUID()
+			cloudItem.Label = common.GenerateResourceShortUUID(v.resourceType)
 		} else {
 			cloudItem.Label = diffBase.Label
 		}
@@ -120,6 +117,10 @@ func (v *VPC) generateUpdateInfo(diffBase *diffbase.VPC, cloudItem *cloudmodel.V
 	if diffBase.RegionLcuuid != cloudItem.RegionLcuuid {
 		mapInfo["region"] = cloudItem.RegionLcuuid
 		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
+	}
+	if diffBase.Owner != cloudItem.Owner {
+		mapInfo["owner"] = cloudItem.Owner
+		structInfo.Owner.Set(diffBase.Owner, cloudItem.Owner)
 	}
 	if diffBase.CIDR != cloudItem.CIDR {
 		mapInfo["cidr"] = cloudItem.CIDR

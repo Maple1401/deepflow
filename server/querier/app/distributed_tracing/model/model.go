@@ -27,3 +27,8 @@ type TraceMap struct {
 	Context        context.Context
 	OrgID          string
 }
+
+type FlowMap struct {
+	TraceMap
+	TopoFrame TopoFrame `json:"topo_frame,omitempty"`
+}

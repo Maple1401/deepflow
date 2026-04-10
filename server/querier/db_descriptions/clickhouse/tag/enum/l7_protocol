@@ -9,6 +9,8 @@
 45      , bRPC            ,
 46      , Tars            ,
 47      , Some/IP         ,
+48      , ISO-8583        ,
+49      , Triple          ,
 60      , MySQL           ,
 61      , PostgreSQL      ,
 62      , Oracle          ,
@@ -23,6 +25,7 @@
 105     , Pulsar          ,
 106     , ZMTP            , ZeroMQ
 107     , RocketMQ        ,
+108     , WebSphereMQ     ,
 120     , DNS             ,
 121     , TLS             ,
 122     , Ping            ,

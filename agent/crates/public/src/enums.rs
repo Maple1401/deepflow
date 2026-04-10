@@ -17,11 +17,10 @@
 //! Referfence `gopacket/layers/enums.go`
 
 use std::fmt;
-use std::ops::BitAnd;
 
 use bitflags::bitflags;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// EthernetType is an enumeration of ethernet type values, and acts as a decoder
 /// for any type it supports.
@@ -246,6 +245,7 @@ pub enum HeaderType {
     Ipv4 = 0x20,
     Ipv4Icmp = 0x21,
     Ipv6 = 0x40,
+    Ipv6Icmp = 0x41,
     Ipv4Tcp = 0x80,
     Ipv4Udp = 0x81,
     Ipv6Tcp = 0xb0,
@@ -267,8 +267,9 @@ impl HeaderType {
             Self::Ipv4 => 14 + 20,         // 不包括DOT1Q + IPv4 option0,
             Self::Ipv4Icmp => 14 + 20 + 8, // 不包括DOT1Q + IPv4 option 0x21,
             Self::Ipv6 => 14 + 20, // 不包括DOT1Q + IPv6 option，IPv6大于IPv4的20个字节计算在m.l2L3OptSize里面0,
+            Self::Ipv6Icmp => 14 + 20 + 8, // 不包括DOT1Q + IPv6 option，IPv6大于IPv4的20个字节计算在m.l2L3OptSize里面0,
             Self::Ipv4Tcp => 14 + 20 + 20, // 不包括DOT1Q + IPv4 option0x80,
-            Self::Ipv4Udp => 14 + 20 + 8, // 不包括DOT1Q + IPv4 option0x81,
+            Self::Ipv4Udp => 14 + 20 + 8,  // 不包括DOT1Q + IPv4 option0x81,
             Self::Ipv6Tcp => 14 + 40 + 20, // 不包括DOT1Q + IPv6 option，IPv6大于40字节的option计算在m.l2L3OptSize里面0xb0,
             Self::Ipv6Udp => 14 + 40 + 8, // 不包括DOT1Q + IPv6 option，IPv6大于40字节的option计算在m.l2L3OptSize里面0xb1,
             Self::Invalid => unreachable!(),
@@ -282,6 +283,7 @@ impl HeaderType {
             Self::Ipv4 => 20,
             Self::Ipv4Icmp => 8,
             Self::Ipv6 => 20,
+            Self::Ipv6Icmp => 8,
             Self::Ipv4Tcp => 20,
             Self::Ipv4Udp => 8,
             Self::Ipv6Tcp => 20,
@@ -374,71 +376,38 @@ pub enum LinuxSllPacketType {
     FastRoute = 6, // FastRoute frame
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-pub enum MatchType {
-    // true: ignore case, false(default): case sensitive
-    String(bool),
-    Hex,
-}
-
-impl Default for MatchType {
-    fn default() -> MatchType {
-        MatchType::String(false)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum TrafficDirection {
-    Request = 0x01,
-    Response = 0x10,
-    #[default]
-    Both = 0x11,
+pub enum PacketDirection {
+    ClientToServer = 0,
+    ServerToClient = 1,
 }
 
-impl BitAnd for TrafficDirection {
-    type Output = Self;
-    fn bitand(self, rhs: Self) -> Self::Output {
-        let r = self as u8 & rhs as u8;
-        match r {
-            0x01 => TrafficDirection::Request,
-            0x10 => TrafficDirection::Response,
-            0x11 => TrafficDirection::Both,
-            _ => TrafficDirection::Both,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Charset {
-    Digits,
-    Alphabets,
-    Chinese,
-}
-
-impl Charset {
-    pub fn check(&self, c: &char) -> bool {
+impl PacketDirection {
+    pub fn reversed(&self) -> Self {
         match self {
-            Charset::Digits => c.is_ascii_digit(),
-            Charset::Alphabets => c.is_ascii_alphabetic(),
-            Charset::Chinese => {
-                matches!(*c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{20000}'..='\u{2EBEF}')
-            }
+            PacketDirection::ClientToServer => PacketDirection::ServerToClient,
+            PacketDirection::ServerToClient => PacketDirection::ClientToServer,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, PartialOrd)]
-#[repr(u8)]
-pub enum FieldType {
-    #[default]
-    Header,
-    HttpUrl,
-    PayloadJson,
-    PayloadXml,
-    PayloadHessian2,
+impl Default for PacketDirection {
+    fn default() -> PacketDirection {
+        PacketDirection::ClientToServer
+    }
 }
+
+impl fmt::Display for PacketDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClientToServer => write!(f, "c2s"),
+            Self::ServerToClient => write!(f, "s2c"),
+        }
+    }
+}
+
+pub use public_derive_internals::enums::L7ResponseStatus;
 
 #[cfg(test)]
 mod tests {
@@ -469,5 +438,14 @@ mod tests {
         assert_eq!(size_of::<EthernetType>(), 2);
         assert_eq!(size_of::<IpProtocol>(), 1);
         assert_eq!(size_of::<CaptureNetworkType>(), 2);
+    }
+
+    #[test]
+    fn validate_l7_response_status_as_uint() {
+        assert_eq!(L7ResponseStatus::Ok as u32, 0);
+        assert_eq!(L7ResponseStatus::Timeout as u32, 2);
+        assert_eq!(L7ResponseStatus::ServerError as u32, 3);
+        assert_eq!(L7ResponseStatus::ClientError as u32, 4);
+        assert_eq!(L7ResponseStatus::Unknown as u32, 5);
     }
 }

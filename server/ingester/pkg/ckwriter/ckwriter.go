@@ -338,26 +338,17 @@ func initTable(conn *ch.Client, timeZone string, t *ckdb.Table, orgID uint16) er
 	}
 
 	if t.Aggr1S {
-		aggrTableCreateSQL, err := QuerySingleStringColumn(conn, fmt.Sprintf("SHOW CREATE TABLE %s", t.AggrTable1S(orgID)), "statement")
-		if err != nil {
-			log.Warningf("query 1s agg table failed: %s", err)
-		}
-		if t.IsAggrTableWrong(aggrTableCreateSQL) {
-			if err := ExecSQL(conn, t.MakeAggrTableDropSQL1S(orgID)); err != nil {
-				log.Warningf("drop 1s agg table failed: %s", err)
-			}
-		}
 		if err := ExecSQL(conn, t.MakeAggrTableCreateSQL1S(orgID)); err != nil {
-			log.Warningf("create 1h agg table failed: %s", err)
+			log.Warningf("create 1s agg table failed: %s", err)
 		}
 		if err := ExecSQL(conn, t.MakeAggrMVTableCreateSQL1S(orgID)); err != nil {
-			log.Warningf("create 1h mv table failed: %s", err)
+			log.Warningf("create 1s mv table failed: %s", err)
 		}
 		if err := ExecSQL(conn, t.MakeAggrLocalTableCreateSQL1S(orgID)); err != nil {
-			log.Warningf("create 1h local table failed: %s", err)
+			log.Warningf("create 1s local table failed: %s", err)
 		}
 		if err := ExecSQL(conn, t.MakeAggrGlobalTableCreateSQL1S(orgID)); err != nil {
-			log.Warningf("create 1h global table failed: %s", err)
+			log.Warningf("create 1s global table failed: %s", err)
 		}
 
 	}

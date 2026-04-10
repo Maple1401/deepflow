@@ -25,9 +25,10 @@ var VTAP_APP_PORT_METRICS_REPLACE = map[string]*Metrics{
 	"client_error_ratio": NewReplaceMetrics("client_error/response", ""),
 	"server_error_ratio": NewReplaceMetrics("server_error/response", ""),
 	"timeout_ratio":      NewReplaceMetrics("timeout/request", ""),
+	"response_ratio":     NewReplaceMetrics("response/request", ""),
+	"success_ratio":      NewReplaceMetrics("1 - error/response", ""),
 }
 
 func GetVtapAppPortMetrics() map[string]*Metrics {
-	// TODO: 特殊指标量修改
 	return VTAP_APP_PORT_METRICS
 }

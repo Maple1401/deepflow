@@ -109,7 +109,7 @@ var hostUniversalTags = []string{
 // convert promql aggregation functions to querier functions
 var aggFunctions = map[string]string{
 	"sum":          view.FUNCTION_SUM,
-	"avg":          view.FUNCTION_AVG,
+	"avg":          view.FUNCTION_AAVG,
 	"count":        view.FUNCTION_COUNT,
 	"min":          view.FUNCTION_MIN,
 	"max":          view.FUNCTION_MAX,
@@ -136,6 +136,33 @@ const (
 )
 
 type ctxKeyPrefixType struct{}
+
+type queryableTag struct {
+	name   string
+	alias  string
+	filter string
+	isEnum bool
+}
+
+// buildFilterClauses constructs SQL filter expressions for the given operation and values.
+// For enum tags with numeric values, it uses the raw tag column (e.g. `l7_protocol`=20).
+// For empty values on DeepFlow tags, it uses [not] exist(tag).
+// Otherwise it uses quoted string comparison.
+func buildFilterClauses(tag queryableTag, tagMatcher, operation string, values []string, isDeepFlowTag bool) string {
+	filters := make([]string, 0, len(values))
+	for _, v := range values {
+		val := escapeSingleQuote(v)
+		intVal, e := strconv.Atoi(val)
+		if e == nil && tag.isEnum {
+			filters = append(filters, fmt.Sprintf("%s %s %d", tag.filter, operation, intVal))
+		} else if val == "" && isDeepFlowTag && len(values) == 1 {
+			filters = append(filters, fmt.Sprintf("%s(%s)", operation, tagMatcher))
+		} else {
+			filters = append(filters, fmt.Sprintf("%s %s '%s'", tagMatcher, operation, val))
+		}
+	}
+	return fmt.Sprintf("(%s)", strings.Join(filters, " OR "))
+}
 
 func (p *prometheusReader) promReaderTransToSQL(ctx context.Context, req *prompb.ReadRequest, startTime int64, endTime int64, debug bool) (context.Context, string, string, string, string, error) {
 	queriers := req.Queries
@@ -203,20 +230,20 @@ func (p *prometheusReader) promReaderTransToSQL(ctx context.Context, req *prompb
 
 			// should append all labels in query & grouping clause
 			for _, groupLabel := range q.Hints.Grouping {
-				tagName, tagAlias, _ := p.parsePromQLTag(prefixType, db, groupLabel)
+				queryableTag, _ := p.parsePromQLTag(prefixType, db, groupLabel)
 
-				if tagAlias == "" {
-					groupBy = append(groupBy, tagName)
-					metricsArray = append(metricsArray, tagName)
+				if queryableTag.alias == "" {
+					groupBy = append(groupBy, queryableTag.name)
+					metricsArray = append(metricsArray, queryableTag.name)
 				} else {
-					groupBy = append(groupBy, tagAlias)
-					metricsArray = append(metricsArray, fmt.Sprintf("%s as %s", tagName, tagAlias))
+					groupBy = append(groupBy, queryableTag.alias)
+					metricsArray = append(metricsArray, fmt.Sprintf("%s as %s", queryableTag.name, queryableTag.alias))
 				}
 			}
 
 			// aggregation for metrics, assert aggOperator is not empty
 			switch aggOperator {
-			case view.FUNCTION_SUM, view.FUNCTION_AVG, view.FUNCTION_MIN, view.FUNCTION_MAX, view.FUNCTION_STDDEV:
+			case view.FUNCTION_SUM, view.FUNCTION_AAVG, view.FUNCTION_AVG, view.FUNCTION_MIN, view.FUNCTION_MAX, view.FUNCTION_STDDEV:
 				metricWithAggFunc = fmt.Sprintf("%s(`%s`)", aggOperator, metricName)
 			case "1":
 				// group
@@ -252,9 +279,9 @@ func (p *prometheusReader) promReaderTransToSQL(ctx context.Context, req *prompb
 			if len(q.Hints.Grouping) > 0 {
 				expectedDeepFlowNativeTags = make(map[string]string, len(q.Hints.Grouping)+len(q.Matchers)-1)
 				for _, q := range q.Hints.Grouping {
-					tagName, tagAlias, isDeepFlowTag := p.parsePromQLTag(prefixType, db, q)
+					queryableTag, isDeepFlowTag := p.parsePromQLTag(prefixType, db, q)
 					if isDeepFlowTag {
-						expectedDeepFlowNativeTags[tagName] = tagAlias
+						expectedDeepFlowNativeTags[queryableTag.name] = queryableTag.alias
 					}
 				}
 			} else {
@@ -281,12 +308,12 @@ func (p *prometheusReader) promReaderTransToSQL(ctx context.Context, req *prompb
 		} else {
 			metricsArray = append(metricsArray, fmt.Sprintf("FastTrans(%s) as %s", PROMETHEUS_NATIVE_TAG_NAME, model.PROMETHEUS_LABELS_INDEX))
 			for _, g := range q.Hints.Grouping {
-				tagName, tagAlias, _ := p.parsePromQLTag(prefixType, db, g)
+				queryableTag, _ := p.parsePromQLTag(prefixType, db, g)
 
-				if tagAlias == "" {
-					metricsArray = append(metricsArray, tagName)
+				if queryableTag.alias == "" {
+					metricsArray = append(metricsArray, queryableTag.name)
 				} else {
-					metricsArray = append(metricsArray, fmt.Sprintf("%s as %s", tagName, tagAlias))
+					metricsArray = append(metricsArray, fmt.Sprintf("%s as %s", queryableTag.name, queryableTag.alias))
 				}
 			}
 		}
@@ -309,17 +336,17 @@ func (p *prometheusReader) promReaderTransToSQL(ctx context.Context, req *prompb
 	filters := make([]string, 0, len(q.Matchers)+1)
 	filters = append(filters, fmt.Sprintf("(time >= %d AND time <= %d)", startTime, endTime))
 	for _, matcher := range q.Matchers {
-		tagName, tagAlias, isDeepFlowTag, newFilter := p.parseMatchers(matcher, prefixType, db)
-		if newFilter == "" {
+		queryableTag, isDeepFlowTag, sqlFilter := p.parseMatchers(matcher, prefixType, db)
+		if sqlFilter == "" {
 			continue
 		}
-		filters = append(filters, newFilter)
+		filters = append(filters, sqlFilter)
 
 		if db == "" || db == chCommon.DB_NAME_PROMETHEUS || db == chCommon.DB_NAME_EXT_METRICS {
 			if isDeepFlowTag && len(q.Hints.Grouping) == 0 {
-				expectedDeepFlowNativeTags[tagName] = tagAlias
+				expectedDeepFlowNativeTags[queryableTag.name] = queryableTag.alias
 				// append all priority higher tags
-				if greaterTags, hasIDSuffix := getTagsGreaterThan(tagName); greaterTags != nil {
+				if greaterTags, hasIDSuffix := getTagsGreaterThan(queryableTag.name); greaterTags != nil {
 					for i := range greaterTags {
 						appendTag := fmt.Sprintf("`%s`", greaterTags[i])
 						if hasIDSuffix {
@@ -330,27 +357,29 @@ func (p *prometheusReader) promReaderTransToSQL(ctx context.Context, req *prompb
 				}
 			}
 
-			if isDeepFlowTag && tagAlias != "" {
-				expectedDeepFlowNativeTags[tagName] = tagAlias
+			if isDeepFlowTag && queryableTag.alias != "" {
+				expectedDeepFlowNativeTags[queryableTag.name] = queryableTag.alias
 			}
 
 			if !isDeepFlowTag && debug {
-				// append in query for analysis (findout if tag is target_label)
-				expectedDeepFlowNativeTags[tagName] = tagAlias
+				// append in query for analysis (find out if tag is target_label)
+				expectedDeepFlowNativeTags[queryableTag.name] = queryableTag.alias
 			}
 		}
 	}
 
 	if len(p.extraFilters) > 0 {
-		// to support same pron like promql filters, here we need to parse and extract `where` clause
+		// to support same filters like promql filters, here we need to parse and extract `where` clause
 		// it can't be use in querier where directly
+		// for this scenarios, all tag would be use as deepflow-tag, do not support prometheus tag here
+		// notice: here, when call parseExtraFiltersToWhereClause, use prefixType=prefixNone means always query DeepFlow tag
 		extraLabelMatchers, err := parseExtraFiltersToMatchers(p.extraFilters)
 		if err == nil {
-			filters = append(filters, p.parseExtraFiltersToWhereClause(extraLabelMatchers, prefixType, db,
-				func(tagName, tagAlias string, isDeepFlowTag bool) {
+			filters = append(filters, p.parseExtraFiltersToWhereClause(extraLabelMatchers, prefixNone, db,
+				func(tagName string, isTag bool) {
 					if db == "" || db == chCommon.DB_NAME_PROMETHEUS || db == chCommon.DB_NAME_EXT_METRICS {
-						if isDeepFlowTag && (len(q.Hints.Grouping) == 0 || tagAlias != "") {
-							expectedDeepFlowNativeTags[tagName] = tagAlias
+						if len(q.Hints.Grouping) == 0 && isTag {
+							expectedDeepFlowNativeTags[tagName] = tagName
 						}
 					}
 				}))
@@ -380,59 +409,66 @@ func (p *prometheusReader) promReaderTransToSQL(ctx context.Context, req *prompb
 	return ctx, sql, db, dataPrecision, queryMetric, err
 }
 
-func (p *prometheusReader) parseMatchers(matcher *prompb.LabelMatcher, prefixType prefix, db string) (string, string, bool, string) {
-	if matcher.Name == labels.MetricName {
-		return "", "", false, ""
+func (p *prometheusReader) parseExtraFilters(filter *extraFilters, db string) (string, string) {
+	if filter.label == "" || filter.operator == "" {
+		return "", ""
 	}
-	tagName, tagAlias, isDeepFlowTag := p.parsePromQLTag(prefixType, db, matcher.Name)
+	if filter.operator == "exist" || filter.operator == "not exist" {
+		return filter.label, fmt.Sprintf("%s(%s)", filter.operator, filter.label)
+	}
+	return filter.label, fmt.Sprintf("%s %s %s", filter.label, filter.operator, escapeSingleQuote(filter.value))
+}
+
+func (p *prometheusReader) parseMatchers(matcher *prompb.LabelMatcher, prefixType prefix, db string) (queryableTag, bool, string) {
+	tag := queryableTag{name: "", alias: "", filter: ""}
+	if matcher.Name == labels.MetricName {
+		return tag, false, ""
+	}
+	tag, isDeepFlowTag := p.parsePromQLTag(prefixType, db, matcher.Name)
 	operation, value := getLabelMatcher(matcher.Type, matcher.Value, isDeepFlowTag)
 	if operation == "" {
-		return "", "", false, ""
+		return tag, false, ""
 	}
 
 	// for normal query & DeepFlow metrics, query enum tag can only use tag name(Enum(x)) in filter clause
-	tagMatcher := tagName
-	if prefixType != prefixNone && isDeepFlowTag && tagAlias != "" {
+	tagMatcher := tag.name
+	if prefixType != prefixNone && isDeepFlowTag && tag.alias != "" {
 		// for Prometheus metrics, query DeepFlow enum tag can only use tag alias(x_enum) in filter clause
-		tagMatcher = tagAlias
+		tagMatcher = tag.alias
 	}
 
-	if len(value) > 1 {
-		tmpFilters := make([]string, 0, len(value))
-		for _, v := range value {
-			tmpFilters = append(tmpFilters, fmt.Sprintf("%s %s '%s'", tagMatcher, operation, escapeSingleQuote(v)))
-		}
-		return tagName, tagAlias, isDeepFlowTag, fmt.Sprintf("(%s)", strings.Join(tmpFilters, " OR "))
-	} else {
-		// () with only ONE condition in it will cause error
-		if value[0] == "" && isDeepFlowTag {
-			// only for DeepFlow Tag, when value is empty, use [not] exist(`tag`) for query
-			return tagName, tagAlias, isDeepFlowTag, fmt.Sprintf("%s(%s)", operation, tagMatcher)
-		} else {
-			return tagName, tagAlias, isDeepFlowTag, fmt.Sprintf("%s %s '%s'", tagMatcher, operation, escapeSingleQuote(value[0]))
-		}
-	}
+	return tag, isDeepFlowTag, buildFilterClauses(tag, tagMatcher, operation, value, isDeepFlowTag)
 }
 
 // parse extra-filters to filters in `where` clause
-func (p *prometheusReader) parseExtraFiltersToWhereClause(extraLabelMatchers [][]*prompb.LabelMatcher, prefixType prefix, db string, handleTags func(string, string, bool)) string {
-	outerFilters := make([]string, 0, len(extraLabelMatchers))
-	for i := 0; i < len(extraLabelMatchers); i++ {
-		innerFilters := make([]string, 0, len(extraLabelMatchers[i]))
-		for j := 0; j < len(extraLabelMatchers[i]); j++ {
-			matcher := extraLabelMatchers[i][j]
-			tagName, tagAlias, isDeepFlowTag, newFilter := p.parseMatchers(matcher, prefixType, db)
-			if newFilter == "" {
-				continue
-			}
-			innerFilters = append(innerFilters, newFilter)
-			handleTags(tagName, tagAlias, isDeepFlowTag)
-		}
-		// inside matchers use 'AND' for connected
-		outerFilters = append(outerFilters, fmt.Sprintf("(%s)", strings.Join(innerFilters, " AND ")))
+func (p *prometheusReader) parseExtraFiltersToWhereClause(node *filterNode, prefixType prefix, db string, handleTags func(string, bool)) string {
+	if node == nil {
+		return ""
 	}
-	// outside matchers use 'OR' for connected
-	return fmt.Sprintf("(%s)", strings.Join(outerFilters, " OR "))
+	if node.filter != nil {
+		// leaf node
+		tagName, sql := p.parseExtraFilters(node.filter, db)
+		if sql == "" {
+			return ""
+		}
+		handleTags(tagName, node.filter.isTag)
+		return sql
+	}
+	// internal AND/OR node: recurse into children
+	parts := make([]string, 0, len(node.children))
+	for _, child := range node.children {
+		s := p.parseExtraFiltersToWhereClause(child, prefixType, db, handleTags)
+		if s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	return fmt.Sprintf("(%s)", strings.Join(parts, " "+node.op+" "))
 }
 
 // return: prefixType, metricName, db, table, dataPrecision, metricAlias
@@ -579,13 +615,12 @@ func showTags(ctx context.Context, db string, table string, startTime int64, end
 	return tagsArray, nil
 }
 
-func parseDeepFlowTag(tag string) (tagName string, tagAlias string) {
-	if enumAlias, ok := formatEnumTag(tag); ok {
-		return enumAlias, fmt.Sprintf("`%s%s`", tag, ENUM_TAG_SUFFIX)
+func parseDeepFlowTag(tag string) queryableTag {
+	if enumTag := formatEnumTag(tag); enumTag.isEnum {
+		return enumTag
 	} else {
-		tagName = fmt.Sprintf("`%s`", tag)
+		return queryableTag{name: fmt.Sprintf("`%s`", tag), alias: "", filter: ""}
 	}
-	return tagName, tagAlias
 }
 
 func parsePrometheusTag(tag string) string {
@@ -596,7 +631,10 @@ func removePrometheusTagPrefix(tag string) string {
 	return strings.Replace(tag, "tag.", "", 1)
 }
 
-func (p *prometheusReader) parsePromQLTag(prefixType prefix, db, tag string) (tagName string, tagAlias string, isDeepFlowTag bool) {
+// prefix type means "real prefix type" for metric
+// when query prometheus metrics, prefix type is DeepFlow Tag, means we should query DeepFlow tag with 'df_x'
+// when query DeepFlow metrics, prefix type is Prometheus Tag, means we should query Prometheus tag with 'tag_x'
+func (p *prometheusReader) parsePromQLTag(prefixType prefix, db, tag string) (qTag queryableTag, isDeepFlowTag bool) {
 	// set flag
 	if prefixType == prefixNone {
 		isDeepFlowTag = true
@@ -611,20 +649,19 @@ func (p *prometheusReader) parsePromQLTag(prefixType prefix, db, tag string) (ta
 	// `tagAlias` return only when tag is `enum tag` (returns `Enum(tag)` as `_tag_enum`)
 	if isDeepFlowTag {
 		if strings.HasPrefix(tag, config.Cfg.Prometheus.AutoTaggingPrefix) {
-			tagName, tagAlias = parseDeepFlowTag(p.convertToQuerierAllowedTagName(removeDeepFlowPrefix(tag)))
+			qTag = parseDeepFlowTag(p.convertToQuerierAllowedTagName(removeDeepFlowPrefix(tag)))
 		} else {
-			tagName, tagAlias = parseDeepFlowTag(p.convertToQuerierAllowedTagName(tag))
+			qTag = parseDeepFlowTag(p.convertToQuerierAllowedTagName(tag))
 		}
 	} else {
 		// query ext_metrics/prometheus
 		// query deepflow native metrics (deepflow_admin/deepflow_tenant/flow_metrics/flow_log)
-		tagName = parsePrometheusTag(removeTagPrefix(tag))
+		qTag.name = parsePrometheusTag(removeTagPrefix(tag))
 	}
 
 	// deepflow_admin/deepflow_tanant don't have any DeepFlow universal tag, overwrite the tagName
 	if db == chCommon.DB_NAME_DEEPFLOW_ADMIN || db == chCommon.DB_NAME_DEEPFLOW_TENANT {
-		tagName = parsePrometheusTag(tag)
-		tagAlias = ""
+		qTag.name = parsePrometheusTag(tag)
 	}
 	return
 }
@@ -1059,9 +1096,9 @@ func (p *prometheusReader) parseQueryRequestToSQL(ctx context.Context, queryReq 
 	expectedQueryTags := make(map[string]string, cap(groupBy)+len(queryReq.GetLabels())-1)
 
 	handleTagFunc := func(tag string) string {
-		tagName, tagAlias, _ := p.parsePromQLTag(prefixDeepFlow, chCommon.DB_NAME_PROMETHEUS, tag)
-		expectedQueryTags[tagName] = tagAlias
-		return tagName
+		queryableTag, _ := p.parsePromQLTag(prefixDeepFlow, chCommon.DB_NAME_PROMETHEUS, tag)
+		expectedQueryTags[queryableTag.name] = queryableTag.alias
+		return queryableTag.name
 	}
 
 	// filter
@@ -1078,36 +1115,24 @@ func (p *prometheusReader) parseQueryRequestToSQL(ctx context.Context, queryReq 
 		if matcher.Name == labels.MetricName {
 			continue
 		}
-		tagName, tagAlias, isDeepFlowTag := p.parsePromQLTag(prefixDeepFlow, chCommon.DB_NAME_PROMETHEUS, matcher.Name)
+		queryableTag, isDeepFlowTag := p.parsePromQLTag(prefixDeepFlow, chCommon.DB_NAME_PROMETHEUS, matcher.Name)
 		operation, value := getLabelMatcher(parseMatcherType(matcher.Type), matcher.Value, isDeepFlowTag)
 		if operation == "" {
 			continue
 		}
 
-		tagMatcher := tagName
-		if isDeepFlowTag && tagAlias != "" {
-			tagMatcher = tagAlias
+		tagMatcher := queryableTag.name
+		if isDeepFlowTag && queryableTag.alias != "" {
+			tagMatcher = queryableTag.alias
 		}
-		if len(value) > 1 {
-			tmpFilters := make([]string, 0, len(value))
-			for _, v := range value {
-				tmpFilters = append(tmpFilters, fmt.Sprintf("%s %s '%s'", tagMatcher, operation, escapeSingleQuote(v)))
-			}
-			filters = append(filters, fmt.Sprintf("(%s)", strings.Join(tmpFilters, " OR ")))
-		} else {
-			if value[0] == "" && isDeepFlowTag {
-				// only for DeepFlow Tag, when value is empty, use [not] exist(`tag`) for query
-				filters = append(filters, fmt.Sprintf("%s(%s)", operation, tagMatcher))
-			} else {
-				filters = append(filters, fmt.Sprintf("%s %s '%s'", tagMatcher, operation, escapeSingleQuote(value[0])))
-			}
-		}
+
+		filters = append(filters, buildFilterClauses(queryableTag, tagMatcher, operation, value, isDeepFlowTag))
 
 		if isDeepFlowTag && cap(groupBy) == 0 {
 			// if not grouping tag, but use filter or has alias for enum tag, append into `expectedDeepFlowNativeTags` for `select df_tag`
 			// why cap(groupBy) == 0: select would influence group result, so when cap(groupBy)>0, we don't append select
-			expectedQueryTags[tagName] = tagAlias
-			if greaterTags, hasIDSuffix := getTagsGreaterThan(tagName); greaterTags != nil {
+			expectedQueryTags[queryableTag.name] = queryableTag.alias
+			if greaterTags, hasIDSuffix := getTagsGreaterThan(queryableTag.name); greaterTags != nil {
 				for i := range greaterTags {
 					appendTag := fmt.Sprintf("`%s`", greaterTags[i])
 					if hasIDSuffix {
@@ -1119,12 +1144,12 @@ func (p *prometheusReader) parseQueryRequestToSQL(ctx context.Context, queryReq 
 		}
 	}
 	if len(p.extraFilters) > 0 {
-		extraLabelMatchers, err := parseExtraFiltersToMatchers(p.extraFilters)
+		extraLabelFilters, err := parseExtraFiltersToMatchers(p.extraFilters)
 		if err == nil {
-			filters = append(filters, p.parseExtraFiltersToWhereClause(extraLabelMatchers, prefixDeepFlow, chCommon.DB_NAME_PROMETHEUS,
-				func(tagName, tagAlias string, isDeepFlowTag bool) {
-					if isDeepFlowTag && cap(groupBy) == 0 {
-						expectedQueryTags[tagName] = tagAlias
+			filters = append(filters, p.parseExtraFiltersToWhereClause(extraLabelFilters, prefixNone, chCommon.DB_NAME_PROMETHEUS,
+				func(tagName string, isTag bool) {
+					if cap(groupBy) == 0 && isTag {
+						expectedQueryTags[tagName] = tagName
 					}
 				}))
 		}
@@ -1447,15 +1472,30 @@ func extractEnumTag(tag string) string {
 	return tag
 }
 
-func formatEnumTag(tagName string) (string, bool) {
+// format enum tags for query & filter
+// when tag is an enum, usually we expect enum value for display and filter, like Enum(l7_protocol)='HTTP'
+// also we need to support enum key for filter, like l7_protocol=20
+func formatEnumTag(tagName string) queryableTag {
 	// parse when query client/server side enum tag
 	enumFile := strings.TrimSuffix(tagName, "_0")
 	enumFile = strings.TrimSuffix(enumFile, "_1")
 	_, exists := tagdescription.TAG_ENUMS[enumFile]
+	queryableTag := queryableTag{name: tagName, alias: tagName, filter: tagName}
 	if exists {
-		return fmt.Sprintf("Enum(%s)", tagName), exists
+		// Enum(l7_protocol)
+		queryableTag.name = fmt.Sprintf("Enum(%s)", tagName)
+		// Enum(l7_protocol) as l7_protocol_enum
+		queryableTag.alias = fmt.Sprintf("`%s%s`", tagName, ENUM_TAG_SUFFIX)
+		// l7_protocol_enum = 'HTTP'
+		queryableTag.filter = queryableTag.alias
 	}
-	return tagName, exists
+	_, isIntEnum := tagdescription.TAG_INT_ENUMS[enumFile]
+	// if value is numeric, filter = l7_protocol=20
+	if isIntEnum {
+		queryableTag.filter = fmt.Sprintf("`%s`", tagName)
+	}
+	queryableTag.isEnum = exists || isIntEnum
+	return queryableTag
 }
 
 // k8s label character set: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set
@@ -1525,17 +1565,6 @@ func getTagsGreaterThan(tag string) ([]string, bool) {
 	return nil, false
 }
 
-func parseOperator(op string) prompb.LabelMatcher_Type {
-	switch op {
-	case "=":
-		return prompb.LabelMatcher_EQ
-	case "!=":
-		return prompb.LabelMatcher_NEQ
-	default:
-		return prompb.LabelMatcher_EQ
-	}
-}
-
 // extrace inner nested type from Nullable(*)
 func findNestedType(dbType string) string {
 	if dbType == "" || !strings.Contains(dbType, "(") {
@@ -1546,60 +1575,71 @@ func findNestedType(dbType string) string {
 	return dbType[leftParen+1 : rightParen]
 }
 
-func parseExtraFiltersToMatchers(filters string) ([][]*prompb.LabelMatcher, error) {
+// 专门给 extraFilters 做一个结构体，以解析实际的 tag + value
+// 注意：仅能用于 DeepFlow tag 查询
+type extraFilters struct {
+	label    string
+	value    string
+	operator string
+	isTag    bool
+}
+
+// filterNode is a boolean expression tree of extra filters.
+// Leaf node: filter != nil. Internal node: op is "AND"/"OR", children non-empty.
+type filterNode struct {
+	filter   *extraFilters
+	op       string
+	children []*filterNode
+}
+
+func parseExtraFiltersToMatchers(filters string) (*filterNode, error) {
 	fakeSQL := fmt.Sprintf("select 1 from t where %s", filters)
 	stmt, err := sqlparser.Parse(fakeSQL)
 	if err != nil {
 		return nil, err
 	}
 	selectStmt := stmt.(*sqlparser.Select)
-	labelMatchers := make([][]*prompb.LabelMatcher, 0)
-	_, err = iterateExprs(selectStmt.Where.Expr, &labelMatchers)
-	if err != nil {
-		return nil, err
-	}
-	return labelMatchers, nil
+	return iterateExprs(selectStmt.Where.Expr)
 }
 
-func iterateExprs(node sqlparser.Expr, labelMatchers *[][]*prompb.LabelMatcher) (sqlparser.Expr, error) {
+// iterateExprs builds a filterNode tree from a SQL expression.
+// AND/OR structure is preserved as-is; no DNF flattening needed.
+func iterateExprs(node sqlparser.Expr) (*filterNode, error) {
 	switch node := node.(type) {
 	case *sqlparser.AndExpr:
-		left, err := iterateExprs(node.Left, labelMatchers)
+		left, err := iterateExprs(node.Left)
 		if err != nil {
-			return left, err
+			return nil, err
 		}
-		right, err := iterateExprs(node.Right, labelMatchers)
+		right, err := iterateExprs(node.Right)
 		if err != nil {
-			return right, err
+			return nil, err
 		}
 		if left == nil {
 			return right, nil
-		} else if right == nil {
+		}
+		if right == nil {
 			return left, nil
 		}
-		return node, nil
+		return &filterNode{op: "AND", children: []*filterNode{left, right}}, nil
 	case *sqlparser.OrExpr:
-		left, err := iterateExprs(node.Left, labelMatchers)
+		left, err := iterateExprs(node.Left)
 		if err != nil {
-			return left, err
+			return nil, err
 		}
-		right, err := iterateExprs(node.Right, labelMatchers)
+		right, err := iterateExprs(node.Right)
 		if err != nil {
-			return right, err
+			return nil, err
 		}
 		if left == nil {
 			return right, nil
-		} else if right == nil {
+		}
+		if right == nil {
 			return left, nil
 		}
-		return node, nil
+		return &filterNode{op: "OR", children: []*filterNode{left, right}}, nil
 	case *sqlparser.ParenExpr:
-		(*labelMatchers) = append((*labelMatchers), []*prompb.LabelMatcher{})
-		expr, err := iterateExprs(node.Expr, labelMatchers)
-		if err != nil {
-			return expr, err
-		}
-		return expr, nil
+		return iterateExprs(node.Expr)
 	case *sqlparser.ComparisonExpr:
 		var comparExpr sqlparser.Expr
 		if parenExpr, ok := node.Left.(*sqlparser.ParenExpr); ok {
@@ -1608,31 +1648,54 @@ func iterateExprs(node sqlparser.Expr, labelMatchers *[][]*prompb.LabelMatcher) 
 			comparExpr = node.Left
 		}
 		var colName, colValue, op string
+		var istag bool
 		switch comparExpr.(type) {
 		case *sqlparser.SQLVal:
 			colValue = sqlparser.String(comparExpr)
 			colName = sqlparser.String(node.Right)
 			op = node.Operator
+			istag = false
 		case *sqlparser.ColName:
 			colName = sqlparser.String(comparExpr)
 			colValue = sqlparser.String(node.Right)
 			op = node.Operator
+			istag = true
 		}
-		lastIndex := len(*labelMatchers) - 1
-		if lastIndex < 0 {
-			(*labelMatchers) = append((*labelMatchers), []*prompb.LabelMatcher{})
-			lastIndex = len(*labelMatchers) - 1
-		}
-
-		(*labelMatchers)[lastIndex] = append((*labelMatchers)[lastIndex], &prompb.LabelMatcher{
-			Type: parseOperator(op),
+		return &filterNode{filter: &extraFilters{
+			operator: op,
 			// some tag will escape by sqlparser
 			// https://github.com/xwb1989/sqlparser/blob/master/token.go#L85
-			Name:  removeEscapeQuote(colName, "`"),
-			Value: removeEscapeQuote(colValue, "'"),
-		})
-		return node, nil
+			label: removeEscapeQuote(colName, "`"),
+			value: removeEscapeQuote(colValue, "'"),
+			isTag: istag,
+		}}, nil
+	case *sqlparser.NotExpr:
+		if funcExpr, ok := node.Expr.(*sqlparser.FuncExpr); ok &&
+			strings.ToLower(funcExpr.Name.String()) == "exist" &&
+			len(funcExpr.Exprs) == 1 {
+			if aliasedExpr, ok := funcExpr.Exprs[0].(*sqlparser.AliasedExpr); ok {
+				tagName := removeEscapeQuote(sqlparser.String(aliasedExpr.Expr), "`")
+				return &filterNode{filter: &extraFilters{
+					operator: "not exist",
+					label:    tagName,
+					isTag:    true,
+				}}, nil
+			}
+		}
+		return nil, nil
+	case *sqlparser.FuncExpr:
+		if strings.ToLower(node.Name.String()) == "exist" && len(node.Exprs) == 1 {
+			if aliasedExpr, ok := node.Exprs[0].(*sqlparser.AliasedExpr); ok {
+				tagName := removeEscapeQuote(sqlparser.String(aliasedExpr.Expr), "`")
+				return &filterNode{filter: &extraFilters{
+					operator: "exist",
+					label:    tagName,
+					isTag:    true,
+				}}, nil
+			}
+		}
+		return nil, nil
 	default:
-		return node, nil
+		return nil, nil
 	}
 }

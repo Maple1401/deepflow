@@ -32,19 +32,24 @@ type Chrony struct {
 	Timeout uint32 `default:"1" yaml:"timeout"`
 }
 
+type Push struct {
+	Enabled  bool `default:"true" yaml:"enabled"`
+	DelayMax int  `default:"0" yaml:"delay-max"` // unit: second min: 1 max: 10
+}
+
 type Config struct {
 	ListenPort                     string   `default:"20014" yaml:"listen-port"`
 	LogLevel                       string   `default:"info"`
 	TsdbIP                         string   `yaml:"tsdb-ip"`
 	Chrony                         Chrony   `yaml:"chrony"`
+	Push                           Push     `yaml:"push"`
 	SelfUpdateUrl                  string   `default:"grpc" yaml:"self-update-url"`
 	RemoteApiTimeout               uint16   `default:"30" yaml:"remote-api-timeout"`
-	TridentTypeForUnknowVtap       uint16   `default:"0" yaml:"trident-type-for-unknow-vtap"`
-	OldTridentTypeForUnknowVtap    uint16   `default:"0" yaml:"trident-type-for-unkonw-vtap"` // Compatible with older configurations
 	PlatformVips                   []string `yaml:"platform-vips"`
 	NodeType                       string   `default:"master" yaml:"node-type"`
 	RegionDomainPrefix             string   `yaml:"region-domain-prefix"`
 	ClearKubernetesTime            int      `default:"600" yaml:"clear-kubernetes-time"`
+	AutoGRPCBufferSizeInterval     float64  `default:"3600" yaml:"auto-grpc-buffer-size-interval"` // unit: second
 	NodeIP                         string
 	VTapCacheRefreshInterval       int  `default:"300" yaml:"vtapcache-refresh-interval"`
 	MetaDataRefreshInterval        int  `default:"60" yaml:"metadata-refresh-interval"`
@@ -71,9 +76,6 @@ type Config struct {
 }
 
 func (c *Config) Convert() {
-	if c.OldTridentTypeForUnknowVtap != 0 && c.TridentTypeForUnknowVtap == 0 {
-		c.TridentTypeForUnknowVtap = c.OldTridentTypeForUnknowVtap
-	}
 	if c.Chrony.Host != "" {
 		if value, ok := os.LookupEnv(c.Chrony.Host); ok {
 			c.Chrony.Host = value
@@ -90,6 +92,11 @@ func (c *Config) Convert() {
 		log.Errorf("IP(%s) address format is incorrect", nodeIP)
 	} else {
 		c.NodeIP = nodeIP
+	}
+
+	if c.Push.DelayMax != 0 && (c.Push.DelayMax < 1 || c.Push.DelayMax > 10) {
+		log.Errorf("invalid config push:delay-max (%d), min: 1 , max: 10", c.Push.DelayMax)
+		c.Push.DelayMax = 0
 	}
 }
 

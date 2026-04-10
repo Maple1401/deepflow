@@ -19,7 +19,9 @@ use std::ffi::CStr;
 use bson::{self, Document};
 use serde::Serialize;
 
-use super::super::{AppProtoHead, LogMessageType};
+use public::l7_protocol::LogMessageType;
+
+use super::super::AppProtoHead;
 use crate::common::flow::L7PerfStats;
 use crate::common::l7_protocol_log::L7ParseResult;
 use crate::config::handler::LogParserConfig;
@@ -30,8 +32,8 @@ use crate::{
         flow::L7Protocol,
         flow::PacketDirection,
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     flow_generator::{
         protocol_logs::{
@@ -182,9 +184,9 @@ impl MongoDBInfo {
 impl From<MongoDBInfo> for L7ProtocolSendLog {
     fn from(f: MongoDBInfo) -> Self {
         let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         let log = L7ProtocolSendLog {
             captured_request_byte: f.captured_request_byte,
@@ -214,36 +216,47 @@ impl From<MongoDBInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&MongoDBInfo> for LogCache {
+    fn from(info: &MongoDBInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct MongoDBLog {
     info: MongoDBInfo,
-    perf_stats: Option<L7PerfStats>,
-    last_is_on_blacklist: bool,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 impl L7ProtocolParserInterface for MongoDBLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
         let mut header = MongoDBHeader::default();
         let offset = header.decode(payload);
         if offset < 0 {
-            return false;
+            return None;
         }
 
         self.info.is_tls = param.is_tls();
-        return header.is_request();
+        if header.is_request() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
         let mut info = MongoDBInfo::default();
-        if self.perf_stats.is_none() {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
 
         self.parse(payload, param.l4_protocol, param.direction, &mut info)?;
         info.is_tls = param.is_tls();
@@ -251,28 +264,18 @@ impl L7ProtocolParserInterface for MongoDBLog {
         if let Some(config) = param.parse_config {
             info.set_is_on_blacklist(config);
         }
-        if !info.is_on_blacklist && !self.last_is_on_blacklist {
-            match info.msg_type {
-                LogMessageType::Request => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req());
+        self.perf_stats.clear();
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if let Some(mut stats) = info.perf_stats(param) {
+                if info.reply_false {
+                    stats.inc_resp_err();
                 }
-                LogMessageType::Response => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp());
-                    if info.response_code > 0 {
-                        self.perf_stats.as_mut().map(|p| p.inc_req_err());
-                    }
-                }
-                _ => {}
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
             }
-            if info.reply_false {
-                self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-            }
-            info.cal_rrt(param, &None).map(|(rrt, _)| {
-                info.rrt = rrt;
-                self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-            });
+            self.perf_stats.push(perf_stat);
         }
-        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::MongoDBInfo(info)))
         } else {
@@ -288,8 +291,8 @@ impl L7ProtocolParserInterface for MongoDBLog {
         false
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -684,7 +687,7 @@ mod tests {
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
         flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/mongo";
@@ -713,7 +716,7 @@ mod tests {
             let mut mongo = MongoDBLog::default();
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -722,7 +725,7 @@ mod tests {
             );
             param.set_captured_byte(payload.len());
 
-            let is_mongo = mongo.check_payload(payload, param);
+            let is_mongo = mongo.check_payload(payload, param).is_some();
             let info = mongo.parse_payload(payload, param);
             if let Ok(info) = info {
                 match info.unwrap_single() {

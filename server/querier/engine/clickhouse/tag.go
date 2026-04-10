@@ -86,7 +86,7 @@ func GetTagTranslator(name, alias string, e *CHEngine) ([]Statement, string, err
 	labelType := ""
 	nameNoBackQuote := strings.Trim(name, "`")
 	tagItem, ok := tag.GetTag(nameNoBackQuote, db, table, "default")
-	if table == "alert_event" {
+	if table == chCommon.TABLE_NAME_ALERT_EVENT || table == chCommon.TABLE_NAME_ALERT_RECORD {
 		if slices.Contains(tag.AUTO_CUSTOM_TAG_NAMES, nameNoBackQuote) {
 			autoTagMap := tagItem.TagTranslatorMap
 			autoTagSlice := []string{}
@@ -100,6 +100,27 @@ func GetTagTranslator(name, alias string, e *CHEngine) ([]Statement, string, err
 		} else if ok {
 			tagTranslator := tagItem.TagTranslator
 			stmts = append(stmts, &SelectTag{Value: tagTranslator, Alias: selectTag})
+		} else if strings.HasPrefix(nameNoBackQuote, "tag_string.") || strings.HasPrefix(nameNoBackQuote, "tag_int.") {
+			nameNoPrefix := ""
+			if strings.HasPrefix(nameNoBackQuote, "tag_string.") {
+				tagItem, ok = tag.GetTag("tag_string.", db, table, "default")
+				nameNoPrefix = strings.TrimPrefix(nameNoBackQuote, "tag_string.")
+			} else {
+				tagItem, ok = tag.GetTag("tag_int.", db, table, "default")
+				nameNoPrefix = strings.TrimPrefix(nameNoBackQuote, "tag_int.")
+			}
+			TagTranslatorStr := fmt.Sprintf(tagItem.TagTranslator, nameNoPrefix, nameNoPrefix)
+			stmts = append(stmts, &SelectTag{Value: TagTranslatorStr, Alias: selectTag})
+		} else if strings.HasPrefix(nameNoBackQuote, "custom_tag.") {
+			tagItem, ok = tag.GetTag("custom_tag.", db, table, "default")
+			nameNoPrefix := strings.TrimPrefix(nameNoBackQuote, "custom_tag.")
+			TagTranslatorStr := fmt.Sprintf(tagItem.TagTranslator, nameNoPrefix, nameNoPrefix)
+			stmts = append(stmts, &SelectTag{Value: TagTranslatorStr, Alias: selectTag})
+		} else if strings.Contains(nameNoBackQuote, ".") {
+			// Handle other tag types that contain dots
+			tagItem, ok = tag.GetTag("tag_string.", db, table, "default")
+			TagTranslatorStr := fmt.Sprintf(tagItem.TagTranslator, nameNoBackQuote, nameNoBackQuote)
+			stmts = append(stmts, &SelectTag{Value: TagTranslatorStr, Alias: selectTag})
 		} else {
 			stmts = append(stmts, &SelectTag{Value: name, Alias: alias})
 		}
@@ -108,14 +129,16 @@ func GetTagTranslator(name, alias string, e *CHEngine) ([]Statement, string, err
 	if !ok {
 		name := strings.Trim(name, "`")
 		// map item tag
-		nameNoPreffix, _, transKey := common.TransMapItem(name, table)
+		nameNoPrefix, _, transKey := common.TransMapItem(name, table)
 		if transKey != "" {
 			tagItem, _ = tag.GetTag(transKey, db, table, "default")
 			TagTranslatorStr := name
 			if strings.HasPrefix(name, "os.app.") || strings.HasPrefix(name, "k8s.env.") {
-				TagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPreffix)
+				TagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPrefix)
+			} else if strings.HasPrefix(name, common.BIZ_SERVICE_GROUP) {
+				TagTranslatorStr = tagItem.TagTranslator
 			} else {
-				TagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPreffix, nameNoPreffix, nameNoPreffix)
+				TagTranslatorStr = fmt.Sprintf(tagItem.TagTranslator, nameNoPrefix, nameNoPrefix, nameNoPrefix)
 			}
 			stmts = append(stmts, &SelectTag{Value: TagTranslatorStr, Alias: selectTag})
 		} else if slices.Contains(tag.AUTO_CUSTOM_TAG_NAMES, name) {
@@ -148,15 +171,29 @@ func GetTagTranslator(name, alias string, e *CHEngine) ([]Statement, string, err
 			} else {
 				tagItem, ok = tag.GetTag("attribute.", db, table, "default")
 			}
-			nameNoPreffix := strings.TrimPrefix(name, "tag.")
-			nameNoPreffix = strings.TrimPrefix(nameNoPreffix, "attribute.")
-			TagTranslatorStr := fmt.Sprintf(tagItem.TagTranslator, nameNoPreffix)
+			nameNoPrefix := strings.TrimPrefix(name, "tag.")
+			nameNoPrefix = strings.TrimPrefix(nameNoPrefix, "attribute.")
+			TagTranslatorStr := fmt.Sprintf(tagItem.TagTranslator, nameNoPrefix, nameNoPrefix)
 			stmts = append(stmts, &SelectTag{Value: TagTranslatorStr, Alias: selectTag})
 		}
 	} else {
 		// Only vtap_acl translate policy_id
 		if strings.Trim(name, "`") == "policy_id" && table != chCommon.TABLE_NAME_VTAP_ACL {
 			stmts = append(stmts, &SelectTag{Value: selectTag})
+		} else if strings.Trim(name, "`") == chCommon.TRACE_ID_TAG {
+			stmt := &SelectTag{}
+			// trace_id as trace_ids
+			if table == chCommon.TABLE_NAME_L7_FLOW_LOG {
+				stmt = &SelectTag{Value: tagItem.TagTranslator}
+				if alias == "" {
+					stmt.Alias = chCommon.TRACE_IDS_TAG
+				} else {
+					stmt.Alias = alias
+				}
+			} else {
+				stmt = &SelectTag{Value: name, Alias: alias}
+			}
+			stmts = append(stmts, stmt)
 		} else if name == "metrics" {
 			tagTranslator := ""
 			if db == "flow_log" || db == chCommon.DB_NAME_APPLICATION_LOG {
@@ -205,22 +242,22 @@ func GetPrometheusSingleTagTranslator(tag string, e *CHEngine) (string, string, 
 	table := e.Table
 	labelType := ""
 	TagTranslatorStr := ""
-	nameNoPreffix := strings.TrimPrefix(tag, "tag.")
+	nameNoPrefix := strings.TrimPrefix(tag, "tag.")
 	metricID, ok := trans_prometheus.ORGPrometheus[e.ORGID].MetricNameToID[table]
 	if !ok {
 		errorMessage := fmt.Sprintf("%s not found", table)
 		return "", "", common.NewError(common.RESOURCE_NOT_FOUND, errorMessage)
 	}
-	labelNameID, ok := trans_prometheus.ORGPrometheus[e.ORGID].LabelNameToID[nameNoPreffix]
+	labelNameID, ok := trans_prometheus.ORGPrometheus[e.ORGID].LabelNameToID[nameNoPrefix]
 	if !ok {
-		errorMessage := fmt.Sprintf("%s not found", nameNoPreffix)
+		errorMessage := fmt.Sprintf("%s not found", nameNoPrefix)
 		return "", "", errors.New(errorMessage)
 	}
 	// Determine whether the tag is app_label or target_label
 	isAppLabel := false
 	if appLabels, ok := trans_prometheus.ORGPrometheus[e.ORGID].MetricAppLabelLayout[table]; ok {
 		for _, appLabel := range appLabels {
-			if appLabel.AppLabelName == nameNoPreffix {
+			if appLabel.AppLabelName == nameNoPrefix {
 				isAppLabel = true
 				labelType = "app"
 				TagTranslatorStr = fmt.Sprintf("dictGet('flow_tag.app_label_map', 'label_value', (toUInt64(%d), toUInt64(app_label_value_id_%d)))", labelNameID, appLabel.AppLabelColumnIndex)
@@ -302,6 +339,8 @@ func (t *SelectTag) Format(m *view.Model) {
 		if t.Value == "packet_batch" {
 			m.AddCallback(t.Value, packet_batch.PacketBatchFormat([]interface{}{}))
 		}
+		if t.Alias == chCommon.TRACE_IDS_TAG {
+			m.AddCallback(t.Alias, TraceIDsToTraceID([]interface{}{}))
+		}
 	}
-
 }

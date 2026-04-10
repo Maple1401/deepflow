@@ -15,7 +15,7 @@
  */
 
 use std::{
-    fmt::{self, Display},
+    fmt,
     mem::swap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
@@ -25,8 +25,6 @@ use std::{
 use log::{error, warn};
 use serde::{Serialize, Serializer};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use super::super::ebpf::{MSG_REQUEST, MSG_REQUEST_END, MSG_RESPONSE, MSG_RESPONSE_END};
 use super::{
     decapsulate::TunnelType,
     enums::{CaptureNetworkType, EthernetType, IpProtocol, TcpFlags},
@@ -321,12 +319,14 @@ impl From<TunnelField> for flow_log::TunnelField {
 pub struct TcpPerfCountsPeer {
     pub retrans_count: u32,
     pub zero_win_count: u32,
+    pub ooo_count: u32,
 }
 
 impl TcpPerfCountsPeer {
     pub fn sequential_merge(&mut self, other: &TcpPerfCountsPeer) {
         self.retrans_count += other.retrans_count;
         self.zero_win_count += other.zero_win_count;
+        self.ooo_count += other.ooo_count;
     }
 }
 
@@ -335,6 +335,7 @@ impl From<TcpPerfCountsPeer> for flow_log::TcpPerfCountsPeer {
         flow_log::TcpPerfCountsPeer {
             retrans_count: p.retrans_count,
             zero_win_count: p.zero_win_count,
+            ooo_count: p.ooo_count,
         }
     }
 }
@@ -369,6 +370,8 @@ pub struct TcpPerfStats {
     pub retrans_syn_count: u32,
     #[serde(rename = "retrans_synack")]
     pub retrans_synack_count: u32,
+
+    pub fin_count: u32,
 
     #[serde(flatten, serialize_with = "serialize_tcp_perf_counts")]
     pub counts_peers: [TcpPerfCountsPeer; 2],
@@ -438,6 +441,7 @@ impl TcpPerfStats {
         self.counts_peers[0].sequential_merge(&other.counts_peers[0]);
         self.counts_peers[1].sequential_merge(&other.counts_peers[1]);
         self.total_retrans_count += other.total_retrans_count;
+        self.fin_count += other.fin_count;
     }
 
     pub fn reverse(&mut self) {
@@ -467,6 +471,7 @@ impl From<TcpPerfStats> for flow_log::TcpPerfStats {
             cit_max: p.cit_max,
             syn_count: p.syn_count,
             synack_count: p.synack_count,
+            fin_count: p.fin_count,
             ..Default::default()
         }
     }
@@ -546,6 +551,7 @@ pub struct L7Stats {
     // request-reponse time span
     pub time_span: u32,
     pub biz_type: u8,
+    pub is_reversed: bool,
 }
 
 #[derive(Serialize, Debug, Default, Clone, PartialEq, Eq)]
@@ -803,7 +809,6 @@ impl FlowMetricsPeer {
         self.l3_byte_count += other.l3_byte_count;
         self.l4_byte_count += other.l4_byte_count;
         self.packet_count += other.packet_count;
-
         self.total_byte_count = other.total_byte_count;
         self.total_packet_count = other.total_packet_count;
         self.first = other.first;
@@ -870,47 +875,7 @@ impl From<FlowMetricsPeer> for flow_log::FlowMetricsPeer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PacketDirection {
-    ClientToServer = FlowMetricsPeer::SRC,
-    ServerToClient = FlowMetricsPeer::DST,
-}
-
-impl PacketDirection {
-    pub fn reversed(&self) -> Self {
-        match self {
-            PacketDirection::ClientToServer => PacketDirection::ServerToClient,
-            PacketDirection::ServerToClient => PacketDirection::ClientToServer,
-        }
-    }
-}
-
-impl Default for PacketDirection {
-    fn default() -> PacketDirection {
-        PacketDirection::ClientToServer
-    }
-}
-
-impl Display for PacketDirection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ClientToServer => write!(f, "c2s"),
-            Self::ServerToClient => write!(f, "s2c"),
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-impl From<u8> for PacketDirection {
-    fn from(msg_type: u8) -> Self {
-        match msg_type {
-            MSG_REQUEST | MSG_REQUEST_END => Self::ClientToServer,
-            MSG_RESPONSE | MSG_RESPONSE_END => Self::ServerToClient,
-            _ => panic!("ebpf direction({}) unknown.", msg_type),
-        }
-    }
-}
+pub use public::enums::PacketDirection;
 
 #[derive(PartialEq, Eq, Debug, Clone, Hash, Copy)]
 pub struct HeartbeatAggrKey {
@@ -939,6 +904,8 @@ pub struct Flow {
     pub synack_seq: u32,
     pub last_keepalive_seq: u32,
     pub last_keepalive_ack: u32,
+
+    pub init_ipid: u32,
 
     #[serde(serialize_with = "timestamp_to_micros")]
     pub start_time: Timestamp,
@@ -1066,6 +1033,8 @@ impl Flow {
         if !other.request_domain.is_empty() {
             self.request_domain = other.request_domain.clone();
         }
+
+        self.reconcile_close_type_with_l7();
     }
 
     // FIXME 注意：由于FlowGenerator中TcpPerfStats在Flow方向调整之后才获取到，
@@ -1097,6 +1066,36 @@ impl Flow {
             && dst_tcp_flags.contains(TcpFlags::SYN_ACK)
     }
 
+    // Returns true when the flow already has at least one successful L7 response
+    // (response_count > 0 and no client/server errors recorded).
+    //
+    // This is used to distinguish RST-after-successful-L7 (e.g. health-check probes
+    // that use RST for fast teardown) from genuine mid-transfer client resets.
+    fn has_l7_successful_response(&self) -> bool {
+        match self.flow_perf_stats {
+            Some(ref perf) => {
+                perf.l7.response_count > 0
+                    && perf.l7.err_client_count == 0
+                    && perf.l7.err_server_count == 0
+            }
+            None => false,
+        }
+    }
+
+    fn reconcile_close_type_with_l7(&mut self) {
+        if self.flow_key.proto != IpProtocol::TCP {
+            return;
+        }
+        if self.close_type == CloseType::TcpClientRst
+            && !self.flow_metrics_peers[FlowMetricsPeer::DST as usize]
+                .total_tcp_flags
+                .contains(TcpFlags::RST)
+            && self.has_l7_successful_response()
+        {
+            self.close_type = CloseType::TcpFinClientRst;
+        }
+    }
+
     pub fn update_close_type(&mut self, flow_state: FlowState) {
         self.close_type = match flow_state {
             FlowState::Exception => CloseType::Unknown,
@@ -1115,15 +1114,19 @@ impl Flow {
             FlowState::Reset => {
                 if self.is_heartbeat() {
                     CloseType::TcpFinClientRst
+                } else if self.flow_metrics_peers[FlowMetricsPeer::DST as usize]
+                    .total_tcp_flags
+                    .contains(TcpFlags::RST)
+                {
+                    CloseType::TcpServerRst
+                } else if self.has_l7_successful_response() {
+                    // Client sent RST to close the connection, but L7 had already
+                    // completed a successful request-response exchange (e.g. an HTTP
+                    // health-check probe that uses RST for fast teardown instead of
+                    // FIN). Treat this as a normal close, not a client error.
+                    CloseType::TcpFinClientRst
                 } else {
-                    if self.flow_metrics_peers[FlowMetricsPeer::DST as usize]
-                        .total_tcp_flags
-                        .contains(TcpFlags::RST)
-                    {
-                        CloseType::TcpServerRst
-                    } else {
-                        CloseType::TcpClientRst
-                    }
+                    CloseType::TcpClientRst
                 }
             }
             FlowState::Syn1 | FlowState::ClientL4PortReuse => {
@@ -1166,7 +1169,7 @@ impl Flow {
                 );
                 CloseType::Unknown
             }
-        }
+        };
     }
 
     pub fn set_tap_side(
@@ -1179,14 +1182,7 @@ impl Flow {
         }
         // 链路追踪统计位置
         self.directions = get_direction(&*self, agent_type, cloud_gateway_traffic);
-
-        if self.directions[0] != Direction::None && self.directions[1] == Direction::None {
-            self.tap_side = self.directions[0].into();
-        } else if self.directions[0] == Direction::None && self.directions[1] != Direction::None {
-            self.tap_side = self.directions[1].into();
-        } else {
-            self.tap_side = TapSide::Rest;
-        }
+        self.tap_side = Direction::from(&self.directions).into();
     }
 
     // Currently acl_gids only saves the policy ID of pcap, but does not save the policy ID of NPB
@@ -1264,6 +1260,7 @@ impl From<Flow> for flow_log::Flow {
             acl_gids: f.acl_gids.into_iter().map(|g| g as u32).collect(),
             direction_score: f.direction_score as u32,
             request_domain: f.request_domain,
+            init_ipid: f.init_ipid,
         }
     }
 }
@@ -1637,4 +1634,81 @@ fn get_direction(
     }
 
     [src_direct, dst_direct]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flow_with_client_rst() -> Flow {
+        let mut flow = Flow::default();
+        flow.flow_key.proto = IpProtocol::TCP;
+        flow.flow_metrics_peers[FlowMetricsPeer::SRC as usize].total_tcp_flags = TcpFlags::RST;
+        flow
+    }
+
+    #[test]
+    fn reset_after_successful_l7_is_treated_as_normal_close() {
+        let mut flow = flow_with_client_rst();
+        let mut perf = FlowPerfStats::default();
+        perf.l7.response_count = 1;
+        flow.flow_perf_stats = Some(perf);
+
+        flow.update_close_type(FlowState::Reset);
+
+        assert_eq!(flow.close_type, CloseType::TcpFinClientRst);
+    }
+
+    #[test]
+    fn reset_after_l7_client_error_is_still_treated_as_client_reset() {
+        let mut flow = flow_with_client_rst();
+        let mut perf = FlowPerfStats::default();
+        perf.l7.response_count = 1;
+        perf.l7.err_client_count = 1;
+        flow.flow_perf_stats = Some(perf);
+
+        flow.update_close_type(FlowState::Reset);
+
+        assert_eq!(flow.close_type, CloseType::TcpClientRst);
+    }
+
+    #[test]
+    fn sequential_merge_forced_report_success_should_reclassify_client_reset() {
+        let mut flow = flow_with_client_rst();
+        flow.flow_id = 100;
+        flow.close_type = CloseType::ForcedReport;
+        let mut perf = FlowPerfStats::default();
+        perf.l7.response_count = 1;
+        flow.flow_perf_stats = Some(perf);
+
+        let mut closed = flow_with_client_rst();
+        closed.flow_id = 100;
+        closed.close_type = CloseType::TcpClientRst;
+        closed.flow_perf_stats = Some(FlowPerfStats::default());
+
+        flow.sequential_merge(&closed);
+
+        assert_eq!(flow.flow_perf_stats.as_ref().unwrap().l7.response_count, 1);
+        assert_eq!(flow.close_type, CloseType::TcpFinClientRst);
+    }
+
+    #[test]
+    fn sequential_merge_forced_report_client_error_should_keep_client_reset() {
+        let mut flow = flow_with_client_rst();
+        flow.flow_id = 101;
+        flow.close_type = CloseType::ForcedReport;
+        let mut perf = FlowPerfStats::default();
+        perf.l7.response_count = 1;
+        perf.l7.err_client_count = 1;
+        flow.flow_perf_stats = Some(perf);
+
+        let mut closed = flow_with_client_rst();
+        closed.flow_id = 101;
+        closed.close_type = CloseType::TcpClientRst;
+        closed.flow_perf_stats = Some(FlowPerfStats::default());
+
+        flow.sequential_merge(&closed);
+
+        assert_eq!(flow.close_type, CloseType::TcpClientRst);
+    }
 }

@@ -22,9 +22,9 @@ use std::{net::Ipv4Addr, time::Instant};
 use criterion::*;
 use deepflow_agent::{
     _L7PerfCache as L7PerfCache, _LogCache as LogCache, _LogCacheKey as LogCacheKey,
-    _LogMessageType as LogMessageType,
 };
 use lru::LruCache;
+use public::l7_protocol::LogMessageType;
 use rand::prelude::*;
 use uluru::LRUCache;
 
@@ -435,10 +435,9 @@ fn rrt_lru(c: &mut Criterion) {
                         ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
                     ),
                     LogCache {
-                        endpoint: None,
                         msg_type: LogMessageType::Request,
                         time: item.duration.as_micros() as u64,
-                        multi_merge_info: None,
+                        ..Default::default()
                     },
                 );
             }
@@ -464,10 +463,9 @@ fn rrt_lru(c: &mut Criterion) {
                         ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
                     ),
                     LogCache {
-                        endpoint: None,
                         msg_type: LogMessageType::Request,
                         time: item.duration.as_micros() as u64,
-                        multi_merge_info: None,
+                        ..Default::default()
                     },
                 );
             }
@@ -499,10 +497,9 @@ fn rrt_lru(c: &mut Criterion) {
                         ((item.flow_id as u128) << 64) | item.stream_id.unwrap_or_default() as u128,
                     ),
                     LogCache {
-                        endpoint: None,
                         msg_type: LogMessageType::Request,
                         time: item.duration.as_micros() as u64,
-                        multi_merge_info: None,
+                        ..Default::default()
                     },
                 );
             }

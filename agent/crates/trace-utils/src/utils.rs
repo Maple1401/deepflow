@@ -14,9 +14,23 @@
  * limitations under the License.
  */
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    ffi::{CStr, CString},
+    fs::File,
+    io,
+    os::unix::{fs::MetadataExt, io::AsRawFd},
+    sync::{Mutex, OnceLock},
+};
 
 use libc::{c_int, c_longlong, c_void};
+use log::debug;
+use nix::{
+    sched::setns,
+    sys::wait::{waitpid, WaitStatus},
+    unistd::{execve, fork, ForkResult},
+};
+use procfs::process::all_processes;
 
 #[derive(Default)]
 pub struct IdGenerator {
@@ -56,5 +70,244 @@ pub(crate) unsafe fn get_errno() -> i32 {
         } else {
             unimplemented!()
         }
+    }
+}
+
+static PROTECT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn global_lock() -> &'static Mutex<()> {
+    PROTECT_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Find the first process named "numad" in /proc and return its PID and executable path.
+///
+/// # Returns
+/// - `Ok((pid, exe_path))` if a "numad" process is found.
+/// - `Err(io::Error)` if no such process is found or if there is a failure reading /proc.
+fn find_numad_proc() -> io::Result<(i32, String)> {
+    for res in all_processes().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))? {
+        if let Ok(proc) = res {
+            if let Ok(stat) = proc.stat() {
+                if stat.comm == "numad" {
+                    if let Ok(exe) = proc.exe() {
+                        return Ok((proc.pid(), exe.to_string_lossy().to_string()));
+                    }
+                }
+            }
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "numad not found"))
+}
+
+/// Protect CPU affinity by preventing `numad` from interfering with the agent.
+///
+/// This function ensures that `numad` is instructed to exclude the current agent's CPU affinity,
+/// without affecting the agent's own process memory or threads.
+///
+/// Behavior:
+/// 1. Serializes access using a global mutex to avoid concurrent execution in multiple threads,
+///    since fork + multi-threaded environment is unsafe.
+/// 2. Finds the first running `numad` process (PID + absolute executable path).
+/// 3. Checks whether the current process is already in the same PID namespace as `numad`.
+///    - If in the same PID namespace, skips `setns` to avoid unnecessary namespace changes.
+///    - Otherwise, opens the `pid` and `mnt` namespace file descriptors of `numad`.
+/// 4. Forks a child process:
+///     - Child:
+///         - Enters `numad`'s PID/MNT namespaces (if different from self) using `setns`.
+///         - Immediately execs `numad -x <agent_pid>`.
+///         - Any failure in the child results in `_exit(code)` to prevent running destructors in the parent.
+///         - Unsafe operations are minimal: `setns` and `execve`.
+///     - Parent:
+///         - Drops namespace file descriptors immediately after fork.
+///         - Waits for child termination using `waitpid` and returns appropriate `io::Result`.
+///
+/// Safety considerations:
+/// - Mutex prevents simultaneous calls in multiple threads, ensuring fork + multi-thread safety.
+/// - Child uses `_exit` on failure to avoid destructor execution and potential deadlocks.
+/// - File descriptors are only used in the child for `setns`; parent drops them immediately.
+/// - If PID/MNT namespaces match, the agent itself is never replaced or modified.
+/// - Errors are propagated via `io::Result` for the caller to handle.
+///
+/// Note:
+/// - This function does not modify the agent's process memory or threads.
+/// - Only a short-lived child process may perform namespace changes and exec `numad`.
+pub fn protect_cpu_affinity() -> io::Result<()> {
+    let _guard = global_lock().lock().unwrap();
+
+    let (numad_pid, numad_exe) = find_numad_proc()?;
+    let agent_pid = std::process::id();
+
+    let self_pid_ns = std::fs::metadata("/proc/self/ns/mnt")?.ino();
+    let target_pid_ns = std::fs::metadata(format!("/proc/{}/ns/mnt", numad_pid))?.ino();
+
+    let need_setns = self_pid_ns != target_pid_ns;
+
+    // Fork a helper process to run `numad -x <agent_pid>` inside the proper namespaces.
+    //
+    // Safety:
+    // - `fork()` is unsafe because it only replicates the calling thread. We hold a global mutex
+    //   so no other threads call this concurrently.
+    // - In the child branch, only async-signal-safe functions are used (`setns`, `execve`, `_exit`).
+    // - Rust destructors are avoided in the child by immediately calling `_exit` on any failure.
+    unsafe {
+        match fork() {
+            Ok(ForkResult::Parent { child }) => {
+                // Parent drops any state; wait for child to finish.
+                match waitpid(child, None).map_err(|e| io::Error::new(io::ErrorKind::Other, e))? {
+                    WaitStatus::Exited(_, 0) => Ok(()),
+                    WaitStatus::Exited(_, code) => Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("helper exited with code {}", code),
+                    )),
+                    WaitStatus::Signaled(_, sig, _) => Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("helper killed by signal {:?}", sig),
+                    )),
+                    other => Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("unexpected wait status: {:?}", other),
+                    )),
+                }
+            }
+            Ok(ForkResult::Child) => {
+                if need_setns {
+                    // Since "numad" communicates via SysV message queues, the "ipc" namespace must also be included.
+                    // If the target process is in a different IPC namespace, then even if the PID and mount namespaces match,
+                    // System V message queues (msgget/msgrcv/msgsnd) cannot be shared.
+                    // Joining the same IPC namespace ensures that both processes can access the same
+                    // message queue identified by the common key (e.g., 0xdeadbeef).
+                    for ns in ["pid", "mnt", "ipc"] {
+                        let path = format!("/proc/{}/ns/{}", numad_pid, ns);
+                        let file = match File::open(&path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("failed to open {}: {}", path, e);
+                                libc::_exit(1);
+                            }
+                        };
+
+                        if let Err(e) = setns(&file, nix::sched::CloneFlags::empty()) {
+                            eprintln!("setns failed for {} (fd {}): {:?}", ns, file.as_raw_fd(), e);
+                            libc::_exit(1);
+                        }
+                    }
+                }
+
+                let prog = CString::new(numad_exe.clone()).unwrap_or_else(|_| libc::_exit(127));
+                let arg0 = CString::new(numad_exe).unwrap_or_else(|_| libc::_exit(127));
+                let arg1 = CString::new("-x").unwrap_or_else(|_| libc::_exit(127));
+                let arg2 = CString::new(agent_pid.to_string()).unwrap_or_else(|_| libc::_exit(127));
+
+                let argv = &[arg0.as_c_str(), arg1.as_c_str(), arg2.as_c_str()];
+                let envp: &[&std::ffi::CStr] = &[];
+
+                execve(&prog, argv, envp).unwrap_or_else(|e| {
+                    eprintln!("execve failed: {:?}", e);
+                    libc::_exit(127);
+                });
+                #[allow(unreachable_code)]
+                libc::_exit(127);
+            }
+            Err(e) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("fork failed: {}", e),
+            )),
+        }
+    }
+}
+
+#[repr(u8)]
+pub enum LogLevel {
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
+}
+
+impl From<LogLevel> for log::Level {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Error => log::Level::Error,
+            LogLevel::Warn => log::Level::Warn,
+            LogLevel::Info => log::Level::Info,
+            LogLevel::Debug => log::Level::Debug,
+            LogLevel::Trace => log::Level::Trace,
+        }
+    }
+}
+
+// levels:
+//   check the enums in src/ebpf/user/log.h
+//   - info: 0
+//   - error: 2
+//   - warn: 4
+//   other levels are ignored
+// msg/function_name/file_path should be null terminated utf8 strings or will be ignored
+// function_name and file_path can be nil
+// _function_name is ignored at the moment because file_name + line_number should be enough for debugging
+#[no_mangle]
+pub unsafe extern "C" fn rust_log_wrapper(
+    level: LogLevel,
+    error_number: libc::c_int,
+    msg: *const libc::c_char,
+    _function_name: *const libc::c_char,
+    file_path: *const libc::c_char,
+    line_number: libc::c_int,
+) {
+    if msg.is_null() {
+        debug!("msg is null");
+        return;
+    }
+    let msg = match CStr::from_ptr(msg).to_str() {
+        Ok(msg) => msg,
+        Err(e) => {
+            debug!("msg is not null terminated utf8 string: {e}");
+            return;
+        }
+    };
+
+    let err_msg = if error_number == 0 {
+        None
+    } else {
+        match CStr::from_ptr(libc::strerror(error_number)).to_str() {
+            Ok(err_msg) => Some(err_msg),
+            Err(e) => {
+                debug!("failed to convert strerror to string: {e}");
+                None
+            }
+        }
+    };
+
+    let file_path = if file_path.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(file_path).to_str() {
+            Ok(path) => Some(path),
+            Err(e) => {
+                debug!("file_path is not null terminated utf8 string: {e}");
+                None
+            }
+        }
+    };
+
+    let line_number = if line_number == 0 {
+        None
+    } else {
+        Some(line_number as u32)
+    };
+
+    let mut rb = log::Record::builder();
+    rb.target("libtrace")
+        .level(level.into())
+        .file(file_path)
+        .line(line_number);
+    // `format_args!` must be put into `args()` to avoid borrow checker issues as of rust 1.83
+    match err_msg {
+        Some(err_msg) => log::logger().log(
+            &rb.args(format_args!("{msg}: {err_msg} (errno {error_number})"))
+                .build(),
+        ),
+        None => log::logger().log(&rb.args(format_args!("{msg}")).build()),
     }
 }

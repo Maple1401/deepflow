@@ -18,20 +18,22 @@ use std::{fmt, mem, str};
 
 use serde::Serialize;
 
+use public::l7_protocol::LogMessageType;
+
 use crate::{
     common::{
         enums::IpProtocol,
         flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     config::handler::LogParserConfig,
     flow_generator::{
         error::{Error, Result},
         protocol_logs::{
             pb_adapter::{L7ProtocolSendLog, L7Request, L7Response},
-            AppProtoHead, L7ResponseStatus, LogMessageType, PacketDirection,
+            AppProtoHead, L7ResponseStatus, PacketDirection,
         },
     },
 };
@@ -188,6 +190,17 @@ impl TryFrom<&str> for Response {
     }
 }
 
+impl From<&Response> for L7ResponseStatus {
+    fn from(resp: &Response) -> Self {
+        match resp {
+            Response::NotFound => L7ResponseStatus::Unknown,
+            Response::ServerError => L7ResponseStatus::ServerError,
+            Response::Error | Response::ClientError => L7ResponseStatus::ClientError,
+            _ => L7ResponseStatus::Ok,
+        }
+    }
+}
+
 impl Response {
     pub fn is_matched(&self, cmd: &Command) -> bool {
         cmd.is_matched(self)
@@ -302,9 +315,9 @@ impl fmt::Display for MemcachedInfo {
 impl From<MemcachedInfo> for L7ProtocolSendLog {
     fn from(f: MemcachedInfo) -> Self {
         let flags = if f.is_tls() {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
 
         let mut log = L7ProtocolSendLog {
@@ -323,12 +336,7 @@ impl From<MemcachedInfo> for L7ProtocolSendLog {
         if let Some(resp) = f.response {
             log.resp = L7Response {
                 result: f.result,
-                status: match resp {
-                    Response::NotFound => L7ResponseStatus::Unknown,
-                    Response::ServerError => L7ResponseStatus::ServerError,
-                    Response::Error | Response::ClientError => L7ResponseStatus::ClientError,
-                    _ => L7ResponseStatus::Ok,
-                },
+                status: L7ResponseStatus::from(&resp),
                 exception: f.err_msg,
                 ..Default::default()
             };
@@ -337,16 +345,28 @@ impl From<MemcachedInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&MemcachedInfo> for LogCache {
+    fn from(info: &MemcachedInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info
+                .response
+                .map(|r| L7ResponseStatus::from(&r))
+                .unwrap_or_default(),
+            on_blacklist: info.is_on_blacklist,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct MemcachedLog {
-    perf_stats: Option<L7PerfStats>,
-    was_on_blacklist: bool,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 impl MemcachedLog {
     fn reset(&mut self) {
-        self.perf_stats = None;
-        self.was_on_blacklist = false;
+        self.perf_stats = vec![];
     }
 
     fn parse_commands(mut payload: &[u8]) -> Result<Vec<MemcachedInfo>> {
@@ -572,20 +592,22 @@ impl MemcachedLog {
 }
 
 impl L7ProtocolParserInterface for MemcachedLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
-        MemcachedLog::parse_commands(payload).is_ok()
+
+        if MemcachedLog::parse_commands(payload).is_ok() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
         let mut on_blacklist = false;
         let mut results = match param.direction {
             PacketDirection::ClientToServer => {
@@ -610,28 +632,20 @@ impl L7ProtocolParserInterface for MemcachedLog {
             });
         };
         let mut info_rrt = 0;
-        if !(on_blacklist || self.was_on_blacklist) {
-            match param.direction {
-                PacketDirection::ClientToServer => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req());
-                }
-                PacketDirection::ServerToClient => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp());
-                    if matches!(info.response, Some(Response::ServerError)) {
-                        self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                    }
-                }
+
+        self.perf_stats.clear();
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if let Some(stats) = info.perf_stats(param) {
+                info_rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
             }
-            info.cal_rrt(param, &None).map(|(rrt, _)| {
-                info_rrt = rrt;
-                self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-            });
+            self.perf_stats.push(perf_stat);
         }
         for info in results.iter_mut() {
             info.is_on_blacklist = on_blacklist;
             info.rrt = info_rrt;
         }
-        self.was_on_blacklist = on_blacklist;
         if param.parse_log {
             if results.len() == 1 {
                 Ok(L7ParseResult::Single(L7ProtocolInfo::MemcachedInfo(
@@ -662,8 +676,8 @@ impl L7ProtocolParserInterface for MemcachedLog {
         false
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -680,7 +694,7 @@ mod tests {
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
         flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/memcached";
@@ -709,7 +723,7 @@ mod tests {
 
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -719,7 +733,9 @@ mod tests {
             param.set_captured_byte(payload.len());
 
             let is_memcached = match packet.lookup_key.direction {
-                PacketDirection::ClientToServer => memcached.check_payload(payload, param),
+                PacketDirection::ClientToServer => {
+                    memcached.check_payload(payload, param).is_some()
+                }
                 PacketDirection::ServerToClient => MemcachedLog::parse_response(payload).is_ok(),
             };
 

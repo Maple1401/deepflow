@@ -18,6 +18,7 @@
 #include <arpa/inet.h>
 #include <sched.h>
 #include <signal.h>
+#include <sys/stat.h> // chmod()
 #include <sys/utsname.h>
 #include <sys/prctl.h>
 #include <linux/version.h>
@@ -46,6 +47,8 @@
 #include "extended/extended.h"
 #include "profile/perf_profiler.h"
 
+#include "deepflow_ebpfctl_bin.c"
+
 /*
  * Sleep duration (in seconds) before retrying CPU binding if it fails.
  * This is used when binding fails and no event-based wakeup is implemented.
@@ -63,6 +66,7 @@ char linux_release[128];	// Record the contents of 'uname -r'
  * Used to manage or inspect per-CPU kick threads.
  */
 kick_thread_info_t kick_threads[MAX_CPU_NR];
+static int32_t kick_kern_nice = KICK_KERN_NICE;
 volatile uint32_t *tracers_lock;
 extern volatile uint64_t sys_boot_time_ns;	// System boot time in nanoseconds
 volatile uint64_t prev_sys_boot_time_ns;	// The last updated system boot time, in nanoseconds
@@ -137,7 +141,6 @@ pthread_mutex_t match_pids_lock;
 // Used to store process IDs for matching various features
 pids_match_hash_t pids_match_hash;
 
-static int tracepoint_attach(struct tracepoint *tp);
 static int perf_reader_setup(struct bpf_perf_reader *perf_readerm,
 			     int thread_nr);
 static void perf_reader_release(struct bpf_perf_reader *perf_reader);
@@ -476,17 +479,47 @@ void free_all_readers(struct bpf_tracer *t)
 	}
 }
 
+ /*
+  * Perf uses a fixed page size defined by PERF_PAGE_DEF_SZ (usually 4KB)
+  * to manage shared memory buffers. However, the system's actual page size
+  * may differ (Some high-end ARM 64-bit platforms support larger page sizes,
+  * such as 16KB or 64KB). To correctly allocate kernel shared memory,
+  * the number of perf pages must be converted to the corresponding number
+  * of system pages.
+  */
+static unsigned int calc_kernel_page_cnt(unsigned int page_cnt)
+{
+	unsigned int perf_bytes = PERF_PAGE_DEF_SZ * page_cnt;
+	unsigned int system_page_sz = (unsigned int)sysconf(_SC_PAGESIZE);
+
+	// Calculate the required system pages using ceiling division
+	unsigned int kernel_page_cnt;
+	kernel_page_cnt = (perf_bytes + system_page_sz - 1) / system_page_sz;
+
+	// Ensure the system page count is greater than 1
+	// because the first page usually holds metadata
+	// and additional pages are required for data.
+	if (kernel_page_cnt <= 1) {
+		kernel_page_cnt = 2;
+	}
+
+	ebpf_info("Input pages: %u, system page size: %u bytes, required"
+		  " system pages: %u\n",
+		  page_cnt, system_page_sz, kernel_page_cnt);
+
+	return kernel_page_cnt;
+}
+
 /**
  * @brief create a perf buffer reader.
  * @param t Tracer address
  * @param The map_name Perf buffer map name
  * @param The raw_cb Perf reader raw data callback
- * @param Lost_cb perf reader data lost callback
- * @param Pages_cnt How many memory pages are used for ring-buffer
- *            (system page size * pages_cnt)
- * @param Thread_nr The number of threads required for the reader's work
- * @param Epoll_timeout perf epoll timeout
- * @return Perf_reader address on success, NULL on error
+ * @param lost_cb perf reader data lost callback
+ * @param pages_cnt How many memory pages are used for ring-buffer
+ * @param thread_nr The number of threads required for the reader's work
+ * @param epoll_timeout perf epoll timeout
+ * @return perf_reader address on success, NULL on error
  */
 struct bpf_perf_reader *create_perf_buffer_reader(struct bpf_tracer *t,
 						  const char *map_name,
@@ -518,7 +551,8 @@ struct bpf_perf_reader *create_perf_buffer_reader(struct bpf_tracer *t,
 		pages_cnt = 1 << min_log2((unsigned int)pages_cnt);
 
 	reader->tracer = t;
-	reader->perf_pages_cnt = pages_cnt;
+	// Adjust to system page count.
+	reader->perf_pages_cnt = calc_kernel_page_cnt(pages_cnt);
 	reader->epoll_timeout = epoll_timeout;
 
 	if (perf_reader_setup(reader, thread_nr))
@@ -571,7 +605,8 @@ int load_ebpf_object(struct ebpf_object *obj)
 	if (ret != 0) {
 		ebpf_warning("bpf load '%s' failed, error:%s (%d).\n",
 			     obj->name, strerror(errno), errno);
-		if (!strcmp(obj->name, "socket-trace-bpf-linux-kfunc")) {
+		if (!strcmp(obj->name, "socket-trace-bpf-linux-kfunc") ||
+		    !strcmp(obj->name, "socket-trace-bpf-linux-5.2_plus")) {
 			ebpf_info("Try other eBPF bytecode binaries ...\n");
 			release_object(obj);
 			return ret;
@@ -985,7 +1020,7 @@ int probe_detach(struct probe *p)
 	return ret;
 }
 
-static int tracepoint_attach(struct tracepoint *tp)
+int tracepoint_attach(struct tracepoint *tp)
 {
 	if (tp->link) {
 		return ETR_EXIST;
@@ -1004,7 +1039,7 @@ static int tracepoint_attach(struct tracepoint *tp)
 	return ETR_OK;
 }
 
-static int tracepoint_detach(struct tracepoint *tp)
+int tracepoint_detach(struct tracepoint *tp)
 {
 	if (tp->link == NULL) {
 		return ETR_NOTEXIST;
@@ -1193,6 +1228,9 @@ perf_event:
 		struct ebpf_object *obj = tracer->obj;
 		for (i = 0; i < obj->progs_cnt; i++) {
 			if (obj->progs[i].type == BPF_PROG_TYPE_PERF_EVENT) {
+				if (strcmp(obj->progs[i].sec_name, "perf_event") != 0) {
+					continue;
+				}
 				errno = 0;
 				int ret =
 				    program__attach_perf_event(obj->progs[i].
@@ -1603,13 +1641,23 @@ static int boot_time_update(void)
 	return ETR_OK;
 }
 
-/* 
+/*
  * Thread function to periodically trigger a kernel-related action.
  *
- * The kernel uses bundled bursts to send data to the user.  
- * The following method triggers a timeout check on all CPUs  
+ * The kernel uses bundled bursts to send data to the user.
+ * The following method triggers a timeout check on all CPUs
  * to push data residing in the eBPF buffer.
  */
+int set_kick_kern_nice(int32_t nice)
+{
+	if (nice < -20 || nice > 19)
+		return ETR_INVAL;
+
+	kick_kern_nice = nice;
+	ebpf_info("Set kick thread nice value to %d.\n", nice);
+	return 0;
+}
+
 static void *kick_kern_push_data(void *arg)
 {
 	int cpu_id = (int)((uintptr_t) arg);	// Extract CPU ID from the argument
@@ -1671,6 +1719,27 @@ retry_bind:
 		ebpf_warning("epoll_ctl failed: %s(%d)\n", strerror(errno),
 			     errno);
 		goto error;
+	}
+
+	/*
+	 * Keep the kick thread on the default SCHED_OTHER/CFS policy and adjust
+	 * only its Linux nice value.
+	 *
+	 * A smaller nice value gives the thread more scheduling preference under
+	 * CPU contention, while a larger value gives it less. Negative values may
+	 * require CAP_SYS_NICE or a sufficient RLIMIT_NICE.
+	 */
+	if (setpriority(PRIO_PROCESS, tid, kick_kern_nice) != 0) {
+		if (kick_kern_nice < 0 && (errno == EACCES || errno == EPERM)) {
+			ebpf_warning("Kick thread %d failed to set nice value %d and will continue with default CFS priority; CAP_SYS_NICE or RLIMIT_NICE may be required: %s(%d)\n",
+				     tid, kick_kern_nice, strerror(errno), errno);
+		} else {
+			ebpf_warning("Kick thread %d failed to set nice value %d and will continue with default CFS priority: %s(%d)\n",
+				     tid, kick_kern_nice, strerror(errno), errno);
+		}
+	} else {
+		ebpf_info("Kick thread %d set nice value %d.\n", tid,
+			  kick_kern_nice);
 	}
 
 	struct epoll_event events[1];
@@ -1748,7 +1817,7 @@ static void period_process_main(__unused void *arg)
 	// Ensure the extra_waiting_process of the server type executes first.
 	sleep(1);
 
-	ebpf_info("cpus_kick begin !!!\n");
+	ebpf_info("trigger_kern_adapt begin !!!\n");
 
 	memset((void *)ready_flag_cpus, 1, sizeof(ready_flag_cpus));
 
@@ -1961,6 +2030,29 @@ bool is_feature_matched(int feature, int pid, const char *path)
 			NULL, 0);
 	free(path_for_basename);
 	return !error;
+}
+
+bool is_feature_regex_set(int feature)
+{
+	if (feature < 0 || feature >= FEATURE_MAX) {
+		return false;
+	}
+	return cfg_feature_regex_array[feature].ok;
+}
+
+bool php_profiler_enabled(void)
+{
+	return is_feature_regex_set(FEATURE_PROFILE_PHP);
+}
+
+bool v8_profiler_enabled(void)
+{
+	return is_feature_regex_set(FEATURE_PROFILE_V8);
+}
+
+bool python_profiler_enabled(void)
+{
+	return is_feature_regex_set(FEATURE_PROFILE_PYTHON);
 }
 
 static void init_thread_ids(void)
@@ -2179,6 +2271,36 @@ int init_match_pids_hash(void)
 				    hash_memory_size);
 }
 
+static int ebpf_tools_install(void)
+{
+	// deeflow-ebpfctl generation.
+	if (access(CTLBIN_INSTALL_PATH, F_OK) == 0) {
+		if (unlink(CTLBIN_INSTALL_PATH) != 0) {
+			ebpf_warning("Delete %s failed, with %s "
+				     "(errno:%d)\n", CTLBIN_INSTALL_PATH,
+				     strerror(errno), errno);
+			return (-1);
+		}
+	}
+
+	if (gen_file_from_mem((const char *)deepflow_ebpfctl_bin,
+			      sizeof(deepflow_ebpfctl_bin),
+			      (const char *)CTLBIN_INSTALL_PATH)) {
+		ebpf_warning("deepflow-ebpfctl tool (%s) generate failed.\n",
+			     CTLBIN_INSTALL_PATH);
+		return (-1);
+	}
+
+	if (chmod(CTLBIN_INSTALL_PATH, 0755) < 0) {
+		ebpf_warning("file '%s' chmod failed. with %s (errno:%d)\n",
+			     CTLBIN_INSTALL_PATH, strerror(errno), errno);
+		return (-1);
+	}
+
+	ebpf_info("%s installed successfully.\n", CTLBIN_INSTALL_PATH);
+	return (0);
+}
+
 int bpf_tracer_init(const char *log_file, bool is_stdout)
 {
 	init_list_head(&extra_waiting_head);
@@ -2236,6 +2358,8 @@ int bpf_tracer_init(const char *log_file, bool is_stdout)
 		     MAX_CPU_NR, sys_cpus_count);
 		return ETR_INVAL;
 	}
+
+	ebpf_tools_install();
 
 	uint64_t real_time, monotonic_time;
 	real_time = gettime(CLOCK_REALTIME, TIME_TYPE_NAN);

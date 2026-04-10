@@ -3,8 +3,6 @@ syntax = "proto2";
 package agent;
 option go_package = "agent";
 
-import "common.proto";
-
 service Synchronizer {
     rpc Sync(SyncRequest) returns (SyncResponse) {}
     rpc Push(SyncRequest) returns (stream SyncResponse) {}
@@ -103,6 +101,8 @@ message SyncRequest {
     optional uint64 version_acls = 10 [default = 0];
     optional uint64 version_groups = 11 [default = 0];
     optional string current_k8s_image = 12;
+    optional CustomAppConfig custom_app_config = 13; // agent will only populate `version`
+    optional string exception_description = 14;
 
     optional string ctrl_ip = 21;
     optional string host = 22;      // 表示hostname，操作系统的原始主机名，注册和信息同步使用
@@ -124,6 +124,8 @@ message SyncRequest {
     optional string kubernetes_cluster_id = 45;    // 仅对容器类型的 agent 有意义
     optional string kubernetes_cluster_name = 46;  // 仅对容器类型的 agent 有意义
     optional string kubernetes_cluster_md5 = 47;  // 仅对容器类型的 agent 有意义
+
+    optional uint64 current_grpc_buffer_size = 50;  // Unit: Bytes
 }
 
 enum Status {
@@ -378,6 +380,17 @@ message DynamicConfig {
     optional string group_id = 22;
 }
 
+message CustomAppConfig {
+    optional uint64 version = 1; // config version, apply to whole message
+
+    optional bool compressed = 2; // whether configs are compressed with ZSTD
+
+    // config string that is one of:
+    // - UTF-8 encoded YAML
+    // - ZSTD compressed UTF-8 encoded YAML (if `compressed` is true)
+    optional bytes configs = 10;
+}
+
 message SyncResponse {
     optional Status status = 1;
     optional string user_config = 2;
@@ -404,6 +417,20 @@ message SyncResponse {
     repeated SkipInterface skip_interface = 15;
 
     optional DynamicConfig dynamic_config = 20;
+    optional CustomAppConfig custom_app_config = 21;
+
+    // When the controller determines that the agent needs to adjust `current_grpc_buffer_size`,
+    // this value is set to true. At this time, only the following fields in the message are valid:
+    // - status
+    // - user_config
+    // - revision
+    // - self_update_url
+    // - containers
+    // - dynamic_config
+    // - only_partial_fields
+    // - new_grpc_buffer_size
+    optional bool only_partial_fields = 30 [default = false];
+    optional uint64 new_grpc_buffer_size = 31;  // 0 indicates no adjustment needed. Unit: Bytes.
 }
 
 message UpgradeRequest {
@@ -552,6 +579,12 @@ message GenesisSyncResponse {
     optional uint64 version = 1 [default = 0];
 }
 
+message KubernetesAPIInfo {
+    optional string type = 1;
+    optional string info = 2;
+    optional bytes compressed_info = 3;
+}
+
 message KubernetesAPISyncRequest {
     optional string cluster_id = 1;
     optional uint64 version = 2;
@@ -559,7 +592,7 @@ message KubernetesAPISyncRequest {
     optional uint32 agent_id = 4;
     optional string source_ip = 5;
     optional string team_id = 6;  // agent team identity
-    repeated common.KubernetesAPIInfo entries = 10;
+    repeated KubernetesAPIInfo entries = 10;
 }
 
 message KubernetesAPISyncResponse {
@@ -782,7 +815,7 @@ message LinuxNamespace {
     optional string cmd = 5;
 }
 
-message CommandResult {
+message DataChunk {
     optional int32 errno = 1;
     optional bytes content = 2;
     // will only be populated in the last segment
@@ -796,6 +829,13 @@ enum ExecutionType {
     LIST_COMMAND = 0;
     LIST_NAMESPACE = 1;
     RUN_COMMAND = 2;
+    // Sending pcap to agent for biz protocol inferencing and biz decoding.
+    // Large pcap should be split into chunks in multiple `RemoteExecRequest`s (in `command_data`).
+    // Application protocol and server port can be specified in `params` with the following keys:
+    // - l7_protocol
+    // - server_port
+    // If protocol and server port are set, agent will not try to infer them.
+    DRY_REPLAY_PCAP = 3;
 }
 
 message Parameter {
@@ -813,6 +853,8 @@ message RemoteExecRequest {
     optional uint32 batch_len = 6 [default = 1048576]; // batch len of command execution results, min 1024
     optional string command_ident = 7;
 
+    optional DataChunk command_data = 10;
+
     optional uint32 command_id = 3; // deprecated, use `command_ident` instead
 }
 
@@ -825,5 +867,5 @@ message RemoteExecResponse {
 
     repeated RemoteCommand commands = 4;
     repeated LinuxNamespace linux_namespaces = 5;
-    optional CommandResult command_result = 6;
+    optional DataChunk command_result = 6;
 }

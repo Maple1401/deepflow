@@ -142,6 +142,9 @@ pub(super) struct InternalState {
 }
 
 impl BaseDispatcher {
+    pub(super) const LIVENESS_TIMEOUT_MS: u64 = 60_000;
+    pub(super) const LIVENESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
     pub(super) fn prepare_flow(
         meta_packet: &mut MetaPacket,
         tap_type: CaptureNetworkType,
@@ -302,7 +305,7 @@ impl BaseDispatcher {
         }
         while !leaky_bucket.acquire(1) {
             counter.get_token_failed.fetch_add(1, Ordering::Relaxed);
-            exception_handler.set(Exception::RxPpsThresholdExceeded);
+            exception_handler.set(Exception::RxPpsThresholdExceeded, None);
             thread::sleep(Duration::from_millis(1));
         }
 

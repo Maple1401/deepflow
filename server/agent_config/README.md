@@ -39,7 +39,7 @@ deepflow-agent uses cgroups to limit CPU usage.
 
 **Tags**:
 
-`hot_update`
+<mark>agent_restart</mark>
 
 **FQCN**:
 
@@ -64,6 +64,11 @@ global:
 **Description**:
 
 deepflow-agent uses cgroups to limit memory usage.
+
+Note:
+- Memory of the dedicated deepflow-agent is not limited
+- Memory limits for container deepflow-agent are enforced by container
+- Memory limits for container deepflow-agent in the same cluster need to be consistent
 
 ### Maximum Log Backhaul Rate {#global.limits.max_log_backhaul_rate}
 
@@ -704,8 +709,9 @@ global:
 **Description**:
 
 CPU affinity is the tendency of a process to run on a given CPU for as long as possible
-without being migrated to other processors. Invalid ID will be ignored. Currently only
-works for dispatcher threads. Example:
+without being migrated to other processors. Invalid ID will be ignored. The setting
+applies to existing deepflow-agent threads as well, except self-managed kick-kern.*
+eBPF threads. Example:
 ```yaml
 global:
   tunning:
@@ -716,7 +722,7 @@ global:
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -746,7 +752,7 @@ The smaller the value of process scheduling priority, the higher the priority of
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -841,7 +847,7 @@ Note:
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -905,6 +911,9 @@ global:
 
 Whether to synchronize the clock to the deepflow-server, this behavior
 will not change the time of the deepflow-agent running environment.
+
+Notice: Before enabling NTP, the controller needs to first start the NTP service. The agent will
+only continue to work after the time synchronization is complete.
 
 ### Maximum Drift {#global.ntp.max_drift}
 
@@ -1158,6 +1167,7 @@ of deepflow-agent outside the cluster is 30033.
 **Tags**:
 
 `hot_update`
+<mark>deprecated</mark>
 
 **FQCN**:
 
@@ -1345,7 +1355,7 @@ will set the log level to INFO for all modules and DEBUG for the rpc::session mo
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1665,7 +1675,7 @@ type in CLI environments.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1693,7 +1703,7 @@ The /proc fs mount path.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1721,14 +1731,14 @@ Synchronization interval for process Socket information.
 '0ns' means disabled, do not configure a value less than `1s` except for 0.
 
 Note: When enabling this feature, the specific process list must also be specified in `inputs.proc.process_matcher`,
-i.e., `inputs.proc.socket_info_sync_interval` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
+i.e., `proc.socket_list` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
 Additionally, ensure `inputs.proc.enabled` is configured to **true**.
 
 ### Minimal Lifetime {#inputs.proc.min_lifetime}
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1759,7 +1769,7 @@ Socket and Process will not be reported if their uptime is lower than this thres
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1806,7 +1816,7 @@ inputs:
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1835,7 +1845,7 @@ The user who should execute the `script_command` command.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1870,7 +1880,7 @@ The list of processe names ignored by process matcher.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -1893,7 +1903,35 @@ inputs:
     - enabled_features:
       - ebpf.profile.on_cpu
       - proc.gprocess_info
+      match_regex: \bjava( +\S+)* +-(?:cp|classpath) +\S+ +(?P<CLASS_NAME>[$_A-Za-z][$_0-9A-Za-z]*(?:\.[$_A-Za-z][$_0-9A-Za-z]*)*)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: ${CLASS_NAME}
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
       match_regex: \bpython(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $4
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \b(?:lua|luajit)(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)
+      match_type: cmdline_with_args
+      only_in_container: false
+      rewrite_name: $5
+    - enabled_features:
+      - ebpf.profile.on_cpu
+      - proc.gprocess_info
+      match_regex: \b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)
       match_type: cmdline_with_args
       only_in_container: false
       rewrite_name: $4
@@ -1971,7 +2009,7 @@ inputs:
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2000,7 +2038,7 @@ The regex of matcher.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2038,7 +2076,7 @@ The type of matcher.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2058,6 +2096,8 @@ inputs:
 | java | |
 | golang | |
 | python | |
+| lua | |
+| php | |
 | nodejs | |
 | dotnet | |
 
@@ -2074,7 +2114,7 @@ Default value `[]` match all languages.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2101,7 +2141,7 @@ Default value `[]` match all usernames.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2128,7 +2168,7 @@ Default value `true` means only match processes in container.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2157,7 +2197,7 @@ Default value `false` means match processes with or without tags.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2186,7 +2226,7 @@ Whether to ignore matched processes.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2215,7 +2255,7 @@ New name after matched.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -2234,14 +2274,14 @@ inputs:
 **Enum options**:
 | Value | Note                         |
 | ----- | ---------------------------- |
-| proc.gprocess_info | |
-| proc.golang_symbol_table | |
-| proc.socket_list | |
-| ebpf.socket.uprobe.golang | |
-| ebpf.socket.uprobe.tls | |
-| ebpf.profile.on_cpu | |
-| ebpf.profile.off_cpu | |
-| ebpf.profile.memory | |
+| proc.gprocess_info | Synchronize process resource information and inject process tags from the observation point into raw eBPF data |
+| proc.golang_symbol_table | Parse Golang-specific symbol tables to optimize profiling data when Golang processes prune the standard symbol table |
+| proc.socket_list | Synchronize active socket information of processes to inject process labels for both peers in application and network observation data |
+| ebpf.socket.uprobe.golang | Enable eBPF uprobe for Golang processes to trace goroutines and capture Golang HTTP/2 and HTTPS communications |
+| ebpf.socket.uprobe.tls | Enable eBPF uprobe for TLS communications to capture encrypted communication data from non-Golang processes |
+| ebpf.profile.on_cpu | Enable continuous On-CPU profiling |
+| ebpf.profile.off_cpu | Enable continuous Off-CPU profiling |
+| ebpf.profile.memory | Enable continuous memory profiling |
 
 **Schema**:
 | Key  | Value                        |
@@ -3524,12 +3564,18 @@ inputs:
 **Schema**:
 | Key  | Value                        |
 | ---- | ---------------------------- |
-| Type | int |
-| Range | [1, 65535] |
+| Type | string |
 
 **Description**:
 
 For the specified ports, consecutive TCP packets will be aggregated together for application log parsing.
+
+Example: 
+
+packet_segmentation_reassembly:
+- 1000
+- 2000-2010
+- 5000
 
 ### Physical Mirror Traffic {#inputs.cbpf.physical_mirror}
 
@@ -3776,6 +3822,11 @@ One can use the following method to determine whether an application process can
 - Use the command `cat /proc/<PID>/maps | grep "libssl.so"` to check if it contains
   information about openssl. If it does, it indicates that this process is using the
   openssl library.
+- If "libssl.so" is not found above, it may indicate that the program
+  is statically linked with OpenSSL. In that case, you can verify it by:
+  running the command `sudo nm /proc/<PID>/exe | grep SSL_write`.
+  If the output contains symbols such as `0000000000502ac0 T SSL_write`,
+  it means the process is using a statically linked OpenSSL library.
 
 After enabled, deepflow-agent will retrieve process information that
 matches the regular expression, hooking the corresponding encryption/decryption
@@ -3783,9 +3834,12 @@ interfaces of the openssl library. In the logs, you will encounter a message sim
 to the following:
 ```
 [eBPF] INFO openssl uprobe, pid:1005, path:/proc/1005/root/usr/lib64/libssl.so.1.0.2k
+OR
+[eBPF] INFO openssl uprobe, pid:28890, path:/proc/28890/root/usr/sbin/nginx
 ```
 
-Note: When enabling this feature, the specific process list must also be specified in `inputs.proc.process_matcher`,
+Note: When this feature is enabled, Envoy mTLS traffic can be automatically traced.
+For non-Envoy traffic, the specific process list must also be specified in `inputs.proc.process_matcher`,
 i.e., `ebpf.socket.uprobe.tls` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
 
 ##### DPDK {#inputs.ebpf.socket.uprobe.dpdk}
@@ -4087,6 +4141,80 @@ Use kprobe to collect data on ports that are not in the blacklist or whitelist.
 
 Example: `ports: 80,1000-2000`
 
+#### SockOps {#inputs.ebpf.socket.sock_ops}
+
+##### TCP Option Trace {#inputs.ebpf.socket.sock_ops.tcp_option_trace}
+
+###### TCP Option Tracing {#inputs.ebpf.socket.sock_ops.tcp_option_trace.enabled}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`inputs.ebpf.socket.sock_ops.tcp_option_trace.enabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      sock_ops:
+        tcp_option_trace:
+          enabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to enable the tcp-option tracing SockOps program, which injects DeepFlow metadata
+(for example, process PID) into a custom TCP option for eligible connections.
+Note: This feature requires cgroup v2 (unified hierarchy) and kernel > 5.10. On hosts
+using cgroup v1 the SockOps program will fail to attach and the agent will log a warning.
+Compatibility: validated on x86 with kernel > 5.10; on arm we have only tested with
+kernel 6.8 so far.
+Limitation: PID tracking relies on the per-CPU syscall map in. Under CPU congestion,
+softirqs handling TCP may run on a different CPU than the userspace thread, so the
+injected metadata can be missing or stale.
+
+###### PID Injection Window {#inputs.ebpf.socket.sock_ops.tcp_option_trace.sampling_window_bytes}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`inputs.ebpf.socket.sock_ops.tcp_option_trace.sampling_window_bytes`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      sock_ops:
+        tcp_option_trace:
+          sampling_window_bytes: 16384
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Unit | Bytes |
+| Range | [0, 1048576] |
+
+**Description**:
+
+Minimum number of TCP payload bytes between PID injections. Default 16KB matches the
+legacy behavior; smaller windows increase frequency, larger windows decrease it. Set to
+0 to disable sampling and inject on every eligible packet.
+
 #### Tunning {#inputs.ebpf.socket.tunning}
 
 ##### Max Capture Rate {#inputs.ebpf.socket.tunning.max_capture_rate}
@@ -4185,6 +4313,44 @@ degradation. This configuration only applies to maps of type 'BPF_MAP_TYPE_HASH'
 Currently applicable to socket trace and uprobe Golang/OpenSSL trace functionalities.
 Disabling memory preallocation will approximately reduce memory usage by 45MB.
 
+##### Enable the fentry/fexit feature {#inputs.ebpf.socket.tunning.fentry_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.socket.tunning.fentry_enabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      tunning:
+        fentry_enabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Explanation of Using fentry/fexit Features
+- Compared to traditional kprobes, fentry and fexit programs offer higher performance and
+  availability, providing approximately 5%-10% performance improvement.
+- Some Linux kernels do not fully support this feature, which may lead to kernel bugs and
+  node crashes. Known bug fixes include:
+  - Bug fix for TencentOS Linux kernel 5.4.119
+    [https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423](https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423)
+  - Bug fix for Alibaba Cloud Linux kernel 5.10.23
+    [https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861](https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861)
+- Kernel recommendation: To enable the fentry/fexit feature, it is recommended to use Linux
+  kernel 5.10.28 or later to ensure stability and performance.
+
 #### Preprocess {#inputs.ebpf.socket.preprocess}
 
 ##### OOOR Cache Size {#inputs.ebpf.socket.preprocess.out_of_order_reassembly_cache_size}
@@ -4206,7 +4372,7 @@ inputs:
   ebpf:
     socket:
       preprocess:
-        out_of_order_reassembly_cache_size: 16
+        out_of_order_reassembly_cache_size: 256
 ```
 
 **Schema**:
@@ -4269,7 +4435,40 @@ the agent's memory usage.
 
 Supported protocols: [https://www.deepflow.io/docs/features/l7-protocols/overview/](https://www.deepflow.io/docs/features/l7-protocols/overview/)
 
-Attention: use `HTTP2` for `gRPC` Protocol.
+Attention: configuring `HTTP2` or `gRPC` will enable both protocols.
+
+##### OOOR Timeout {#inputs.ebpf.socket.preprocess.out_of_order_reassembly_timeout}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.socket.preprocess.out_of_order_reassembly_timeout`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    socket:
+      preprocess:
+        out_of_order_reassembly_timeout: 100ms
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | duration |
+| Range | ['100ms', '1s'] |
+
+**Description**:
+
+When the OOOR cache data times out, it will be output directly. This parameter can be adjusted according to metric
+`deepflow_agent_ebpf_collect.metrics.time_backtrack_max`.
+
+Note: Increasing this value will consume more memory
 
 ##### SR Protocols {#inputs.ebpf.socket.preprocess.segmentation_reassembly_protocols}
 
@@ -4313,7 +4512,7 @@ multiple syscalls before parsing it. This enhances the success rate of applicati
 protocol parsing. Note that `out_of_order_reassembly_protocols` must also be enabled for
 this feature to be effective.
 Supported protocols: [https://www.deepflow.io/docs/features/l7-protocols/overview/](https://www.deepflow.io/docs/features/l7-protocols/overview/)
-Attention: use `HTTP2` for `gRPC` Protocol.
+Attention: configuring `HTTP2` or `gRPC` will enable both protocols.
 
 ### File {#inputs.ebpf.file}
 
@@ -4360,7 +4559,7 @@ Collection modes:
 - All: Indicates that all IO events are collected.
 
 Note:
-- To obtain the full file path, we need to combine it with the process's mount information. However, 
+- To obtain the full file path, we need to combine it with the process's mount information. However,
   some processes exit quickly after completing their tasks. When we attempt to process the file I/O
   data generated by such processes, the corresponding /proc/[pid]/mountinfo entry may no longer be
   available, resulting in incomplete paths (missing mount points). For processes with a lifetime
@@ -4397,6 +4596,38 @@ inputs:
 **Description**:
 
 Only collect IO events with delay exceeding this threshold.
+
+##### Virtual File Collection Enabled {#inputs.ebpf.file.io_event.enable_virtual_file_collect}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.file.io_event.enable_virtual_file_collect`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    file:
+      io_event:
+        enable_virtual_file_collect: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When set to true, the agent will collect file I/O events generated on
+virtual file systems (such as /proc, /sys, /run, and other kernel
+pseudo file systems).
+When set to false, the agent will not collect file I/O events from
+virtual file systems.
 
 ### Profile {#inputs.ebpf.profile}
 
@@ -4853,6 +5084,106 @@ inputs:
 Agent uses LRU cache to record process allocated addresses to avoid uncontrolled
 memory usage. Each record in this LRU is about 80B.
 
+##### Sort length {#inputs.ebpf.profile.memory.sort_length}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.sort_length`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        sort_length: 16384
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 65536] |
+
+**Description**:
+
+In order to match mallocs and frees, memory profiler will sort data by timestamp before processing.
+This parameter is the length of the sorted array.
+When configuring this option, first adjust the `sort_interval` parameter according to the instructions,
+and then refer to the agent performance statistics in `deepflow_agent_ebpf_memory_profiler`
+`dequeued_by_length` and `dequeued_by_interval` metrics, appropriately reduce this parameter
+while ensuring that the former is several times smaller than the latter.
+
+##### Sort interval {#inputs.ebpf.profile.memory.sort_interval}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.sort_interval`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        sort_interval: 1500ms
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | duration |
+| Range | ['1ns', '10s'] |
+
+**Description**:
+
+In order to match mallocs and frees, memory profiler will sort data by timestamp before processing.
+This parameter controls the max span of interval between the first and last item in the sorted array.
+Refer to agent performance statistics in `deepflow_agent_ebpf_memory_profiler`,
+making `time_backtracked` to 0. Configurion `sort_length` may also need to be increased.
+
+##### Queue Size {#inputs.ebpf.profile.memory.queue_size}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.memory.queue_size`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      memory:
+        queue_size: 32768
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [4096, 64000000] |
+
+**Description**:
+
+Memory profiler inner queue size.
+Refer to agent performance statistics in `deepflow_agent_ebpf_memory_profiler`,
+making `overwritten` to 0 and `pending` not exceeding this configuration.
+
 #### Preprocess {#inputs.ebpf.profile.preprocess}
 
 ##### Stack Compression {#inputs.ebpf.profile.preprocess.stack_compression}
@@ -4888,6 +5219,464 @@ memory usage, data transmission bandwidth consumption, and ingester's CPU overhe
 it also increases the CPU usage of the agent. Tests have shown that compressing the on-cpu
 function call stack of the deepflow-agent can reduce bandwidth consumption by `x` times, but
 it will result in an additional `y%` CPU usage for the agent.
+
+#### Language-specific Profiling {#inputs.ebpf.profile.languages}
+
+Control which interpreter languages to profile. Disabling unused languages can save ~5-6 MB memory per language.
+Total memory: ~17-20 MB (all enabled), ~6.1 MB (Python only), ~5.2 MB (PHP only), ~6.4 MB (Node.js only).
+
+##### Python profiling disabled {#inputs.ebpf.profile.languages.python_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.python_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        python_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable Python interpreter profiling. When disabled, Python process stack traces will not be collected,
+saving approximately 6.1 MB of kernel memory (python_tstate_addr_map, python_unwind_info_map, python_offsets_map).
+
+##### PHP profiling disabled {#inputs.ebpf.profile.languages.php_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.php_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        php_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable PHP interpreter profiling. When disabled, PHP process stack traces will not be collected,
+saving approximately 5.2 MB of kernel memory (php_unwind_info_map, php_offsets_map).
+
+##### Node.js profiling disabled {#inputs.ebpf.profile.languages.nodejs_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.profile.languages.nodejs_disabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    profile:
+      languages:
+        nodejs_disabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Disable Node.js (V8) interpreter profiling. When disabled, Node.js process stack traces will not be collected,
+saving approximately 6.4 MB of kernel memory (v8_unwind_info_map).
+
+### Network {#inputs.ebpf.network}
+
+#### NIC optimization Enabled {#inputs.ebpf.network.nic_opt_enabled}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_opt_enabled`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_opt_enabled: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to enable NIC optimization for enhanced multi-core packet
+processing and burst traffic resilience.
+
+When enabled, the system applies a combination of:
+  - RSS hardware queue configuration
+  - RX ring descriptor size tuning
+  - IRQ (interrupt) CPU affinity binding
+  - Optional XDP CPUMAP-based CPU redirection
+
+This optimization mitigates scenarios where RSS hardware cannot hash
+inner headers of encapsulated traffic (e.g., GRE, Double VLAN,
+VXLAN, ERSPAN), which may otherwise cause traffic to be concentrated
+on a single CPU core and lead to packet drops or performance bottlenecks.
+
+RX ring tuning improves burst handling capability by increasing
+the number of descriptors available for packet reception, reducing
+the likelihood of ring overflow under high traffic conditions.
+
+When XDP CPU redirect is enabled, packets are redistributed in
+software across multiple CPU cores after initial reception,
+providing better load balancing beyond hardware RSS capabilities.
+
+Recommended to enable this feature when:
+  1) Traffic on the interface consists primarily of encapsulated
+     packets (e.g., verified via tcpdump showing GRE, Double VLAN,
+     VXLAN, etc.).
+  2) One CPU core shows near 100% softirq utilization (e.g.,
+     observed via `top` with per-CPU view), while other CPUs
+     remain underutilized.
+
+For optimal performance, IRQ CPUs and XDP redirect CPUs should be
+configured on the same NUMA node as the physical NIC.
+
+#### NIC Optimize {#inputs.ebpf.network.nic_optimize}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - interface: ''
+        irq_cpu_list: ''
+        rss_channel_count: 0
+        rx_ring_size: 0
+        xdp_cpu_redirect: false
+        xdp_cpu_redirect_list: ''
+        xdp_queue_size: 2048
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**Description**:
+
+Configure NIC-level performance optimizations for specific interfaces.
+
+This feature improves packet processing scalability and burst handling
+by tuning hardware RSS queues, interrupt CPU affinity, RX ring size,
+and optional XDP CPUMAP-based CPU redirection.
+
+Recommended when:
+  - Traffic is primarily encapsulated (GRE, Double VLAN, VXLAN, ERSPAN).
+  - One CPU shows near 100% softirq usage while others are idle.
+
+To achieve better performance, the program will automatically disable the
+irqbalance service to prevent network interface interrupts from migrating
+between CPUs.
+
+Multiple NIC optimize entries can be configured for different interfaces.
+
+Example:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_opt_enabled: true
+      nic_optimize:
+      - interface: eth0
+        rx_ring_size: 4096
+        rss_channel_count: 2
+        irq_cpu_list: 1,2
+        xdp_cpu_redirect: true
+        xdp_queue_size: 2048
+        xdp_cpu_redirect_list: 4,5,6,7
+      - interface: eth1
+        rx_ring_size: 4096
+        rss_channel_count: 2
+        irq_cpu_list: 1,2
+        xdp_cpu_redirect: true
+        xdp_queue_size: 2048
+        xdp_cpu_redirect_list: 4,5,6,7
+```
+
+##### Interface {#inputs.ebpf.network.nic_optimize.interface}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.interface`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - interface: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+Name of the network interface to optimize.
+
+##### RX Ring Size {#inputs.ebpf.network.nic_optimize.rx_ring_size}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.rx_ring_size`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - rx_ring_size: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Number of RX descriptors in NIC receive ring.
+
+Increasing this value improves burst traffic buffering
+and reduces packet drops caused by ring overflow.
+Specifically, use `ethtool -g <iface>` to check the current
+configuration, and adjust to an appropriate value based on your workload.
+
+0 (default) means keep the original state and ignore this setting.
+
+##### RSS Channel Count {#inputs.ebpf.network.nic_optimize.rss_channel_count}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.rss_channel_count`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - rss_channel_count: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Number of hardware RSS queues.
+Determines how many queues packets are distributed to after
+hardware hash calculation.
+
+Maximum supported value is typically 16 and must not exceed
+the number of logical CPU cores.
+Specifically, use `ethtool -l <iface>` to check the current configuration
+and adjust to an appropriate value based on your workload.
+
+When XDP CPU redirect is enabled, it is recommended to set this to 1.
+0 (default) means keep the original state and ignore this setting.
+
+##### Hardware IRQ CPU List {#inputs.ebpf.network.nic_optimize.irq_cpu_list}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.irq_cpu_list`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - irq_cpu_list: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+CPU ID or comma-separated CPU list used for handling NIC interrupts.
+
+Recommended to match the number of RSS queues.
+If XDP CPU redirect is enabled, only one CPU is required.
+
+Value can be:
+  - Specific CPU list (e.g., 2,4,6)
+  - "local" (auto match CPUs in local NUMA node)
+
+CPUs should be located on the same NUMA node as the NIC.
+
+##### Enable XDP CPU Redirect {#inputs.ebpf.network.nic_optimize.xdp_cpu_redirect}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_cpu_redirect`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_cpu_redirect: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Enable XDP CPUMAP redirect to redistribute packets across CPUs
+in software.
+
+Useful when hardware RSS cannot distribute encapsulated traffic
+(e.g., Double VLAN, ERSPAN) evenly across CPUs, resulting in
+single-core overload and packet drops.
+
+##### XDP Queue Size {#inputs.ebpf.network.nic_optimize.xdp_queue_size}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_queue_size`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_queue_size: 2048
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Size of the XDP CPUMAP queue.
+
+Valid range: [512, 8192]. Powers of two are recommended.
+
+Larger values improve burst tolerance but consume more memory.
+
+##### XDP Redirect CPU List {#inputs.ebpf.network.nic_optimize.xdp_cpu_redirect_list}
+
+**Tags**:
+
+<mark></mark>
+
+**FQCN**:
+
+`inputs.ebpf.network.nic_optimize.xdp_cpu_redirect_list`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    network:
+      nic_optimize:
+      - xdp_cpu_redirect_list: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+CPU list used for processing packets after XDP redirection.
+
+Format example: 4,6,8
 
 ### Tunning {#inputs.ebpf.tunning}
 
@@ -4956,6 +5745,49 @@ The number of worker threads refers to how many threads participate
 in data processing in user-space. The actual maximal value is the number
 of CPU logical cores on the host.
 
+#### Kick Thread Nice Value {#inputs.ebpf.tunning.kick_kern_nice}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`inputs.ebpf.tunning.kick_kern_nice`
+
+**Default value**:
+```yaml
+inputs:
+  ebpf:
+    tunning:
+      kick_kern_nice: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [-20, 19] |
+
+**Description**:
+
+Controls the Linux nice value of per-CPU kick threads.
+
+These threads wake up after the periodic timer expires and issue a
+lightweight syscall to trigger kernel-side timeout checks that flush
+batched eBPF data.
+
+Pay attention to this option when `metrics.period_push_max_delay`
+under `deepflow_tenant -> deepflow_agent_ebpf_collector` in Metrics
+Center reaches 199 ms. This means the periodic push delay has hit
+the exceeded marker, and the value can be decreased appropriately to
+give the kick threads more scheduling preference.
+
+Smaller nice values mean higher scheduling preference. Larger nice
+values mean lower scheduling preference. Valid values range from
+-20 to 19. A negative value may require CAP_SYS_NICE or a sufficient
+RLIMIT_NICE. This can still affect other workloads.
+
 #### Perf Pages Count {#inputs.ebpf.tunning.perf_pages_count}
 
 **Tags**:
@@ -4988,6 +5820,7 @@ The number of page occupied by the shared memory of the kernel. The
 value is `2^n (5 <= n <= 13)`. Used for perf data transfer. If the
 value is between `2^n` and `2^(n+1)`, it will be automatically adjusted
 by the ebpf configurator to the minimum value `2^n`.
+The page size is 4 KB.
 
 #### Kernel Ring Size {#inputs.ebpf.tunning.kernel_ring_size}
 
@@ -5856,7 +6689,7 @@ inputs:
 **Description**:
 
 Whether to enable receiving external data sources such as Prometheus,
-Telegraf, OpenTelemetry, and SkyWalking.
+Telegraf, OpenTelemetry, SkyWalking and Vector.
 
 ### Listen Port {#inputs.integration.listen_port}
 
@@ -6244,13 +7077,21 @@ sources:
     scrape_interval_secs: 10
     namespace: node
 transforms:
+  host_process_filter:
+    type: filter
+    condition: '!starts_with(string!(.name), "process_")'
+    inputs:
+    - host_metrics
   host_metrics_relabel:
     type: remap
     inputs:
-    - host_metrics
+    - host_process_filter
     source: |
       .tags.instance = "${K8S_NODE_IP_FOR_DEEPFLOW}"
-      .tags.host = "${K8S_NODE_NAME_FOR_DEEPFLOW}"
+      host_name, _ = get_env_var("K8S_NODE_NAME_FOR_DEEPFLOW")
+      if !is_empty(host_name) {
+        .tags.host = host_name
+      }
       metrics_map = {
         "boot_time": "boot_time_seconds",
         "memory_active_bytes": "memory_Active_bytes",
@@ -6334,7 +7175,7 @@ transforms:
     type: filter
     inputs:
     - cadvisor_metrics
-    condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)|container_spec.*')"
+    condition: "!match(string!(.name), r'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)|container_fs_(io_current|io_time_seconds_total|io_time_weighted_seconds_total|reads_merged_total|sector_reads_total|sector_writes_total|writes_merged_total)|container_memory_(mapped_file|swap)|container_(file_descriptors|tasks_state|threads_max)')"
   kubelet_relabel_filter:
     type: filter
     inputs:
@@ -6806,6 +7647,36 @@ processors:
 The length of the following queues:
 - 1-mini-meta-packet-to-pcap
 
+#### Sender Queue Size {#processors.packet.pcap_stream.sender_queue_size}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.packet.pcap_stream.sender_queue_size`
+
+**Default value**:
+```yaml
+processors:
+  packet:
+    pcap_stream:
+      sender_queue_size: 8192
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [4096, 64000000] |
+
+**Description**:
+
+The length of the following queues:
+- 2-pcap-batch-to-sender
+
 #### Buffer Size Per Flow {#processors.packet.pcap_stream.buffer_size_per_flow}
 
 **Tags**:
@@ -7052,6 +7923,100 @@ deepflow-agent will mark the application protocol for each
 changes, the validity period after successfully identifying the protocol will be
 limited to this value.
 
+#### Inference whitelist {#processors.request_log.application_protocol_inference.inference_whitelist}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list:
+        - 15001
+        - 15006
+        process_name: envoy
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | dict |
+
+**Description**:
+
+Application protocol port whitelist, currently only supports eBPF traffic. When eBPF data is on the whitelist,
+the application table is no longer used to query the application protocol. The corresponding application protocol
+is obtained by polling all currently supported protocols. Having too much data on the whitelist greatly reduces the
+processing performance of eBPF data.
+
+Configuration Key:
+- process_name: Process name, regular expressions are not supported
+- port_list: Port Whitelist
+
+##### Process name {#processors.request_log.application_protocol_inference.inference_whitelist.process_name}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.process_name`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - process_name: ''
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+Process name
+
+##### Port list {#processors.request_log.application_protocol_inference.inference_whitelist.port_list}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.inference_whitelist.port_list`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      inference_whitelist:
+      - port_list: []
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+
+**Description**:
+
+Port list
+
 #### Enabled Protocols {#processors.request_log.application_protocol_inference.enabled_protocols}
 
 **Tags**:
@@ -7193,6 +8158,274 @@ processors:
 Due to the response with data id 0x04 has different struct in
 different version, it may has one byte before row affect.
 
+##### ISO8583 {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583}
+
+###### Value Translation {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.translation_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.translation_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          translation_enabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to perform field value translation.
+
+###### PAN Obfuscate {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.pan_obfuscate}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.pan_obfuscate`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          pan_obfuscate: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to obfuscate the Primary Account Number (PAN).
+
+###### Extract Fields {#processors.request_log.application_protocol_inference.protocol_special_config.iso8583.extract_fields}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.iso8583.extract_fields`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        iso8583:
+          extract_fields: 2,7,11,32,33
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | string |
+
+**Description**:
+
+Extracted fields are displayed in `data native tags`.
+  - Example: `extract_fields: 0,2-33`
+Field Reference:
+
+| Field No. | Description |
+|-----------|-------------|
+| 0   | Message Type Identifier (MTI) |
+| 1   | Bitmap |
+| 2   | Primary Account Number (PAN) |
+| 3   | Processing Code |
+| 4   | Amount, Transaction |
+| 5   | Amount, Settlement |
+| 6   | Amount, Cardholder Billing |
+| 7   | Transmission Date & Time |
+| 9   | Conversion Rate, Settlement |
+| 10  | Conversion Rate, Cardholder Billing |
+| 11  | System Trace Audit Number (STAN) |
+| 12  | Local Transaction Time |
+| 13  | Local Transaction Date |
+| 14  | Expiration Date |
+| 15  | Settlement Date |
+| 16  | Conversion Date |
+| 18  | Merchant Type |
+| 19  | Acquiring Institution Country Code |
+| 22  | POS Entry Mode Code |
+| 23  | Card Sequence Number |
+| 25  | POS Condition Code |
+| 26  | POS PIN Capture Code |
+| 28  | Transaction Fee |
+| 32  | Acquiring Institution Identification Code |
+| 33  | Forwarding Institution Identification Code |
+| 35  | Track 2 Data |
+| 36  | Track 3 Data |
+| 37  | Retrieval Reference Number (RRN) |
+| 38  | Authorization Identification Response |
+| 39  | Response Code |
+| 41  | Card Acceptor Terminal ID |
+| 42  | Card Acceptor ID Code |
+| 43  | Card Acceptor Name/Location |
+| 44  | Additional Response Data |
+| 45  | Track 1 Data |
+| 48  | Additional Data – Private |
+| 49  | Currency Code, Transaction |
+| 50  | Currency Code, Settlement |
+| 51  | Currency Code, Cardholder Billing |
+| 52  | PIN Data |
+| 53  | Security Related Control Information |
+| 54  | Additional Amounts (Balance) |
+| 55  | ICC Data (EMV Data) |
+| 56  | Additional Data |
+| 57  | Additional Transaction Data |
+| 59  | Detail Data / Reserved for National Use |
+| 60  | Reserved for Private Use |
+| 61  | Cardholder Authentication Information |
+| 62  | Switch Data |
+| 63  | Network Data |
+| 70  | Network Management Information Code |
+| 90  | Original Data Elements |
+| 96  | Message Security Code |
+| 100 | Receiving Institution Identification Code |
+| 102 | Account Identification 1 |
+| 103 | Account Identification 2 |
+| 104 | Additional Data |
+| 113 | Additional Data |
+| 116 | Additional Data |
+| 117 | Additional Data |
+| 121 | Reserved by China UnionPay (CUPS) |
+| 122 | Reserved for Acquirer |
+| 123 | Reserved for Issuer |
+| 125 | Additional Data |
+| 126 | Additional Data |
+| 128 | Message Authentication Code (MAC) |
+
+##### WebSphereMQ {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq}
+
+###### Parse XML {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.parse_xml_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.parse_xml_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          parse_xml_enabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Whether to parse XML.
+
+###### Decompress Payload {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.decompress_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.decompress_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          decompress_enabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Some web_sphere_mq messages use zlib compression. When this option is enabled,
+the agent will decompress the data packets during parsing.
+
+###### Attribute Field Filter {#processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.filter_attributes_enabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.web_sphere_mq.filter_attributes_enabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        web_sphere_mq:
+          filter_attributes_enabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+Enabling this option will cause the agent to retain only the following fields in the XML during parsing, reducing data storage.
+- Document.ComConf.ConfInf.MT
+- Document.ComConf.ConfInf.MsgId
+- Document.ComConf.ConfInf.MsgPrcCd
+- Document.ComConf.ConfInf.MsgRefId
+- Document.ComConf.ConfInf.OrigSndDt
+- Document.ComConf.ConfInf.OrigSndr
+- Document.ComuCnfm.MsgId
+- Document.ComuCnfm.MsgProCd
+- Document.ComuCnfm.MsgRefId
+- Document.ComuCnfm.MsgTp
+- Document.ComuCnfm.OrigSndDt
+- Document.ComuCnfm.OrigSndr
+
 ##### MySQL {#processors.request_log.application_protocol_inference.protocol_special_config.mysql}
 
 ###### Decompress MySQL Payload {#processors.request_log.application_protocol_inference.protocol_special_config.mysql.decompress_payload}
@@ -7226,6 +8459,35 @@ Some MySQL packets have payload compressed with LZ77 algorithm. Enable this opti
 Set to false to disable decompression for better performance.
 ref: [MySQL Source Code Documentation](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression.html)
 
+###### Endpoint Disabled {#processors.request_log.application_protocol_inference.protocol_special_config.mysql.endpoint_disabled}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.application_protocol_inference.protocol_special_config.mysql.endpoint_disabled`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    application_protocol_inference:
+      protocol_special_config:
+        mysql:
+          endpoint_disabled: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+After turning it off, the actions and table names in the SQL statement will not be extracted into the endpoint.
+
 ##### Grpc {#processors.request_log.application_protocol_inference.protocol_special_config.grpc}
 
 ###### Enable gRPC stream data {#processors.request_log.application_protocol_inference.protocol_special_config.grpc.streaming_data_enabled}
@@ -7258,12 +8520,11 @@ processors:
 When enabled, all gRPC packets are considered to be of the `stream` type, and the `data` will be reported,
 and the rrt calculation of the response will use the `grpc-status` field.
 
-#### custom protocol parsing {#processors.request_log.application_protocol_inference.custom_protocols}
+#### Custom Protocol Parsing {#processors.request_log.application_protocol_inference.custom_protocols}
 
 **Tags**:
 
-<mark>agent_restart</mark>
-<mark>ee_feature</mark>
+<mark></mark>
 
 **FQCN**:
 
@@ -7284,24 +8545,7 @@ processors:
 
 **Description**:
 
-Custom protocol parsing configuration, which can be used to parse custom protocols through simple rules.
-Example:
-```yaml
-- protocol_name: "your_protocol_name" # Protocol name, corresponding to l7_flow_log.l7_protocol_str
-  pre_filter:
-    port_list: 1-65535 # Pre-filter port, which can improve parsing performance
-  request_characters:  # Multiple features are ORed
-    - character: # Multiple match_keywords are ANDed
-      - match_keyword: abc  # Feature string
-        match_type: "string" # Possible values: "string", "hex"
-        match_ignore_case: false # wheather ignore case when match keywords, when match_type == string effected, default: false
-        match_from_beginning: false # Whether to match from the beginning of the payload
-  response_characters:
-    - character:
-      - match_keyword: 0123af
-        match_type: "hex"
-        match_from_beginning: false
-```
+deprecated
 
 ### Filters {#processors.request_log.filters}
 
@@ -7330,6 +8574,7 @@ processors:
         FastCGI: 1-65535
         HTTP: 1-65535
         HTTP2: 1-65535
+        ISO8583: 1-65535
         Kafka: 1-65535
         MQTT: 1-65535
         Memcached: 11211
@@ -7347,6 +8592,7 @@ processors:
         SomeIP: 1-65535
         TLS: 443,6443
         Tars: 1-65535
+        WebSphereMQ: 1-65535
         ZMTP: 1-65535
         bRPC: 1-65535
 ```
@@ -7401,6 +8647,7 @@ processors:
         FastCGI: []
         HTTP: []
         HTTP2: []
+        ISO8583: []
         Kafka: []
         MQTT: []
         Memcached: []
@@ -7418,6 +8665,7 @@ processors:
         SomeIP: []
         TLS: []
         Tars: []
+        WebSphereMQ: []
         ZMTP: []
         bRPC: []
         gRPC: []
@@ -7616,7 +8864,7 @@ Match field value.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -7945,6 +9193,36 @@ it to empty.
 If multiple values are specified, the first match will be used.
 Fields rewritten by plugins have the highest priority.
 
+##### Multiple TraceID Collection {#processors.request_log.tag_extraction.tracing_tag.multiple_trace_id_collection}
+
+**Tags**:
+
+`hot_update`
+<mark>ee_feature</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.tracing_tag.multiple_trace_id_collection`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      tracing_tag:
+        multiple_trace_id_collection: true
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When configured as `false`, only one TraceID is collected.
+When configured as `true`, multiple TraceIDs will be collected.
+
 ##### APM TraceID {#processors.request_log.tag_extraction.tracing_tag.apm_trace_id}
 
 **Tags**:
@@ -7981,6 +9259,42 @@ setting it to empty.
 If multiple values are specified, the first match will be used.
 Fields rewritten by plugins have the highest priority.
 
+Supports extracting the trace id from the following headers, in the following format:
+- traceparent: 00-TRACEID-SPANID-01
+- sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+- sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+- sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+- uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+- b3: TRACEID-SPANID-1
+
+##### Copy APM TraceID {#processors.request_log.tag_extraction.tracing_tag.copy_apm_trace_id}
+
+**Tags**:
+
+`hot_update`
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.tracing_tag.copy_apm_trace_id`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      tracing_tag:
+        copy_apm_trace_id: false
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | bool |
+
+**Description**:
+
+When set to true, the APM TraceID will be copied to the attribute.apm_trace_id field.
+
 ##### APM SpanID {#processors.request_log.tag_extraction.tracing_tag.apm_span_id}
 
 **Tags**:
@@ -8016,6 +9330,14 @@ in multiple values separated by commas. This feature can be turned off by
 setting it to empty.
 If multiple values are specified, the first match will be used.
 Fields rewritten by plugins have the highest priority.
+
+Supports extracting the span id from the following headers, in the following format:
+- traceparent: 00-TRACEID-SPANID-01
+- sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+- sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+- sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+- uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+- b3: TRACEID-SPANID-1
 
 #### HTTP Endpoint {#processors.request_log.tag_extraction.http_endpoint}
 
@@ -8275,12 +9597,11 @@ processors:
 
 Field name.
 
-#### Custom Fields Policies {#processors.request_log.tag_extraction.custom_field_policies}
+#### Custom Protocol Parsing {#processors.request_log.tag_extraction.custom_field_policies}
 
 **Tags**:
 
-<mark>agent_restart</mark>
-<mark>ee_feature</mark>
+<mark></mark>
 
 **FQCN**:
 
@@ -8301,40 +9622,7 @@ processors:
 
 **Description**:
 
-Custom field extraction policies, used to extract custom fields from L7 protocols
-Example:
-```yaml
-- policy_name: "my_policy" # name of current policy
-  protocol_name: HTTP # protocol name, if protocol is Grpc, please set it to HTTP2, optional values: HTTP/HTTP2/Dubbo/SofaRPC/Custom/...
-  custom_protocol_name: "my_protocol"  # when protocol_name is Custom are effected, and there must be a `processors.request_log.application_protocol_inference.custom_protocols` configuration with the same name, otherwise it cannot be parsed
-  port_list: 1-65535
-  fields:
-  - field_name: "my_field"
-    field_match_type: "string"  # optional values: "string"
-    field_match_ignore_case: "false" # wheather ignore case when match field, default: false
-    field_match_keyword: "abc"  # can be filled with additional characters to improve accuracy, for example `"\"abc\": \""`
-
-    subfield_match_keyword: "y" # in some cases, we need to extract a subfield, for example, in the HTTP Cookie field, we only need to extract part of it, such as extracting the value corresponding to y from `abc: x=1,y=2,z=3` (the value is `x=1,y=2,z=3`)
-    separator_between_subfield_kv_pair: "," # default: empty
-    separator_between_subfield_key_and_value: "=" # default: empty
-
-    field_type: "http_url_field" # field type of extraction, optional values: http_url_field/header_field/payload_json_value/payload_xml_value/payload_hessian2_value, default value: header_field
-    traffic_direction: request # could be limited to search only in request (or only in response), optional values: request/response/both, default value: both
-    check_value_charset: false # used for checking whether the extracted result is legal
-    value_primary_charset: ["digits", "alphabets", "chinese"] # used for checking the character set of the extracted result, optional values: digits/alphabets/chinese
-    value_special_charset: ".-_" # used for checking the character set of the extracted result
-    attribute_name: "xyz" # this field will appear in the calling log's attribute.xyz, default value is empty, if empty, this field will not be added to attribute
-    rewrite_native_tag: version # rewrite can fill in one of the following fields to overwrite the corresponding field value: version/request_type/request_domain/request_resource/request_id/endpoint/response_code/response_exception/response_result/trace_id/span_id/x_request_id/http_proxy_client
-    rewrite_response_status: # rewrite response_status field, when response_code is in success_values array, response_status will be set to success, otherwise set to server_error
-      success_values: []
-    metric_name: "xyz"  # this field will appear in the calling log's metrics.xyz, default value is empty
-```
-notice: the different values of field_type will affect the extraction method of the field, as follows:
-- `http_url_field`: extract field from HTTP URL parameters at the end of the URL, such as `?key=value&key2=value2`
-- `header_field`: extract field from the Header part of HTTP/Dubbo/SofaRPC/... protocols, such as HTTP Header like `key: value`
-- `payload_json_value`: extract field from Json Payload, such as `"key": 1`, or `"key": "value"`, or `"key": None`, etc.
-- `payload_xml_value`: extract field from XML Payload, such as `<key attr="xxx">value</key>`
-- `payload_hessian2_value`: extract field from Payload encoded with Hessian2
+deprecated
 
 #### Obfuscate Protocols {#processors.request_log.tag_extraction.obfuscate_protocols}
 
@@ -8378,6 +9666,140 @@ to be desensitized is configured here and is not processed by default.
 Obfuscated fields mainly include:
 - Authorization information
 - Value information in various statements
+
+#### Raw Data {#processors.request_log.tag_extraction.raw}
+
+控制提取 L7 日志对应的原始数据
+
+##### Length of extracted request header {#processors.request_log.tag_extraction.raw.error_request_header}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_request_header`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_request_header: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**Description**:
+
+When set to a value greater than 0, for call logs with abnormal states, the request Header is automatically collected
+(truncated to $error_request_header bytes) into attribute.request_header. Recommended for temporary use only for the
+following reasons:
+- On one hand, directly storing the header carries a certain risk of exposing sensitive information, which may
+  lead to compliance issues.
+- On the other hand, it can also cause all request header (currently only for the HTTP protocol) to be cached
+  until the response status is parsed to determine whether to send them, consuming collector resources.
+
+##### Length of extracted request header {#processors.request_log.tag_extraction.raw.error_response_header}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_response_header`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_response_header: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**Description**:
+
+When set to a value greater than 0, for call logs with abnormal states, the response Header is automatically collected
+(truncated to $error_response_header bytes) into attribute.response_header.
+
+##### Length of extracted response header {#processors.request_log.tag_extraction.raw.error_request_payload}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_request_payload`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_request_payload: 0
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**Description**:
+
+When set to a value greater than 0, for call logs with abnormal status, the request payload is automatically
+collected (truncated to $error_request_payload) into attribute.request_payload. Recommended for temporary use
+only for the following reasons:
+- On one hand, directly storing the payload carries a certain risk of exposing sensitive information, which may
+  lead to compliance issues.
+- On the other hand, it can also cause all request payloads (currently only for the HTTP protocol) to be cached
+  until the response status is parsed to determine whether to send them, consuming collector resources.
+
+##### Length of extracted request header {#processors.request_log.tag_extraction.raw.error_response_payload}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.request_log.tag_extraction.raw.error_response_payload`
+
+**Default value**:
+```yaml
+processors:
+  request_log:
+    tag_extraction:
+      raw:
+        error_response_payload: 256
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [0, 16384] |
+
+**Description**:
+
+The default value is 256, which means collecting the first 256 bytes of an abnormal response payload and placing
+them into attribute.response_payload. When set to 0, it means that abnormal response payloads are not collected.
 
 ### Tunning {#processors.request_log.tunning}
 
@@ -8660,6 +10082,12 @@ processors:
 
 Service port list, priority lower than TCP SYN flags.
 
+The server determines the priority order from highest to lowest as:
+- TCP Flags: SYN|ACK, GPID
+- Layer 7 Parsing
+- `server_ports` Configuration
+- Packet Count (The side with more sent packets is the server.)
+
 ##### Cloud Traffic Ignore MAC {#processors.flow_log.conntrack.flow_generation.cloud_traffic_ignore_mac}
 
 **Tags**:
@@ -8764,7 +10192,7 @@ set this value at this time. Only valid for IDC (not Cloud) traffic.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8795,7 +10223,7 @@ Timeouts for TCP State Machine - Established.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8826,7 +10254,7 @@ Timeouts for TCP State Machine - Closing Reset.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8857,7 +10285,7 @@ Timeouts for TCP State Machine - Opening Reset.
 
 **Tags**:
 
-<mark>agent_restart</mark>
+`hot_update`
 
 **FQCN**:
 
@@ -8946,10 +10374,37 @@ processors:
 
 **Description**:
 
-Maximum number of flows that can be stored in FlowMap, It will also affect the capacity of
-the RRT cache, Example: `rrt-cache-capacity` = `flow-count-limit`. When `rrt-cache-capacity`
-is not enough, it will be unable to calculate the rrt of l7. When `inputs.cbpf.common.capture_mode`
-is `Physical Mirror` and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
+Maximum number of flows that can be stored in FlowMap. When `inputs.cbpf.common.capture_mode` is `Physical Mirror`
+and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
+
+#### RRT Cache Capacity {#processors.flow_log.tunning.rrt_cache_capacity}
+
+**Tags**:
+
+<mark>agent_restart</mark>
+
+**FQCN**:
+
+`processors.flow_log.tunning.rrt_cache_capacity`
+
+**Default value**:
+```yaml
+processors:
+  flow_log:
+    tunning:
+      rrt_cache_capacity: 16000
+```
+
+**Schema**:
+| Key  | Value                        |
+| ---- | ---------------------------- |
+| Type | int |
+| Range | [1024, 64000000] |
+
+**Description**:
+
+The capacity of the RRT Cache table in FlowMap. This table is used to calculate RRT latency metrics. If it is too large,
+it will cause high memory usage in the agent; if it is too small, RRT metrics may be missing.
 
 #### Memory Pool Size {#processors.flow_log.tunning.memory_pool_size}
 
@@ -10186,6 +11641,12 @@ Whether to compress the l4 flow log.
 
 # Plugins {#plugins}
 
+Plugin support
+When both plugins and custom extraction policies match, the priority is:
+1. Plugin extraction
+2. Custom field policies extraction
+3. Agent default extraction
+
 ## Wasm Plugins {#plugins.wasm_plugins}
 
 **Tags**:
@@ -10280,4 +11741,3 @@ dev:
 **Description**:
 
 Unreleased deepflow-agent features can be turned on by setting this switch.
-

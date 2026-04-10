@@ -42,16 +42,16 @@ STATIC_OBJDIR := $(OBJDIR)/staticobjs
 
 define compile_socket_trace_elf
 	@echo "  COMPILE ELF kernel version $(1)"
-	@cd kernel && make clean --no-print-directory && make socket_trace.bpf.elf $(2) --no-print-directory && cd ../
-	@echo "  Generate file user/socket_trace_bpf_$(strip $1).c"
-	@./tools/bintobuffer kernel/socket_trace.bpf.elf user/socket_trace_bpf_$(strip $1).c socket_trace_$(strip $1)_ebpf_data
+	@cd kernel && make PREFIX=$(1) build/$(1)/socket_trace.bpf.elf $(2) --no-print-directory && cd ../
+	@echo "  Generate file user/socket_trace_bpf_$(1).c"
+	@./tools/bintobuffer kernel/build/$(1)/socket_trace.bpf.elf user/socket_trace_bpf_$(1).c socket_trace_$(1)_ebpf_data
 endef
 
 define compile_perf_profiler_elf
 	@echo "  COMPILE ELF kernel version $(1)"
-	@cd kernel && make clean --no-print-directory && make perf_profiler.bpf.elf $(2) --no-print-directory && cd ../
-	@echo "  Generate file user/perf_profiler_bpf_$(strip $1).c"
-	@./tools/bintobuffer kernel/perf_profiler.bpf.elf user/perf_profiler_bpf_$(strip $1).c perf_profiler_$(strip $1)_ebpf_data
+	@cd kernel && make PREFIX=$(1) build/$(1)/perf_profiler.bpf.elf $(2) --no-print-directory && cd ../
+	@echo "  Generate file user/perf_profiler_bpf_$(1).c"
+	@./tools/bintobuffer kernel/build/$(1)/perf_profiler.bpf.elf user/perf_profiler_bpf_$(1).c perf_profiler_$(1)_ebpf_data
 endef
 
 define check_gcc_version
@@ -118,6 +118,10 @@ ifeq ($(GCC_VER_GTE71),1)
 endif
 CFLAGS += $(JAVA_AGENT_MACROS)
 
+CTLSRC := user/utils.c user/ctrl_tracer.c user/ctrl.c user/log.c
+CTLBIN := deepflow-ebpfctl
+CTLBIN_C := user/deepflow_ebpfctl_bin.c
+
 # trace-utils header
 CFLAGS += -I../../crates/trace-utils/src
 
@@ -151,9 +155,10 @@ SOCKET_TRACE_ELFS := user/socket_trace_bpf_common.c \
 	user/socket_trace_bpf_kprobe.c
 
 PERF_PROFILER_ELFS := user/perf_profiler_bpf_common.c \
-	user/perf_profiler_bpf_5_2_plus.c
+	user/perf_profiler_bpf_5_2_plus.c \
+	user/perf_profiler_bpf_5_15_plus.c
 
-ELFFILES := $(SOCKET_TRACE_ELFS) $(PERF_PROFILER_ELFS) $(AF_PACKET_FANOUT_ELFS)
+ELFFILES := $(SOCKET_TRACE_ELFS) $(PERF_PROFILER_ELFS) $(EXTEND_ELFS)
 
 tools/bintobuffer:
 	$(call msg,TOOLS,tools/bintobuffer)
@@ -169,39 +174,43 @@ endef
 
 user/socket_trace_bpf_common.c: tools/bintobuffer kernel/socket_trace.bpf.c
 	$(call check_clang)
-	$(call compile_socket_trace_elf, common)
+	$(call compile_socket_trace_elf,common)
 
 user/socket_trace_bpf_3_10_0.c: tools/bintobuffer kernel/socket_trace.bpf.c
 	$(call check_clang)
-	$(call compile_socket_trace_elf, 3_10_0, LINUX_VER_3_10_0=1)
+	$(call compile_socket_trace_elf,3_10_0,LINUX_VER_3_10_0=1)
 
 user/socket_trace_bpf_5_2_plus.c: tools/bintobuffer kernel/socket_trace.bpf.c
 	$(call check_clang)
-	$(call compile_socket_trace_elf, 5_2_plus, LINUX_VER_5_2_PLUS=1)
+	$(call compile_socket_trace_elf,5_2_plus,LINUX_VER_5_2_PLUS=1)
 
 user/socket_trace_bpf_kfunc.c: tools/bintobuffer kernel/socket_trace.bpf.c
 	$(call check_clang)
-	$(call compile_socket_trace_elf, kfunc, LINUX_VER_KFUNC=1)
+	$(call compile_socket_trace_elf,kfunc,LINUX_VER_KFUNC=1)
 
 user/socket_trace_bpf_kylin.c: tools/bintobuffer kernel/socket_trace.bpf.c
 	$(call check_clang)
-	$(call compile_socket_trace_elf, kylin, LINUX_VER_KYLIN=1)
+	$(call compile_socket_trace_elf,kylin,LINUX_VER_KYLIN=1)
 
 user/socket_trace_bpf_rt.c: tools/bintobuffer kernel/socket_trace.bpf.c
 	$(call check_clang)
-	$(call compile_socket_trace_elf, rt, LINUX_VER_RT=1)
+	$(call compile_socket_trace_elf,rt,LINUX_VER_RT=1)
 
 user/socket_trace_bpf_kprobe.c: tools/bintobuffer kernel/socket_trace.bpf.c
 	$(call check_clang)
-	$(call compile_socket_trace_elf, kprobe, LINUX_VER_KPROBE=1)
+	$(call compile_socket_trace_elf,kprobe,LINUX_VER_KPROBE=1)
 
 user/perf_profiler_bpf_common.c: tools/bintobuffer kernel/perf_profiler.bpf.c
 	$(call check_clang)
-	$(call compile_perf_profiler_elf, common)
+	$(call compile_perf_profiler_elf,common)
 
 user/perf_profiler_bpf_5_2_plus.c: tools/bintobuffer kernel/perf_profiler.bpf.c
 	$(call check_clang)
-	$(call compile_perf_profiler_elf, 5_2_plus, LINUX_VER_5_2_PLUS=1)
+	$(call compile_perf_profiler_elf,5_2_plus,LINUX_VER_5_2_PLUS=1)
+
+user/perf_profiler_bpf_5_15_plus.c: tools/bintobuffer kernel/perf_profiler.bpf.c
+	$(call check_clang)
+	$(call compile_perf_profiler_elf,5_15_plus,LINUX_VER_5_15_PLUS=1)
 
 $(STATIC_OBJDIR) $(SHARED_OBJDIR):
 	$(call msg,MKDIR,$@)
@@ -209,6 +218,14 @@ $(STATIC_OBJDIR) $(SHARED_OBJDIR):
 	$(Q)mkdir -p $@/user/extended/profile
 
 $(STATIC_OBJDIR)/user/socket.o: user/socket.c $(SOCKET_TRACE_ELFS) | $(STATIC_OBJDIR)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) -c $< -o $@
+
+$(STATIC_OBJDIR)/user/tracer.o: user/tracer.c $(CTLBIN_C) | $(STATIC_OBJDIR)
+	$(call msg,CC,$@)
+	$(Q)$(CC) $(CFLAGS) -c $< -o $@
+
+$(STATIC_OBJDIR)/user/profile/profile_common.o: user/profile/profile_common.c $(JAVA_TOOL) | $(STATIC_OBJDIR)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) -c $< -o $@
 
@@ -220,7 +237,7 @@ $(STATIC_OBJDIR)/%.o: %.c | $(STATIC_OBJDIR)
 	$(call msg,CC,$@)
 	$(Q)$(CC) $(CFLAGS) -c $< -o $@
 
-$(LIBTRACE): $(STATIC_OBJS)
+$(LIBTRACE): $(CTLBIN_C) $(STATIC_OBJS)
 	$(call msg,AR,$@)
 	$(Q)$(AR) rcs $@ $^
 
@@ -236,11 +253,17 @@ $(JAVA_AGENT_MUSL_SO): tools/bintobuffer $(JAVA_AGENT_SRC)
 	@rm -rf user/profile/java_agent_so_musl.c
 	@./tools/bintobuffer ./$@ user/profile/java_agent_so_musl.c java_agent_so_musl
 
-build: $(ELFFILES) $(JAVA_TOOL) $(LIBTRACE)
+build: $(CTLBIN_C) $(ELFFILES) $(JAVA_TOOL) $(LIBTRACE)
 
-tools: $(LIBTRACE)
+tools: $(CTLBIN)
+
+$(CTLBIN_C): $(CTLBIN) tools/bintobuffer
+	$(call msg,CTLBIN_C,$(CTLBIN_C))
+	$(Q)./tools/bintobuffer $(CTLBIN) ./$@ deepflow_ebpfctl_bin 
+
+$(CTLBIN): $(CTLSRC) 
 	$(call msg,TOOLS,deepflow-ebpfctl)
-	$(Q)$(CC) $(CFLAGS) --static -g -O2 user/ctrl_tracer.c user/ctrl.c $(LIBTRACE) -o deepflow-ebpfctl -lelf -lz -lpthread
+	$(Q)$(CC) $(CFLAGS) --static -g -O2 $(CTLSRC) -o $@ -lelf -lz -lpthread
 
 $(JAVA_TOOL): $(JAVA_AGENT_SO) user/log.c user/utils.c user/mem.c user/vec.c user/profile/java/jvm_symbol_collect.c libs/jattach/build/libjattach.a
 	$(call msg,TOOLS,$@)
@@ -329,7 +352,7 @@ clean:
 	$(Q)rm -rf .profiler .socket-tracer
 	$(Q)rm -rf samples/rust/socket-tracer/target
 	$(Q)rm -rf samples/rust/profiler/target
-	$(Q)rm -rf $(JAVA_AGENT_SO) $(JAVA_TOOL) tools/bintobuffer
+	$(Q)rm -rf $(JAVA_AGENT_SO) $(JAVA_TOOL) $(CTLBIN) $(CTLBIN_C) tools/bintobuffer
 
 test: $(ELFFILES) $(LIBTRACE)
 	$(Q)$(MAKE) -C test --no-print-directory

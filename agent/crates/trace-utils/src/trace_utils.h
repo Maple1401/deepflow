@@ -13,6 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#ifndef DF_ENTERPRISE
+#define DF_ENTERPRISE 1
+#endif
+
 
 #ifndef TRACE_UTILS_H
 #define TRACE_UTILS_H
@@ -22,9 +26,58 @@
 #include <stdint.h>
 #include "consts.h"
 
+#if defined(__x86_64__)
+#define FP 6
+#endif
+
+#if defined(__aarch64__)
+#define FP 29
+#endif
+
+#if !(defined(__x86_64__) || defined(__aarch64__))
+#define FP 0
+#endif
+
+#if defined(__aarch64__)
+#define LR 30
+#endif
+
+#if defined(DF_ENTERPRISE)
+#define LUA_RUNTIME_DETECT_METHOD_LEN 256
+#endif
+
+#if defined(DF_ENTERPRISE)
+#define LUA_RUNTIME_PATH_LEN 1024
+#endif
+
+#if defined(DF_ENTERPRISE)
+#define LUA_RUNTIME_VERSION_LEN 32
+#endif
+
+#if defined(__x86_64__)
+#define SP 7
+#endif
+
+#if defined(__aarch64__)
+#define SP 31
+#endif
+
+#if !(defined(__x86_64__) || defined(__aarch64__))
+#define SP 0
+#endif
+
 #define UNWIND_ENTRIES_PER_SHARD 65535
 
-#define UNWIND_SHARDS_PER_PROCESS 256
+#define UNWIND_SHARDS_PER_PROCESS 1024
+
+enum LogLevel {
+    LOG_LEVEL_ERROR = 1,
+    LOG_LEVEL_WARN = 2,
+    LOG_LEVEL_INFO = 3,
+    LOG_LEVEL_DEBUG = 4,
+    LOG_LEVEL_TRACE = 5,
+};
+typedef uint8_t LogLevel;
 
 enum CfaType {
     CFA_TYPE_RBP_OFFSET,
@@ -43,9 +96,58 @@ enum RegType {
 };
 typedef uint8_t RegType;
 
+/**
+ * Return Address recovery type for ARM64
+ * On x86_64, RA is always at CFA-8 (implicitly handled in BPF code)
+ * On ARM64, RA may be in LR register or saved on stack
+ */
+enum RaType {
+    RA_TYPE_CFA_OFFSET,
+    RA_TYPE_LR_REGISTER,
+    RA_TYPE_UNSUPPORTED,
+};
+typedef uint8_t RaType;
+
+#if defined(DF_ENTERPRISE)
+typedef struct lua_unwind_table_t lua_unwind_table_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct php_unwind_table_t php_unwind_table_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
 typedef struct python_unwind_table_t python_unwind_table_t;
+#endif
 
 typedef struct unwind_table_t unwind_table_t;
+
+#if defined(DF_ENTERPRISE)
+typedef struct v8_unwind_table_t v8_unwind_table_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint32_t kind;
+    uint8_t version[LUA_RUNTIME_VERSION_LEN];
+    uint8_t detection_method[LUA_RUNTIME_DETECT_METHOD_LEN];
+    uint8_t path[LUA_RUNTIME_PATH_LEN];
+} lua_runtime_info_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint64_t liblua_start;
+    uint64_t liblua_end;
+    uint64_t exe_start;
+    uint64_t exe_end;
+    uint8_t lib_path[LUA_RUNTIME_PATH_LEN];
+    uint8_t exe_path[LUA_RUNTIME_PATH_LEN];
+    uint8_t has_lib;
+    uint8_t has_exe;
+    uint8_t reserved[6];
+} lua_process_layout_t;
+#endif
 
 typedef struct {
     uint32_t id;
@@ -57,7 +159,7 @@ typedef struct {
 } shard_info_t;
 
 typedef struct {
-    uint8_t len;
+    uint16_t len;
     shard_info_t entries[UNWIND_SHARDS_PER_PROCESS];
 } process_shard_list_t;
 
@@ -65,8 +167,16 @@ typedef struct {
     uint64_t pc;
     CfaType cfa_type;
     RegType rbp_type;
+#if defined(__aarch64__)
+    RaType ra_type
+#endif
+    ;
     int16_t cfa_offset;
     int16_t rbp_offset;
+#if defined(__aarch64__)
+    int16_t ra_offset
+#endif
+    ;
 } unwind_entry_t;
 
 typedef struct {
@@ -75,50 +185,91 @@ typedef struct {
     unwind_entry_t entries[UNWIND_ENTRIES_PER_SHARD];
 } unwind_entry_shard_t;
 
+/**
+ * Thread Specific Data info for accessing per-thread PyThreadState.
+ */
 typedef struct {
-    uint64_t thread_state_address;
-    uint8_t offsets_id;
-} python_unwind_info_t;
+    /**
+     * Offset from thread pointer base (TPBASE) to TSD storage
+     */
+    int16_t offset;
+    /**
+     * TSD key multiplier (glibc=16, musl=8)
+     */
+    uint8_t multiplier;
+    /**
+     * Whether indirect addressing is needed (musl=1, glibc=0)
+     */
+    uint8_t indirect;
+} tsd_info_t;
 
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint64_t auto_tls_key_addr;
+    uint16_t version;
+    tsd_info_t tsd_info;
+    uint8_t offsets_id;
+    uint8_t _padding[5];
+    uint64_t none_struct_addr;
+} python_unwind_info_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t current_frame;
 } py_cframe_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t co_filename;
     int64_t co_firstlineno;
     int64_t co_name;
     int64_t co_varnames;
 } py_code_object_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t f_back;
     int64_t f_code;
     int64_t f_lineno;
     int64_t f_localsplus;
 } py_frame_object_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t owner;
 } py_interpreter_frame_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t tstate_head;
 } py_interpreter_state_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t ob_type;
 } py_object_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t interp_main;
 } py_runtime_state_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t data;
     int64_t size;
 } py_string_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t cframe;
     int64_t frame;
@@ -127,15 +278,21 @@ typedef struct {
     int64_t next;
     int64_t thread_id;
 } py_thread_state_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t ob_item;
 } py_tuple_object_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     int64_t tp_name;
 } py_type_object_t;
+#endif
 
+#if defined(DF_ENTERPRISE)
 typedef struct {
     py_cframe_t cframe;
     py_code_object_t code_object;
@@ -149,25 +306,453 @@ typedef struct {
     py_tuple_object_t tuple_object;
     py_type_object_t type_object;
 } python_offsets_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint8_t offsets_id;
+    uint8_t reserved[7];
+    uint64_t state_address;
+} lua_unwind_info_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint32_t features;
+    uint32_t off_l_ci;
+    uint32_t off_l_base_ci;
+    uint32_t off_l_end_ci;
+    uint32_t off_ci_func;
+    uint32_t off_ci_top;
+    uint32_t off_ci_savedpc;
+    uint32_t off_ci_prev;
+    uint32_t off_tvalue_tt;
+    uint32_t off_tvalue_val;
+    uint32_t off_closure_isc;
+    uint32_t off_lclosure_p;
+    uint32_t off_cclosure_f;
+    uint32_t off_proto_source;
+    uint32_t off_proto_linedefined;
+    uint32_t off_proto_code;
+    uint32_t off_proto_sizecode;
+    uint32_t off_proto_lineinfo;
+    uint32_t off_proto_abslineinfo;
+    uint32_t off_tstring_len;
+    uint32_t sizeof_tstring;
+    uint32_t sizeof_callinfo;
+    uint32_t sizeof_tvalue;
+} lua_ofs;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint8_t fr2;
+    uint8_t gc64;
+    uint16_t pad;
+    uint32_t tv_sz;
+    uint32_t off_l_base;
+    uint32_t off_l_stack;
+    uint32_t off_gcproto_firstline;
+    uint32_t off_gcproto_chunkname;
+    uint32_t off_gcstr_data;
+    uint32_t off_gcfunc_cfunc;
+    uint32_t off_gcfunc_ffid;
+    uint32_t off_gcfunc_pc;
+    uint32_t off_gcproto_bc;
+    uint32_t off_gcstr_len;
+    uint32_t off_l_glref;
+    uint32_t off_global_state_dispatchmode;
+} lj_ofs;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint64_t executor_globals_address;
+    uint64_t jit_return_address;
+    uint64_t execute_ex_start;
+    uint64_t execute_ex_end;
+    uint8_t offsets_id;
+    uint8_t has_jit;
+    uint8_t reserved[6];
+} php_unwind_info_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t current_execute_data;
+} php_executor_globals_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint8_t opline;
+    uint8_t function;
+    uint8_t this_type_info;
+    uint8_t prev_execute_data;
+} php_execute_data_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint8_t common_type;
+    uint8_t common_funcname;
+    uint8_t common_scope;
+    uint32_t op_array_filename;
+    uint32_t op_array_linestart;
+    uint32_t sizeof_struct;
+} php_function_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint64_t val;
+} php_string_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint8_t lineno;
+} php_op_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint64_t name;
+} php_class_entry_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    php_executor_globals_t executor_globals;
+    php_execute_data_t execute_data;
+    php_function_t function;
+    php_string_t string;
+    php_op_t op;
+    php_class_entry_t class_entry;
+} php_offsets_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint64_t isolate_address;
+    uint8_t offsets_id;
+    uint32_t version;
+} v8_unwind_info_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    int16_t marker;
+    int16_t function;
+    int16_t bytecode_offset;
+} v8_frame_pointers_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t shared;
+    uint16_t code;
+} v8_js_function_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t name_or_scope_info;
+    uint16_t function_data;
+    uint16_t script_or_debug_info;
+} v8_shared_function_info_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t instruction_start;
+    uint16_t instruction_size;
+    uint16_t flags;
+    uint16_t deoptimization_data;
+    uint16_t source_position_table;
+} v8_code_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t name;
+    uint16_t source;
+} v8_script_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t source_position_table;
+} v8_bytecode_array_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t scope_info;
+    uint16_t shared_function_info;
+    uint16_t js_function_first;
+    uint16_t js_function_last;
+    uint16_t string_first;
+    uint16_t script;
+    uint16_t code;
+} v8_type_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t first_nonstring_type;
+    uint16_t string_representation_mask;
+    uint16_t seq_string_tag;
+    uint16_t cons_string_tag;
+    uint16_t thin_string_tag;
+} v8_fixed_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint8_t first_vars;
+    uint8_t n_context_locals;
+} v8_scope_info_index_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint8_t inlined_function_count;
+    uint8_t literal_array;
+    uint8_t shared_function_info;
+    uint8_t inlining_positions;
+} v8_deoptimization_data_index_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t map;
+} v8_heap_object_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint16_t instance_type;
+} v8_map_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint8_t entry_frame;
+    uint8_t construct_entry_frame;
+    uint8_t exit_frame;
+    uint8_t wasm_frame;
+    uint8_t wasm_to_js_frame;
+    uint8_t wasm_to_js_function_frame;
+    uint8_t js_to_wasm_frame;
+    uint8_t wasm_debug_break_frame;
+    uint8_t stack_switch_frame;
+    uint8_t wasm_exit_frame;
+    uint8_t c_wasm_entry_frame;
+    uint8_t wasm_compile_lazy_frame;
+    uint8_t wasm_liftoff_setup_frame;
+    uint8_t interpreted_frame;
+    uint8_t baseline_frame;
+    uint8_t maglev_frame;
+    uint8_t turbofan_frame;
+    uint8_t stub_frame;
+    uint8_t turbofan_stub_with_context_frame;
+    uint8_t builtin_continuation_frame;
+    uint8_t js_builtin_continuation_frame;
+    uint8_t js_builtin_continuation_with_catch_frame;
+    uint8_t internal_frame;
+    uint8_t construct_frame;
+    uint8_t fast_construct_frame;
+    uint8_t builtin_frame;
+    uint8_t builtin_exit_frame;
+    uint8_t native_frame;
+    uint8_t api_callback_exit_frame;
+    uint8_t irregexp_frame;
+    uint8_t optimized_frame;
+} v8_frame_types_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    uint32_t mask;
+    uint8_t shift;
+    uint8_t baseline;
+    uint8_t interpreted;
+} v8_codekind_t;
+#endif
+
+#if defined(DF_ENTERPRISE)
+typedef struct {
+    v8_frame_pointers_t frame_pointers;
+    v8_js_function_t js_function;
+    v8_shared_function_info_t shared_function_info;
+    v8_code_t code;
+    v8_script_t script;
+    v8_bytecode_array_t bytecode_array;
+    v8_type_t v8_type;
+    v8_fixed_t v8_fixed;
+    v8_scope_info_index_t scope_info_index;
+    v8_deoptimization_data_index_t deopt_data_index;
+    v8_heap_object_t heap_object;
+    v8_map_t map;
+    v8_frame_types_t frame_types;
+    v8_codekind_t codekind;
+} v8_offsets_t;
+#endif
 
 bool frame_pointer_heuristic_check(uint32_t pid);
 
-bool is_lua_process(uint32_t pid);
+#if defined(DF_ENTERPRISE)
+extern int32_t is_lua_process(uint32_t pid);
+#endif
 
-bool is_python_process(uint32_t pid);
+#if defined(DF_ENTERPRISE)
+extern bool is_php_process(uint32_t pid);
+#endif
 
-size_t merge_python_stacks(void *trace_str, size_t len, const void *i_trace, const void *u_trace);
+#if defined(DF_ENTERPRISE)
+extern bool is_python_process(uint32_t pid);
+#endif
 
-python_unwind_table_t *python_unwind_table_create(int32_t unwind_info_map_fd,
-                                                  int32_t offsets_map_fd);
+#if defined(DF_ENTERPRISE)
+extern bool is_v8_process(uint32_t pid);
+#endif
 
-void python_unwind_table_destroy(python_unwind_table_t *table);
+#if defined(DF_ENTERPRISE)
+extern int32_t lua_detect(uint32_t pid, lua_runtime_info_t *out);
+#endif
 
-void python_unwind_table_load(python_unwind_table_t *table, uint32_t pid);
+#if defined(DF_ENTERPRISE)
+extern int32_t lua_get_process_layout(uint32_t pid, lua_process_layout_t *out);
+#endif
 
-void python_unwind_table_unload(python_unwind_table_t *table, uint32_t pid);
+#if defined(DF_ENTERPRISE)
+extern char *lua_format_folded_stack_trace(void *tracer,
+                                           uint32_t pid,
+                                           const uint64_t *frames,
+                                           uint32_t frame_count,
+                                           bool new_cache,
+                                           void *info_p,
+                                           const char *err_tag);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void lua_set_map_fds(int32_t lang_flags_fd,
+                            int32_t unwind_info_fd,
+                            int32_t lua_offsets_fd,
+                            int32_t luajit_offsets_fd);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern lua_unwind_table_t *lua_unwind_table_create(int32_t lang_flags_fd,
+                                                   int32_t unwind_info_fd,
+                                                   int32_t lua_offsets_fd,
+                                                   int32_t luajit_offsets_fd);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void lua_unwind_table_destroy(lua_unwind_table_t *table);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void lua_unwind_table_load(lua_unwind_table_t *table, uint32_t pid);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void lua_unwind_table_unload(lua_unwind_table_t *table, uint32_t pid);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern size_t merge_lua_stacks(void *trace_str,
+                               size_t len,
+                               const void *u_trace,
+                               const void *i_trace);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern size_t merge_php_stacks(void *trace_str,
+                               size_t len,
+                               const void *i_trace,
+                               const void *u_trace);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern size_t merge_python_stacks(void *trace_str,
+                                  size_t len,
+                                  const void *i_trace,
+                                  const void *u_trace);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern size_t merge_v8_stacks(void *trace_str,
+                              size_t len,
+                              const void *i_trace,
+                              const void *u_trace);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern php_unwind_table_t *php_unwind_table_create(int32_t unwind_info_map_fd,
+                                                   int32_t offsets_map_fd);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void php_unwind_table_destroy(php_unwind_table_t *table);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void php_unwind_table_load(php_unwind_table_t *table, uint32_t pid);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void php_unwind_table_unload(php_unwind_table_t *table, uint32_t pid);
+#endif
+
+int32_t protect_cpu_affinity_c(void);
+
+#if defined(DF_ENTERPRISE)
+extern python_unwind_table_t *python_unwind_table_create(int32_t unwind_info_map_fd,
+                                                         int32_t offsets_map_fd);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void python_unwind_table_destroy(python_unwind_table_t *table);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void python_unwind_table_load(python_unwind_table_t *table, uint32_t pid);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void python_unwind_table_unload(python_unwind_table_t *table, uint32_t pid);
+#endif
 
 int32_t read_offset_of_stack_in_task_struct(void);
+
+/**
+ * C-callable function to read TPBASE offset
+ */
+int64_t read_tpbase_offset(void);
+
+#if defined(DF_ENTERPRISE)
+extern char *resolve_php_frame(uint32_t pid,
+                               uint64_t zend_function_ptr,
+                               uint64_t lineno,
+                               uint64_t is_jit);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern char *resolve_v8_frame(uint32_t pid,
+                              uint64_t pointer_and_type,
+                              uint64_t delta_or_marker,
+                              uint64_t sfi_fallback);
+#endif
+
+void rust_log_wrapper(LogLevel level,
+                      int error_number,
+                      const char *msg,
+                      const char *_function_name,
+                      const char *file_path,
+                      int line_number);
 
 int rustc_demangle(const char *mangled, char *out, size_t out_size);
 
@@ -181,5 +766,21 @@ void unwind_table_load(unwind_table_t *table, uint32_t pid);
 void unwind_table_unload(unwind_table_t *table, uint32_t pid);
 
 void unwind_table_unload_all(unwind_table_t *table);
+
+#if defined(DF_ENTERPRISE)
+extern v8_unwind_table_t *v8_unwind_table_create(int32_t unwind_info_map_fd);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void v8_unwind_table_destroy(v8_unwind_table_t *table);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void v8_unwind_table_load(v8_unwind_table_t *table, uint32_t pid);
+#endif
+
+#if defined(DF_ENTERPRISE)
+extern void v8_unwind_table_unload(v8_unwind_table_t *table, uint32_t pid);
+#endif
 
 #endif  /* TRACE_UTILS_H */

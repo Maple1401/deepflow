@@ -95,9 +95,11 @@ var DEFAULT_DATA_SOURCE_DISPLAY_NAMES = []string{
 	"外部指标数据",        // ext_metrics.*
 	"Prometheus 数据", // prometheus.*
 	"事件-资源变更事件",     // event.event
-	"事件-IO 事件",      // event.perf_event
+	"事件-文件读写事件",     // event.file_event
+	"事件-文件读写指标",     // event.file_event_metrics
 	"事件-告警事件",       // event.alert_event
 	"应用-性能剖析",       // profile.in_process
+	"应用-性能剖析指标",     // profile.in_process_metrics
 	"网络-网络策略",       // flow_metrics.traffic_policy
 	"日志-日志数据",       // application_log.log
 }
@@ -142,6 +144,10 @@ func (d *DataSource) GetDataSources(orgID int, filter map[string]interface{}, sp
 				collection = "prometheus.*"
 			case "traffic_policy":
 				collection = "flow_metrics.traffic_policy"
+			case "in_process_metrics":
+				collection = "profile.in_process_metrics"
+			case "file_event_metrics":
+				collection = "event.file_event_metrics"
 			default:
 				collection = t.(string)
 			}

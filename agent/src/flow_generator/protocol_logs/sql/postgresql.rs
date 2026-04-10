@@ -16,7 +16,7 @@
 
 use public::{
     bytes::{read_u32_be, read_u64_be},
-    l7_protocol::L7Protocol,
+    l7_protocol::{L7Protocol, LogMessageType},
 };
 
 use serde::Serialize;
@@ -25,8 +25,8 @@ use crate::{
     common::{
         flow::{L7PerfStats, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     config::handler::LogParserConfig,
     flow_generator::{
@@ -34,7 +34,7 @@ use crate::{
             pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response},
             set_captured_byte, L7ResponseStatus,
         },
-        AppProtoHead, Error, LogMessageType, Result,
+        AppProtoHead, Error, Result,
     },
 };
 
@@ -42,8 +42,7 @@ use super::{
     super::value_is_default,
     postgre_convert::{get_code_desc, get_request_str},
     sql_check::is_postgresql,
-    sql_obfuscate::attempt_obfuscation,
-    ObfuscateCache,
+    sql_obfuscate::CachedObfuscator,
 };
 
 const SSL_REQ: u64 = 34440615471; // 00000008(len) 04d2162f(const 80877103)
@@ -163,9 +162,9 @@ impl L7ProtocolInfoInterface for PostgreInfo {
 impl From<PostgreInfo> for L7ProtocolSendLog {
     fn from(p: PostgreInfo) -> L7ProtocolSendLog {
         let flags = if p.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         L7ProtocolSendLog {
             captured_request_byte: p.captured_request_byte,
@@ -193,23 +192,38 @@ impl From<PostgreInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&PostgreInfo> for LogCache {
+    fn from(info: &PostgreInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct PostgresqlLog {
-    perf_stats: Option<L7PerfStats>,
-    obfuscate_cache: Option<ObfuscateCache>,
-    last_is_on_blacklist: bool,
+    perf_stats: Vec<L7PerfStats>,
+
+    has_request: bool,
 }
 
 impl L7ProtocolParserInterface for PostgresqlLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         let mut info = PostgreInfo::default();
         self.set_msg_type(PacketDirection::ClientToServer, &mut info);
         info.is_tls = param.is_tls();
         if self.check_is_ssl_req(payload, &mut info) {
-            return true;
+            return Some(LogMessageType::Request);
         }
 
-        self.parse(payload, &mut info).is_ok()
+        if self.parse(payload, param, true, &mut info).is_ok() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
@@ -221,45 +235,21 @@ impl L7ProtocolParserInterface for PostgresqlLog {
             return Ok(L7ParseResult::None);
         }
 
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
-
-        self.parse(payload, &mut info)?;
+        self.parse(payload, param, false, &mut info)?;
+        self.perf_stats.clear();
         set_captured_byte!(info, param);
         if let Some(config) = param.parse_config {
             info.set_is_on_blacklist(config);
         }
-        if !info.is_on_blacklist
-            && !self.last_is_on_blacklist
-            && !info.ignore
-            && info.at_lease_one_block
-        {
-            match param.direction {
-                PacketDirection::ClientToServer => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req());
-                }
-                PacketDirection::ServerToClient => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp());
-                }
+
+        if param.parse_perf && !info.ignore && info.at_lease_one_block {
+            let mut perf_stat = L7PerfStats::default();
+            if let Some(stats) = info.perf_stats(param) {
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
             }
-            match info.status {
-                L7ResponseStatus::ClientError => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req_err());
-                }
-                L7ResponseStatus::ServerError => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                }
-                _ => {}
-            }
-            if info.at_lease_one_block {
-                info.cal_rrt(param, &None).map(|(rrt, _)| {
-                    info.rrt = rrt;
-                    self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-                });
-            }
+            self.perf_stats.push(perf_stat);
         }
-        self.last_is_on_blacklist = info.is_on_blacklist;
         Ok(if info.ignore || !param.parse_log {
             L7ParseResult::None
         } else {
@@ -275,12 +265,8 @@ impl L7ProtocolParserInterface for PostgresqlLog {
         false
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
-    }
-
-    fn set_obfuscate_cache(&mut self, obfuscate_cache: Option<ObfuscateCache>) {
-        self.obfuscate_cache = obfuscate_cache;
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -292,7 +278,13 @@ impl PostgresqlLog {
         }
     }
 
-    fn parse(&mut self, payload: &[u8], info: &mut PostgreInfo) -> Result<()> {
+    fn parse(
+        &mut self,
+        payload: &[u8],
+        param: &ParseParam,
+        strict: bool,
+        info: &mut PostgreInfo,
+    ) -> Result<()> {
         let mut offset = 0;
         loop {
             if offset >= payload.len() {
@@ -303,7 +295,7 @@ impl PostgresqlLog {
                 offset += len + 5; // len(data) + len 4B + tag 1B
                 let parsed = match info.msg_type {
                     LogMessageType::Request => {
-                        self.on_req_block(tag, &sub_payload[5..5 + len], info)?
+                        self.on_req_block(param, tag, &sub_payload[5..5 + len], strict, info)?
                     }
                     LogMessageType::Response => {
                         self.on_resp_block(tag, &sub_payload[5..5 + len], info)?
@@ -320,6 +312,11 @@ impl PostgresqlLog {
             }
         }
         if info.at_lease_one_block {
+            if info.msg_type == LogMessageType::Request {
+                self.has_request = true;
+            } else {
+                self.has_request = false;
+            }
             return Ok(());
         }
         Err(Error::L7ProtocolUnknown)
@@ -331,16 +328,26 @@ impl PostgresqlLog {
             && read_u64_be(payload) == SSL_REQ
     }
 
-    fn on_req_block(&mut self, tag: char, data: &[u8], info: &mut PostgreInfo) -> Result<bool> {
+    fn on_req_block(
+        &mut self,
+        param: &ParseParam,
+        tag: char,
+        data: &[u8],
+        strict: bool,
+        info: &mut PostgreInfo,
+    ) -> Result<bool> {
+        let obfuscator = CachedObfuscator::new(param.obfuscate_cache.clone());
         match tag {
             'Q' => {
                 info.req_type = tag;
                 let payload = strip_string_end_with_zero(data)?;
-                info.context = attempt_obfuscation(&self.obfuscate_cache, payload)
-                    .map_or(String::from_utf8_lossy(payload).to_string(), |m| {
-                        String::from_utf8_lossy(&m).to_string()
-                    });
+                let context = String::from_utf8_lossy(payload);
+                info.context = match obfuscator.apply(&context) {
+                    Ok(obfuscated) => obfuscated.to_string(),
+                    Err(_) => context.to_string(),
+                };
                 info.ignore = false;
+
                 Ok(true)
             }
             'P' => {
@@ -358,10 +365,11 @@ impl PostgresqlLog {
                     if let Some(idx) = data.iter().position(|x| *x == 0x0) {
                         let payload = &data[..idx];
                         let postgresql = is_postgresql(payload);
-                        info.context = attempt_obfuscation(&self.obfuscate_cache, payload)
-                            .map_or(String::from_utf8_lossy(payload).to_string(), |m| {
-                                String::from_utf8_lossy(&m).to_string()
-                            });
+                        let context = String::from_utf8_lossy(payload);
+                        info.context = match obfuscator.apply(&context) {
+                            Ok(obfuscated) => obfuscated.to_string(),
+                            Err(_) => context.to_string(),
+                        };
                         if postgresql {
                             return Ok(true);
                         }
@@ -369,12 +377,22 @@ impl PostgresqlLog {
                 }
                 Err(Error::L7ProtocolUnknown)
             }
-            'B' | 'F' | 'C' | 'D' | 'H' | 'S' | 'X' | 'd' | 'c' | 'f' => Ok(false),
+            'E' if !strict && info.req_type == '\0' => {
+                info.req_type = tag;
+                info.ignore = false;
+
+                Ok(true)
+            }
+            'B' | 'F' | 'C' | 'D' | 'H' | 'S' | 'X' | 'd' | 'c' | 'f' | 'E' => Ok(false),
             _ => Err(Error::L7ProtocolUnknown),
         }
     }
 
     fn on_resp_block(&mut self, tag: char, data: &[u8], info: &mut PostgreInfo) -> Result<bool> {
+        if !self.has_request {
+            return Err(Error::L7ProtocolUnknown);
+        }
+
         let mut data = data;
         match tag {
             'C' => {
@@ -485,7 +503,9 @@ fn strip_string_end_with_zero(data: &[u8]) -> Result<&[u8]> {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::RefCell, path::Path, rc::Rc};
+    use std::{cell::RefCell, fmt::Write, fs, path::Path, rc::Rc};
+
+    use public::l7_protocol::LogMessageType;
 
     use crate::{
         common::{
@@ -494,9 +514,10 @@ mod test {
             l7_protocol_log::ParseParam,
             l7_protocol_log::{L7PerfCache, L7ProtocolParserInterface},
         },
+        config::handler::LogParserConfig,
         flow_generator::protocol_logs::PostgreInfo,
         flow_generator::{protocol_logs::PostgresqlLog, L7_RRT_CACHE_CAPACITY},
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/postgre";
@@ -591,11 +612,12 @@ mod test {
         let mut p = capture.collect::<Vec<_>>();
         p[0].lookup_key.direction = PacketDirection::ClientToServer;
         p[1].lookup_key.direction = PacketDirection::ServerToClient;
+        let mut perf_stat = L7PerfStats::default();
 
         let mut parser = PostgresqlLog::default();
         let req_param = &mut ParseParam::new(
             &p[0],
-            log_cache.clone(),
+            Some(log_cache.clone()),
             Default::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Default::default(),
@@ -604,15 +626,20 @@ mod test {
         );
         let req_payload = p[0].get_l4_payload().unwrap();
         req_param.set_captured_byte(req_payload.len());
-        assert_eq!((&mut parser).check_payload(req_payload, req_param), true);
+        assert_eq!(
+            (&mut parser).check_payload(req_payload, req_param),
+            Some(LogMessageType::Request)
+        );
         let info = (&mut parser).parse_payload(req_payload, req_param).unwrap();
         let mut req = info.unwrap_single();
-
+        for i in parser.perf_stats() {
+            perf_stat.sequential_merge(&i);
+        }
         (&mut parser).reset();
 
         let resp_param = &mut ParseParam::new(
             &p[1],
-            log_cache.clone(),
+            Some(log_cache.clone()),
             Default::default(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Default::default(),
@@ -621,7 +648,7 @@ mod test {
         );
         let resp_payload = p[1].get_l4_payload().unwrap();
         resp_param.set_captured_byte(resp_payload.len());
-        assert_eq!((&mut parser).check_payload(resp_payload, resp_param), false);
+        assert_eq!((&mut parser).check_payload(resp_payload, resp_param), None);
         let mut resp = (&mut parser)
             .parse_payload(resp_payload, resp_param)
             .unwrap()
@@ -629,8 +656,110 @@ mod test {
 
         req.merge_log(&mut resp).unwrap();
         if let L7ProtocolInfo::PostgreInfo(info) = req {
-            return (info, parser.perf_stats.unwrap());
+            for i in parser.perf_stats() {
+                perf_stat.sequential_merge(&i);
+            }
+            return (info, perf_stat);
         }
         unreachable!()
+    }
+
+    fn run(name: &str, truncate: Option<usize>) -> String {
+        let pcap_file = Path::new(FILE_DIR).join(name);
+        let capture = Capture::load_pcap(pcap_file);
+        let log_cache = Rc::new(RefCell::new(L7PerfCache::new(L7_RRT_CACHE_CAPACITY)));
+        let mut packets = capture.collect::<Vec<_>>();
+        if packets.is_empty() {
+            return "".to_string();
+        }
+
+        let mut pgsql = PostgresqlLog::default();
+        let mut output: String = String::new();
+        let first_dst_port = packets[0].lookup_key.dst_port;
+        let log_config = LogParserConfig::default();
+        for packet in packets.iter_mut() {
+            packet.lookup_key.direction = if packet.lookup_key.dst_port == first_dst_port {
+                PacketDirection::ClientToServer
+            } else {
+                PacketDirection::ServerToClient
+            };
+            let payload = match packet.get_l4_payload() {
+                Some(p) => match truncate {
+                    Some(t) if t < p.len() => &p[..t],
+                    _ => p,
+                },
+                None => continue,
+            };
+
+            let mut param = ParseParam::new(
+                &*packet,
+                Some(log_cache.clone()),
+                Default::default(),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Default::default(),
+                true,
+                true,
+            );
+            param.parse_config = Some(&log_config);
+            param.set_captured_byte(payload.len());
+
+            let is_pgsql = pgsql.check_payload(payload, &param).is_some();
+            let info = pgsql.parse_payload(payload, &param);
+
+            if let Ok(info) = info {
+                if info.is_none() {
+                    let i = PostgreInfo::default();
+                    let _ = write!(
+                        &mut output,
+                        "{} is_pgsql: {}\n",
+                        serde_json::to_string(&i).unwrap(),
+                        is_pgsql
+                    );
+                    continue;
+                }
+                match info.unwrap_single() {
+                    L7ProtocolInfo::PostgreInfo(mut i) => {
+                        i.rrt = 0;
+                        let _ = write!(
+                            &mut output,
+                            "{} is_pgsql: {}\n",
+                            serde_json::to_string(&i).unwrap(),
+                            is_pgsql
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                let i = PostgreInfo::default();
+                let _ = write!(
+                    &mut output,
+                    "{} is_pgsql: {}\n",
+                    serde_json::to_string(&i).unwrap(),
+                    is_pgsql
+                );
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn check() {
+        let files = vec![("pgsql-all.pcap", "pgsql-all.result")];
+
+        for item in files.iter() {
+            let expected = fs::read_to_string(&Path::new(FILE_DIR).join(item.1)).unwrap();
+            let output = run(item.0, None);
+
+            if output != expected {
+                let output_path = Path::new("actual.txt");
+                fs::write(&output_path, &output).unwrap();
+                assert!(
+                    output == expected,
+                    "output different from expected {}, written to {:?}",
+                    item.1,
+                    output_path
+                );
+            }
+        }
     }
 }

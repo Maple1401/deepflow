@@ -14,36 +14,117 @@
  * limitations under the License.
  */
 
-use std::{cell::OnceCell, collections::HashMap, fmt, str};
+use std::{borrow::Cow, cell::OnceCell, collections::HashMap, fmt, str};
 
 use serde::{Serialize, Serializer};
+use strum_macros::Display;
 
-use super::{
-    super::{value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType},
-    ObfuscateCache,
+#[cfg(feature = "enterprise")]
+use enterprise_utils::l7::custom_policy::custom_field_policy::{
+    enums::{Op, Source},
+    Store,
 };
+use public::l7_protocol::{Field, FieldSetter, L7Log, L7LogAttribute, LogMessageType};
+use public_derive::L7Log;
 
 use crate::{
     common::{
         enums::IpProtocol,
         flow::{L7PerfStats, L7Protocol, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     config::handler::LogParserConfig,
     flow_generator::{
         error::{Error, Result},
         protocol_logs::{
-            pb_adapter::{L7ProtocolSendLog, L7Request, L7Response},
+            pb_adapter::{ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response},
             set_captured_byte,
         },
     },
 };
 
+use super::super::{value_is_default, AppProtoHead, L7ResponseStatus};
+
 const SEPARATOR_SIZE: usize = 2;
 
-#[derive(Serialize, Debug, Default, Clone)]
+#[derive(Clone, Display, Debug, Default)]
+enum ResponseType {
+    #[strum(serialize = "Unknown redis format")]
+    #[default]
+    Unknown,
+    #[strum(serialize = "+ Simple string")]
+    String,
+    #[strum(serialize = "- Simple error")]
+    Error,
+    #[strum(serialize = ": Integer")]
+    Integer,
+    #[strum(serialize = "$ Bulk string")]
+    BulkString,
+    #[strum(serialize = "* Array")]
+    Array,
+    #[strum(serialize = "_ Nulls")]
+    Null,
+    #[strum(serialize = "# Boolean")]
+    Boolean,
+    #[strum(serialize = ", Double")]
+    Double,
+    #[strum(serialize = "( Big number")]
+    BigNumber,
+    #[strum(serialize = "! Bulk error")]
+    BulkError,
+    #[strum(serialize = "= Verbatim string")]
+    VerbatimString,
+    #[strum(serialize = "% Map")]
+    Map,
+    #[strum(serialize = "~ Set")]
+    Set,
+    #[strum(serialize = "> Push")]
+    Push,
+}
+
+impl Serialize for ResponseType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl From<u8> for ResponseType {
+    fn from(value: u8) -> Self {
+        match value {
+            b'+' => ResponseType::String,
+            b'-' => ResponseType::Error,
+            b':' => ResponseType::Integer,
+            b'$' => ResponseType::BulkString,
+            b'*' => ResponseType::Array,
+            b'_' => ResponseType::Null,
+            b'#' => ResponseType::Boolean,
+            b',' => ResponseType::Double,
+            b'(' => ResponseType::BigNumber,
+            b'!' => ResponseType::BulkError,
+            b'=' => ResponseType::VerbatimString,
+            b'%' => ResponseType::Map,
+            b'~' => ResponseType::Set,
+            b'>' => ResponseType::Push,
+            _ => ResponseType::Unknown,
+        }
+    }
+}
+
+#[derive(L7Log, Serialize, Debug, Default, Clone)]
+#[l7_log(version.skip = "true", request_domain.skip = "true", endpoint.skip = "true")]
+#[l7_log(response_code.skip = "true")]
+#[l7_log(request_id.skip = "true", http_proxy_client.skip = "true")]
+#[l7_log(trace_id.skip = "true", span_id.skip = "true", x_request_id.skip = "true")]
+#[l7_log(biz_code.skip = "true", biz_type.skip = "true", biz_scenario.skip = "true")]
+#[l7_log(request_resource.getter = "RedisInfo::get_request_resource", request_resource.setter = "RedisInfo::set_request_resource")]
+#[l7_log(request_type.getter = "RedisInfo::get_request_type", request_type.setter = "RedisInfo::set_request_type")]
+#[l7_log(response_result.getter = "RedisInfo::get_response_result", response_result.setter = "RedisInfo::set_response_result")]
+#[l7_log(response_exception.getter = "RedisInfo::get_response_exception", response_exception.setter = "RedisInfo::set_response_exception")]
 pub struct RedisInfo {
     msg_type: LogMessageType,
     #[serde(skip)]
@@ -73,8 +154,10 @@ pub struct RedisInfo {
         serialize_with = "vec_u8_to_string"
     )]
     pub error: Vec<u8>, // '-'
+    #[l7_log(response_status)]
     #[serde(rename = "response_status")]
     pub resp_status: L7ResponseStatus,
+    response_result: ResponseType,
 
     captured_request_byte: u32,
     captured_response_byte: u32,
@@ -82,7 +165,22 @@ pub struct RedisInfo {
     rrt: u64,
 
     #[serde(skip)]
+    attributes: Vec<KeyVal>,
+
+    #[serde(skip)]
     is_on_blacklist: bool,
+
+    #[serde(skip_serializing_if = "value_is_default")]
+    biz_response_code: String,
+}
+
+impl L7LogAttribute for RedisInfo {
+    fn add_attribute(&mut self, name: Cow<'_, str>, value: Cow<'_, str>) {
+        self.attributes.push(KeyVal {
+            key: name.into_owned(),
+            val: value.into_owned(),
+        });
+    }
 }
 
 impl L7ProtocolInfoInterface for RedisInfo {
@@ -126,14 +224,59 @@ where
 }
 
 impl RedisInfo {
+    fn get_field_from_bytes(bytes: &Vec<u8>) -> Field<'_> {
+        match str::from_utf8(bytes) {
+            Ok(s) => Field::from(s),
+            Err(_) => Field::None,
+        }
+    }
+
+    fn set_field_to_bytes(field: FieldSetter<'_>, bytes: &mut Vec<u8>) {
+        *bytes = field.into_inner().to_string().into_bytes();
+    }
+
+    pub fn get_request_resource(&self) -> Field<'_> {
+        Self::get_field_from_bytes(&self.request)
+    }
+
+    pub fn set_request_resource(&mut self, setter: FieldSetter<'_>) {
+        Self::set_field_to_bytes(setter, &mut self.request);
+    }
+
+    pub fn get_request_type(&self) -> Field<'_> {
+        Self::get_field_from_bytes(&self.request_type)
+    }
+
+    pub fn set_request_type(&mut self, setter: FieldSetter<'_>) {
+        Self::set_field_to_bytes(setter, &mut self.request_type);
+    }
+
+    pub fn get_response_result(&self) -> Field<'_> {
+        Self::get_field_from_bytes(&self.status)
+    }
+
+    pub fn set_response_result(&mut self, setter: FieldSetter<'_>) {
+        Self::set_field_to_bytes(setter, &mut self.status);
+    }
+
+    pub fn get_response_exception(&self) -> Field<'_> {
+        Self::get_field_from_bytes(&self.error)
+    }
+
+    pub fn set_response_exception(&mut self, setter: FieldSetter<'_>) {
+        Self::set_field_to_bytes(setter, &mut self.error);
+    }
+
     pub fn merge(&mut self, other: &mut Self) -> Result<()> {
         std::mem::swap(&mut self.status, &mut other.status);
         std::mem::swap(&mut self.error, &mut other.error);
+        std::mem::swap(&mut self.response_result, &mut other.response_result);
         self.resp_status = other.resp_status;
         self.captured_response_byte = other.captured_response_byte;
         if other.is_on_blacklist {
             self.is_on_blacklist = other.is_on_blacklist;
         }
+        self.attributes.append(&mut other.attributes);
         Ok(())
     }
 
@@ -165,6 +308,7 @@ impl fmt::Display for RedisInfo {
             "status: {:?}, ",
             str::from_utf8(&self.status).unwrap_or_default()
         )?;
+        write!(f, "response_result: {:?}, ", &self.response_result)?;
         write!(
             f,
             "error: {:?} }}",
@@ -176,9 +320,9 @@ impl fmt::Display for RedisInfo {
 impl From<RedisInfo> for L7ProtocolSendLog {
     fn from(f: RedisInfo) -> Self {
         let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         let log = L7ProtocolSendLog {
             captured_request_byte: f.captured_request_byte,
@@ -191,64 +335,113 @@ impl From<RedisInfo> for L7ProtocolSendLog {
             resp: L7Response {
                 status: f.resp_status,
                 exception: String::from_utf8_lossy(f.error.as_slice()).to_string(),
+                result: f.response_result.to_string(),
                 ..Default::default()
             },
+            ext_info: Some(ExtendedInfo {
+                attributes: {
+                    if f.attributes.is_empty() {
+                        None
+                    } else {
+                        Some(f.attributes)
+                    }
+                },
+                ..Default::default()
+            }),
             flags,
+            biz_response_code: f.biz_response_code,
             ..Default::default()
         };
         return log;
     }
 }
 
+impl From<&RedisInfo> for LogCache {
+    fn from(info: &RedisInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.resp_status,
+            on_blacklist: info.is_on_blacklist,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct RedisLog {
     has_request: bool,
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
     obfuscate: bool,
-    last_is_on_blacklist: bool,
+    #[cfg(feature = "enterprise")]
+    custom_field_store: Store,
 }
 
 impl L7ProtocolParserInterface for RedisLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
 
-        CommandLine::new(payload).is_ok()
+        if CommandLine::new(payload).is_ok() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
+        self.obfuscate = param.obfuscate_cache.is_some();
+        #[cfg(feature = "enterprise")]
+        self.custom_field_store.clear();
+        #[cfg(feature = "enterprise")]
+        let custom_policies = param
+            .parse_config
+            .and_then(|config| config.get_custom_field_policies(L7Protocol::Redis.into(), param));
+
+        let mut info = RedisInfo {
+            is_tls: param.is_tls(),
+            ..Default::default()
         };
-        let mut info = RedisInfo::default();
-        info.is_tls = param.is_tls();
         self.parse(payload, param.l4_protocol, param.direction, &mut info)?;
+
+        #[cfg(feature = "enterprise")]
+        if let Some(cp) = custom_policies {
+            cp.apply(
+                &mut self.custom_field_store,
+                &info,
+                param.direction.into(),
+                Source::Dummy,
+            );
+            for op in self.custom_field_store.drain_with(cp, &info) {
+                match &op.op {
+                    Op::SaveHeader(_) => (),
+                    Op::SavePayload(key) => {
+                        info.attributes.push(KeyVal {
+                            key: key.to_string(),
+                            val: String::from_utf8_lossy(payload).to_string(),
+                        });
+                    }
+                    _ => (),
+                }
+            }
+        }
+
         set_captured_byte!(info, param);
         if let Some(config) = param.parse_config {
             info.set_is_on_blacklist(config);
         }
-        if !info.is_on_blacklist && !self.last_is_on_blacklist {
-            match param.direction {
-                PacketDirection::ClientToServer => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req());
-                }
-                PacketDirection::ServerToClient => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp());
-                    if info.resp_status == L7ResponseStatus::ServerError {
-                        self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                    }
-                }
+        self.perf_stats.clear();
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if let Some(stats) = info.perf_stats(param) {
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
             }
-            info.cal_rrt(param, &None).map(|(rrt, _)| {
-                info.rrt = rrt;
-                self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-            });
+            self.perf_stats.push(perf_stat);
         }
-        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::RedisInfo(info)))
         } else {
@@ -264,18 +457,14 @@ impl L7ProtocolParserInterface for RedisLog {
         false
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
-    }
-
-    fn set_obfuscate_cache(&mut self, obfuscate_cache: Option<ObfuscateCache>) {
-        self.obfuscate = obfuscate_cache.is_some();
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
 impl RedisLog {
     fn reset(&mut self) {
-        self.perf_stats = None;
+        self.perf_stats = vec![];
     }
 
     fn fill_request(&mut self, request: CommandLine, info: &mut RedisInfo) {
@@ -285,12 +474,12 @@ impl RedisLog {
         self.has_request = true;
     }
 
-    fn fill_response(&mut self, context: Vec<u8>, info: &mut RedisInfo) {
+    fn fill_response(&mut self, context: (Vec<u8>, ResponseType), info: &mut RedisInfo) {
         info.msg_type = LogMessageType::Response;
         self.has_request = false;
-
+        let (context, response_type) = context;
         info.resp_status = L7ResponseStatus::Ok;
-
+        info.response_result = response_type;
         if context.is_empty() {
             return;
         }
@@ -609,7 +798,7 @@ mod stringifier {
         }
     }
 
-    pub fn decode(payload: &[u8], strict: bool) -> Result<Vec<u8>> {
+    pub fn decode(payload: &[u8], strict: bool) -> Result<(Vec<u8>, ResponseType)> {
         if payload.is_empty() {
             return Err(Error::RedisLogParseFailed);
         }
@@ -621,7 +810,7 @@ mod stringifier {
             (_, Err(Error::RedisLogParseFailed)) | (true, Err(Error::RedisLogParsePartial)) => {
                 Err(Error::RedisLogParseFailed)
             }
-            _ => Ok(output),
+            _ => Ok((output, ResponseType::from(payload[0]))),
         }
     }
 }
@@ -1052,7 +1241,7 @@ mod tests {
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
         flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/redis";
@@ -1082,7 +1271,7 @@ mod tests {
 
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -1092,7 +1281,7 @@ mod tests {
             param.set_captured_byte(payload.len());
 
             let is_redis = match packet.lookup_key.direction {
-                PacketDirection::ClientToServer => redis.check_payload(payload, param),
+                PacketDirection::ClientToServer => redis.check_payload(payload, param).is_some(),
                 PacketDirection::ServerToClient => stringifier::decode(payload, false).is_ok(),
             };
 
@@ -1174,7 +1363,10 @@ mod tests {
         for (input, expected) in testcases.iter() {
             let output = stringifier::decode(&input.0.as_bytes(), input.1);
             assert_eq!(
-                output.ok().as_ref().and_then(|vs| str::from_utf8(vs).ok()),
+                output
+                    .ok()
+                    .as_ref()
+                    .and_then(|vs| str::from_utf8(&vs.0).ok()),
                 *expected,
                 "testcase input '{}' failed",
                 str::from_utf8(input.0.as_bytes()).unwrap().escape_default()
@@ -1282,7 +1474,7 @@ mod tests {
         if packets.len() < 2 {
             unreachable!();
         }
-
+        let mut perf_stat = L7PerfStats::default();
         let first_dst_port = packets[0].lookup_key.dst_port;
         for packet in packets.iter_mut() {
             if packet.lookup_key.dst_port == first_dst_port {
@@ -1295,7 +1487,7 @@ mod tests {
                     packet.get_l4_payload().unwrap(),
                     &ParseParam::new(
                         &*packet,
-                        rrt_cache.clone(),
+                        Some(rrt_cache.clone()),
                         Default::default(),
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         Default::default(),
@@ -1303,9 +1495,12 @@ mod tests {
                         true,
                     ),
                 );
+                for i in redis.perf_stats() {
+                    perf_stat.sequential_merge(&i);
+                }
             }
         }
-        redis.perf_stats.unwrap()
+        perf_stat
     }
 
     fn encode_redis_command(command: &str) -> Vec<u8> {

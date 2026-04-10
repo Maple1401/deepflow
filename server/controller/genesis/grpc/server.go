@@ -40,7 +40,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/genesis/common"
 	"github.com/deepflowio/deepflow/server/controller/genesis/config"
 	kstore "github.com/deepflowio/deepflow/server/controller/genesis/store/kubernetes"
-	sstore "github.com/deepflowio/deepflow/server/controller/genesis/store/sync"
+	tcommon "github.com/deepflowio/deepflow/server/controller/trisolaris/common"
 	"github.com/deepflowio/deepflow/server/libs/logger"
 	"github.com/deepflowio/deepflow/server/libs/queue"
 )
@@ -76,14 +76,14 @@ type SynchronizerServer struct {
 	vtapToLastSeen                     sync.Map
 	clusterIDToLastSeen                sync.Map
 	agentStatsMap                      sync.Map
+	gsync                              common.GenesisSync
 	workloadResourceEnabledCache       *cache.Cache
 	workloadResourceChangeEnabledCache *cache.Cache
-	gsync                              *sstore.GenesisSync
 	gkubernetes                        *kstore.GenesisKubernetes
 }
 
 func NewGenesisSynchronizerServer(cfg config.GenesisConfig, genesisSyncQueue, k8sQueue queue.QueueWriter,
-	gsync *sstore.GenesisSync, gkubernetes *kstore.GenesisKubernetes) *SynchronizerServer {
+	gsync common.GenesisSync, gkubernetes *kstore.GenesisKubernetes) *SynchronizerServer {
 	return &SynchronizerServer{
 		cfg:                                cfg,
 		k8sQueue:                           k8sQueue,
@@ -109,7 +109,7 @@ func (g *SynchronizerServer) GenerateCache() {
 	for _, orgID := range orgIDs {
 		db, err := metadb.GetDB(orgID)
 		if err != nil {
-			log.Errorf("get org (%d) metadb session failed", orgID)
+			log.Errorf("get metadb session failed: %s", err.Error(), logger.NewORGPrefix(orgID))
 			continue
 		}
 		var agentGroups []metadbmodel.VTapGroup
@@ -137,7 +137,7 @@ func (g *SynchronizerServer) GenerateCache() {
 				log.Errorf("parse agent config lcuuid (%s) yaml (%s) failed", config.Lcuuid, config.Yaml, logger.NewORGPrefix(orgID))
 				continue
 			}
-			if !k.Bool(common.CONFIG_KEY_WORKLOAD_RESOURCE_ENABLED) {
+			if !k.Bool(tcommon.CONFIG_KEY_WORKLOAD_RESOURCE_ENABLED) {
 				log.Debugf("agent group configuration (ID:%d) workload resource sync disabled", config.ID, logger.NewORGPrefix(orgID))
 				continue
 			}
@@ -153,6 +153,7 @@ func (g *SynchronizerServer) GenerateCache() {
 				g.workloadResourceEnabledCache.SetDefault(fmt.Sprintf("%d-", orgID), true)
 			}
 			g.workloadResourceEnabledCache.SetDefault(key, true)
+			g.workloadResourceEnabledCache.SetDefault(fmt.Sprintf("%d-%s", orgID, group.Name), true)
 		}
 	}
 }
@@ -457,7 +458,7 @@ func (g *SynchronizerServer) GenesisSharingK8S(ctx context.Context, request *con
 		return &controller.GenesisSharingK8SResponse{
 			Epoch:    &epochStr,
 			ErrorMsg: &k8sData.ErrorMSG,
-			Entries:  k8sData.Entries,
+			Entries:  k8sData.EntriesJson,
 		}, nil
 	}
 

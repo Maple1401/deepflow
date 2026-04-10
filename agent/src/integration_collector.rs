@@ -60,6 +60,7 @@ use crate::{
     policy::PolicyGetter,
 };
 
+#[cfg(feature = "enterprise-integration")]
 use integration_skywalking::{
     handle_skywalking_request, handle_skywalking_streaming_request, SkyWalkingExtra,
 };
@@ -216,8 +217,9 @@ async fn aggregate_with_catch_exception(
                 .body(e.to_string().into())
                 .unwrap()
         } else {
-            error!("integration collector error: {}", e);
-            exception_handler.set(Exception::IntegrationSocketError);
+            let error_msg = format!("integration collector error: {}", e);
+            error!("{}", error_msg);
+            exception_handler.set(Exception::IntegrationSocketError, Some(error_msg));
             Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body(e.to_string().into())
@@ -570,6 +572,7 @@ fn fill_l7_stats(
         time_in_second: flow_stat_time.into(),
         biz_type: 0,
         time_span: 0,
+        is_reversed: false,
     }
 }
 
@@ -611,7 +614,7 @@ async fn handler(
     telegraf_sender: DebugSender<TelegrafMetric>,
     profile_sender: DebugSender<Profile>,
     application_log_sender: DebugSender<ApplicationLog>,
-    skywalking_sender: DebugSender<SkyWalkingExtra>,
+    #[cfg(feature = "enterprise-integration")] skywalking_sender: DebugSender<SkyWalkingExtra>,
     datadog_sender: DebugSender<Datadog>,
     exception_handler: ExceptionHandler,
     compressed: bool,
@@ -843,6 +846,7 @@ async fn handler(
 
             Ok(Response::builder().body(Body::empty()).unwrap())
         }
+        #[cfg(feature = "enterprise-integration")]
         (
             &Method::POST,
             "/v3/segments"
@@ -865,6 +869,7 @@ async fn handler(
                     .await,
             )
         }
+        #[cfg(feature = "enterprise-integration")]
         (
             &Method::POST,
             "/skywalking.v3.TraceSegmentReportService/collect"
@@ -1040,6 +1045,7 @@ pub struct MetricServer {
     telegraf_sender: DebugSender<TelegrafMetric>,
     profile_sender: DebugSender<Profile>,
     application_log_sender: DebugSender<ApplicationLog>,
+    #[cfg(feature = "enterprise-integration")]
     skywalking_sender: DebugSender<SkyWalkingExtra>,
     datadog_sender: DebugSender<Datadog>,
     port: Arc<AtomicU16>,
@@ -1069,7 +1075,7 @@ impl MetricServer {
         telegraf_sender: DebugSender<TelegrafMetric>,
         profile_sender: DebugSender<Profile>,
         application_log_sender: DebugSender<ApplicationLog>,
-        skywalking_sender: DebugSender<SkyWalkingExtra>,
+        #[cfg(feature = "enterprise-integration")] skywalking_sender: DebugSender<SkyWalkingExtra>,
         datadog_sender: DebugSender<Datadog>,
         port: u16,
         exception_handler: ExceptionHandler,
@@ -1099,6 +1105,7 @@ impl MetricServer {
                 telegraf_sender,
                 profile_sender,
                 application_log_sender,
+                #[cfg(feature = "enterprise-integration")]
                 skywalking_sender,
                 datadog_sender,
                 port: Arc::new(AtomicU16::new(port)),
@@ -1150,6 +1157,7 @@ impl MetricServer {
         let telegraf_sender = self.telegraf_sender.clone();
         let profile_sender = self.profile_sender.clone();
         let application_log_sender = self.application_log_sender.clone();
+        #[cfg(feature = "enterprise-integration")]
         let skywalking_sender = self.skywalking_sender.clone();
         let datadog_sender = self.datadog_sender.clone();
         let port = self.port.clone();
@@ -1209,8 +1217,13 @@ impl MetricServer {
                                     sleep(Duration::from_secs(1));
                                     continue;
                                 }
-                                error!("integration collector error: {} with addr={}", e, addr);
-                                exception_handler.set(Exception::IntegrationSocketError);
+                                let error_msg = format!(
+                                    "integration collector error: {} with addr={}",
+                                    e, addr
+                                );
+                                error!("{}", error_msg);
+                                exception_handler
+                                    .set(Exception::IntegrationSocketError, Some(error_msg));
                                 sleep(Duration::from_secs(60));
                                 continue;
                             }
@@ -1224,6 +1237,7 @@ impl MetricServer {
                     let telegraf_sender = telegraf_sender.clone();
                     let profile_sender = profile_sender.clone();
                     let application_log_sender = application_log_sender.clone();
+                    #[cfg(feature = "enterprise-integration")]
                     let skywalking_sender = skywalking_sender.clone();
                     let datadog_sender = datadog_sender.clone();
                     let exception_handler_inner = exception_handler.clone();
@@ -1243,6 +1257,7 @@ impl MetricServer {
                         let telegraf_sender = telegraf_sender.clone();
                         let profile_sender = profile_sender.clone();
                         let application_log_sender = application_log_sender.clone();
+                        #[cfg(feature = "enterprise-integration")]
                         let skywalking_sender = skywalking_sender.clone();
                         let datadog_sender = datadog_sender.clone();
                         let exception_handler = exception_handler_inner.clone();
@@ -1268,6 +1283,7 @@ impl MetricServer {
                                     telegraf_sender.clone(),
                                     profile_sender.clone(),
                                     application_log_sender.clone(),
+                                    #[cfg(feature = "enterprise-integration")]
                                     skywalking_sender.clone(),
                                     datadog_sender.clone(),
                                     exception_handler.clone(),
@@ -1296,8 +1312,9 @@ impl MetricServer {
                     info!("integration collector started");
                     info!("integration collector listening on http://{}", addr);
                     if let Err(e) = server.await {
-                        error!("external metric collector error: {}", e);
-                        exception_handler.set(Exception::IntegrationSocketError);
+                        let error_msg = format!("external metric collector error: {}", e);
+                        error!("{}", error_msg);
+                        exception_handler.set(Exception::IntegrationSocketError, Some(error_msg));
                     }
                 }
 

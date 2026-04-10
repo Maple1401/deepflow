@@ -22,9 +22,10 @@ pub(crate) mod mq;
 mod parser;
 pub mod pb_adapter;
 pub(crate) mod ping;
-pub(crate) mod plugin;
+pub mod plugin;
 pub(crate) mod rpc;
 pub(crate) mod sql;
+
 pub use self::http::{check_http_method, parse_v1_headers, HttpInfo, HttpLog};
 use self::pb_adapter::L7ProtocolSendLog;
 
@@ -33,7 +34,6 @@ pub use mq::{
     AmqpInfo, AmqpLog, KafkaInfo, KafkaLog, MqttInfo, MqttLog, NatsInfo, NatsLog, OpenWireInfo,
     OpenWireLog, PulsarInfo, PulsarLog, RocketmqInfo, RocketmqLog, ZmtpInfo, ZmtpLog,
 };
-use num_enum::TryFromPrimitive;
 pub use parser::{AppProto, MetaAppProto, SessionAggregator};
 pub use ping::{PingInfo, PingLog};
 pub use rpc::{
@@ -47,10 +47,12 @@ pub use sql::{
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "enterprise")] {
+        use std::borrow::Cow;
         pub mod tls;
 
+        pub use mq::{WebSphereMqInfo, WebSphereMqLog};
+        pub use rpc::{Iso8583Info, Iso8583Log, SomeIpInfo, SomeIpLog};
         pub use sql::{OracleInfo, OracleLog};
-        pub use rpc::{SomeIpInfo, SomeIpLog};
         pub use tls::{TlsInfo, TlsLog};
     }
 }
@@ -59,6 +61,7 @@ cfg_if::cfg_if! {
 pub use self::plugin::wasm::{get_wasm_parser, WasmLog};
 
 use std::{
+    collections::HashSet,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     str,
@@ -78,75 +81,14 @@ use crate::{
     },
     metric::document::TapSide,
 };
+use public::l7_protocol::LogMessageType;
 use public::proto::flow_log;
 use public::sender::{SendMessageType, Sendable};
 use public::utils::net::MacAddr;
 
 const NANOS_PER_MICRO: u64 = 1000;
 
-#[derive(Serialize, Debug, Default, PartialEq, Copy, Clone, Eq, TryFromPrimitive)]
-#[repr(u8)]
-pub enum L7ResponseStatus {
-    Ok = 0,
-    Timeout = 2,
-    ServerError = 3,
-    ClientError = 4,
-    #[default]
-    Unknown = 5,
-    ParseFailed = 6,
-}
-
-impl L7ResponseStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Timeout => "timeout",
-            Self::ServerError => "server_error",
-            Self::ClientError => "client_error",
-            Self::ParseFailed => "parse_failed",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-impl From<&str> for L7ResponseStatus {
-    fn from(s: &str) -> Self {
-        match s {
-            "ok" => L7ResponseStatus::Ok,
-            "timeout" => L7ResponseStatus::Timeout,
-            "server_error" => L7ResponseStatus::ServerError,
-            "client_error" => L7ResponseStatus::ClientError,
-            "parse_failed" => L7ResponseStatus::ParseFailed,
-            "unknown" => L7ResponseStatus::Unknown,
-            _ => L7ResponseStatus::Unknown,
-        }
-    }
-}
-
-#[derive(Serialize, Debug, PartialEq, Eq, Clone, Copy, TryFromPrimitive)]
-#[repr(u8)]
-pub enum LogMessageType {
-    Request,
-    Response,
-    Session,
-    Other,
-    Max,
-}
-
-impl Default for LogMessageType {
-    fn default() -> Self {
-        LogMessageType::Other
-    }
-}
-
-impl From<PacketDirection> for LogMessageType {
-    fn from(d: PacketDirection) -> LogMessageType {
-        match d {
-            PacketDirection::ClientToServer => LogMessageType::Request,
-            PacketDirection::ServerToClient => LogMessageType::Response,
-        }
-    }
-}
+pub use public::enums::L7ResponseStatus;
 
 // 应用层协议原始数据类型
 #[derive(Debug, PartialEq, Copy, Clone, Serialize)]
@@ -267,6 +209,57 @@ pub struct AppProtoLogsBaseInfo {
     pub pod_id_1: u32,
 }
 
+impl Default for AppProtoLogsBaseInfo {
+    fn default() -> Self {
+        Self {
+            start_time: Default::default(),
+            end_time: Default::default(),
+            flow_id: Default::default(),
+            tap_port: Default::default(),
+            signal_source: Default::default(),
+            agent_id: Default::default(),
+            tap_type: Default::default(),
+            tap_side: Default::default(),
+            biz_type: Default::default(),
+            head: Default::default(),
+
+            mac_src: Default::default(),
+            mac_dst: Default::default(),
+            ip_src: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ip_dst: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            l3_epc_id_src: Default::default(),
+            l3_epc_id_dst: Default::default(),
+            port_src: Default::default(),
+            port_dst: Default::default(),
+            req_tcp_seq: Default::default(),
+            resp_tcp_seq: Default::default(),
+
+            gpid_0: Default::default(),
+            gpid_1: Default::default(),
+
+            ebpf_type: Default::default(),
+            process_id_0: Default::default(),
+            process_id_1: Default::default(),
+            process_kname_0: Default::default(),
+            process_kname_1: Default::default(),
+            syscall_trace_id_request: Default::default(),
+            syscall_trace_id_response: Default::default(),
+            syscall_trace_id_thread_0: Default::default(),
+            syscall_trace_id_thread_1: Default::default(),
+            syscall_coroutine_0: Default::default(),
+            syscall_coroutine_1: Default::default(),
+            syscall_cap_seq_0: Default::default(),
+            syscall_cap_seq_1: Default::default(),
+
+            protocol: Default::default(),
+            is_vip_interface_src: Default::default(),
+            is_vip_interface_dst: Default::default(),
+            pod_id_0: Default::default(),
+            pod_id_1: Default::default(),
+        }
+    }
+}
+
 pub fn timestamp_to_micros<S>(d: &Timestamp, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -287,6 +280,21 @@ where
     T: Default + std::cmp::PartialEq,
 {
     t == &T::default()
+}
+
+pub fn serialize_attributes<S>(
+    attrs: &[pb_adapter::KeyVal],
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(attrs.len()))?;
+    for kv in attrs {
+        map.serialize_entry(&kv.key, &kv.val)?;
+    }
+    map.end()
 }
 
 pub fn value_is_negative<T>(t: &T) -> bool
@@ -413,7 +421,38 @@ impl AppProtoLogsBaseInfo {
             (self.end_time.as_micros() - self.start_time.as_micros()) as u64
         } else {
             0
+        };
+
+        if self.biz_type == 0 {
+            self.biz_type = log.biz_type;
         }
+    }
+
+    fn reverse(&mut self) {
+        std::mem::swap(&mut self.mac_src, &mut self.mac_dst);
+        std::mem::swap(&mut self.ip_src, &mut self.ip_dst);
+        std::mem::swap(&mut self.l3_epc_id_src, &mut self.l3_epc_id_dst);
+        std::mem::swap(&mut self.port_src, &mut self.port_dst);
+        std::mem::swap(&mut self.req_tcp_seq, &mut self.resp_tcp_seq);
+        std::mem::swap(&mut self.gpid_0, &mut self.gpid_1);
+        std::mem::swap(&mut self.process_id_0, &mut self.process_id_1);
+        std::mem::swap(&mut self.process_kname_0, &mut self.process_kname_1);
+        std::mem::swap(
+            &mut self.syscall_trace_id_request,
+            &mut self.syscall_trace_id_response,
+        );
+        std::mem::swap(
+            &mut self.syscall_trace_id_thread_0,
+            &mut self.syscall_trace_id_thread_1,
+        );
+        std::mem::swap(&mut self.syscall_coroutine_0, &mut self.syscall_coroutine_1);
+        std::mem::swap(&mut self.syscall_cap_seq_0, &mut self.syscall_cap_seq_1);
+        std::mem::swap(
+            &mut self.is_vip_interface_src,
+            &mut self.is_vip_interface_dst,
+        );
+        std::mem::swap(&mut self.pod_id_0, &mut self.pod_id_1);
+        self.tap_side.reverse();
     }
 }
 
@@ -551,82 +590,249 @@ macro_rules! set_captured_byte {
 pub(crate) use set_captured_byte;
 pub(crate) use swap_if;
 
-pub struct PrioField<T> {
-    pub prio: u8,
-    pub field: T,
-}
+const BASE_FIELD_PRIORITY: u8 = 128;
+const CUSTOM_FIELD_POLICY_PRIORITY: u8 = 64;
+const PLUGIN_FIELD_PRIORITY: u8 = 32;
 
-impl<T> PrioField<T> {
-    pub fn new(prio: u8, field: T) -> Self {
-        Self { prio, field }
+pub use public::types::PrioField;
+pub use public::types::PrioStrings;
+
+// Wrapper around Option<Vec<PrioField<String>>> for easier manipulation
+#[derive(Serialize, Debug, Default, Clone, Eq, PartialEq)]
+pub struct PrioFields(pub Vec<PrioField<String>>);
+
+impl PrioFields {
+    #[inline]
+    pub fn new() -> Self {
+        Self(Vec::new())
     }
 
-    pub fn into_inner(self) -> T {
-        self.field
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    // insertion is kept in ascending order by prio; if prio is the same, insert it at the end (stable sort)
+    #[inline]
+    fn insert_sorted(&mut self, field: PrioField<String>) {
+        if field.get().is_empty() {
+            return;
+        }
+        // find the first position greater than it (>), skip those that are equal
+        let pos = match self.0.binary_search_by(|x| x.prio().cmp(&field.prio())) {
+            Ok(mut i) => {
+                while i < self.0.len() && self.0[i].prio() == field.prio() {
+                    i += 1;
+                }
+                i
+            }
+            // no larger one found, insert it at position i
+            Err(i) => i,
+        };
+        self.0.insert(pos, field);
+    }
+
+    // merge another PrioFields (without deduplication)
+    #[inline]
+    pub fn merge(&mut self, mut other: PrioFields) {
+        if other.0.is_empty() {
+            return;
+        }
+
+        // take ownership and move elements directly
+        for o in other.0.drain(..) {
+            self.insert_sorted(o);
+        }
+    }
+
+    // merge a list of same-prio strings, consuming the input (without deduplication)
+    pub fn merge_same_priority(&mut self, prio: u8, mut others: Vec<String>) {
+        if others.is_empty() {
+            return;
+        }
+
+        // move each string out of the vector without cloning
+        for field in others.drain(..) {
+            self.insert_sorted(PrioField::new(prio, field));
+        }
+    }
+
+    // merge a single field (without deduplication)
+    pub fn merge_field(&mut self, prio: u8, field: String) {
+        self.insert_sorted(PrioField::new(prio, field));
+    }
+
+    // convert to Vec<String> (already sorted)
+    #[inline]
+    pub fn to_strings(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::with_capacity(self.0.len());
+        for pf in &self.0 {
+            if seen.insert(pf.get()) {
+                result.push(pf.get().clone());
+            }
+        }
+        result
+    }
+
+    #[inline]
+    pub fn into_strings_top3(self) -> Vec<String> {
+        let mut result = Vec::with_capacity(3);
+
+        for pf in self.0 {
+            let field = pf.into_inner();
+
+            if result.iter().any(|f| f == &field) {
+                continue;
+            }
+
+            result.push(field);
+            if result.len() == 3 {
+                break;
+            }
+        }
+        result
+    }
+
+    // get first element's priority, or return max
+    #[inline]
+    pub fn highest_priority(&self) -> u8 {
+        self.0.first().map(|pf| pf.prio()).unwrap_or(u8::MAX)
+    }
+
+    #[inline]
+    pub fn highest(&self) -> &str {
+        self.0.first().map(|pf| pf.get().as_str()).unwrap_or("")
     }
 }
 
-impl<T: Clone> Clone for PrioField<T> {
-    fn clone(&self) -> Self {
-        Self {
-            prio: self.prio,
-            field: self.field.clone(),
+cfg_if::cfg_if! {
+    if #[cfg(feature = "enterprise")] {
+        use log::warn;
+
+        use enterprise_utils::l7::custom_policy::custom_field_policy::enums::{Op, Operation};
+        use public::l7_protocol::{FieldSetter, L7Log};
+
+        pub fn auto_merge_custom_field<L: L7Log>(op: Operation, log: &mut L) {
+            let Operation { op, prio } = op;
+            match op {
+                Op::RewriteResponseStatus(status) => log.set_response_status(status),
+                Op::RewriteNativeTag(tag, value) => {
+                    let field = FieldSetter::new(CUSTOM_FIELD_POLICY_PRIORITY + prio, value.as_str().into());
+                    log.set(tag, field);
+                }
+                Op::AddAttribute(name, value) => log.add_attribute(Cow::Borrowed(name.as_str()), Cow::Borrowed(value.as_str())),
+                _ => warn!("Ignored operation {op:?} that is not supported by auto custom field merging"),
+            }
         }
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for PrioField<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "PrioField {{ prio: {}, field: {:?} }}",
-            self.prio, self.field
-        )
+// Estimate RRT (microseconds) from a time string.
+//
+// Only integer-offset time zones are supported (non-integer ones like India and Nepal are not supported).
+// Since the timezone of the input time is unknown, for integer-offset time zones the minute and second
+// values are the same across time zones, only the hour may differ.
+// As RRT is limited to within 2 minutes, the hour can be ignored and RRT can be computed using only mm:ss.
+// If the response crosses an hour boundary, add 3600 seconds for correction.
+//
+// Input:
+// - mmss: "mmss" (4), must be in Beijing Time (UTC+8)
+// - now_us: current time in microseconds since epoch
+//
+// Behavior:
+// - infer current or previous hour for cross-hour
+// - Compute microsecond difference with now_us
+// - Clamp future time to 0
+// - Ignore if older than 2 minutes
+pub fn estimate_rrt_us_by_beijing_mmss(mmss: &str, now_us: u64) -> Option<u64> {
+    if mmss.len() != 4 || now_us == 0 {
+        return None;
     }
-}
 
-impl<T: Default + PartialEq> PrioField<T> {
-    pub fn is_default(&self) -> bool {
-        self.field == T::default()
+    let input_mm: i64 = mmss[0..2].parse().ok()?;
+    let input_ss: i64 = mmss[2..4].parse().ok()?;
+    let input_sec = input_mm * 60 + input_ss;
+
+    let now_sec = (now_us / 1_000_000) as i64;
+    let now_sec_in_hour = now_sec % 3600;
+
+    let mut diff_sec = now_sec_in_hour - input_sec;
+
+    // 59 -> 00 cross-hour correction
+    if diff_sec < 0 {
+        diff_sec += 3600;
     }
-}
 
-impl<T: Default> Default for PrioField<T> {
-    fn default() -> Self {
-        Self {
-            prio: u8::MAX,
-            field: T::default(),
-        }
+    // future time
+    if diff_sec < 0 {
+        return Some(0);
     }
-}
 
-impl<T: PartialEq> PartialEq for PrioField<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.prio == other.prio && self.field == other.field
+    // RRT exceeding 120s is considered invalid
+    if diff_sec > 120 {
+        return None;
     }
-}
 
-impl<T: Eq> Eq for PrioField<T> {}
-
-impl<T: Serialize> Serialize for PrioField<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.field.serialize(serializer)
-    }
+    let diff_us = diff_sec * 1_000_000 + (now_us % 1_000_000) as i64;
+    Some(diff_us as u64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn make_now_us(min: i64, sec: i64) -> u64 {
+        let total_sec = min * 60 + sec;
+        (total_sec * 1_000_000) as u64
+    }
+
     #[test]
-    fn validate_l7_response_status_as_uint() {
-        assert_eq!(L7ResponseStatus::Ok as u32, 0);
-        assert_eq!(L7ResponseStatus::Timeout as u32, 2);
-        assert_eq!(L7ResponseStatus::ServerError as u32, 3);
-        assert_eq!(L7ResponseStatus::ClientError as u32, 4);
-        assert_eq!(L7ResponseStatus::Unknown as u32, 5);
+    fn test_normal_case() {
+        // 16:53:55 -> 16:54:10
+        let now_us = make_now_us(54, 10);
+        let rrt = estimate_rrt_us_by_beijing_mmss("5355", now_us).unwrap();
+        assert_eq!(rrt, 15_000_000);
+    }
+
+    #[test]
+    fn test_cross_hour_59_to_00() {
+        // 16:59:58 -> 17:00:02
+        let now_us = make_now_us(0, 2);
+        let rrt = estimate_rrt_us_by_beijing_mmss("5958", now_us).unwrap();
+        assert_eq!(rrt, 4_000_000);
+    }
+
+    #[test]
+    fn test_future_time_clamped() {
+        let now_us = make_now_us(10, 0);
+        let rrt = estimate_rrt_us_by_beijing_mmss("1010", now_us).unwrap();
+        assert_eq!(rrt, 0);
+    }
+
+    #[test]
+    fn test_older_than_120s_invalid() {
+        let now_us = make_now_us(10, 0);
+        let rrt = estimate_rrt_us_by_beijing_mmss("0700", now_us);
+        assert!(rrt.is_none());
+    }
+
+    #[test]
+    fn test_invalid_input_length() {
+        let now_us = make_now_us(10, 0);
+        assert!(estimate_rrt_us_by_beijing_mmss("123", now_us).is_none());
+    }
+
+    #[test]
+    fn test_invalid_string() {
+        let now_us = make_now_us(10, 0);
+        assert!(estimate_rrt_us_by_beijing_mmss("ab12", now_us).is_none());
+    }
+
+    #[test]
+    fn test_exact_120s_boundary() {
+        let now_us = make_now_us(10, 0);
+        let rrt = estimate_rrt_us_by_beijing_mmss("0800", now_us).unwrap();
+        assert_eq!(rrt, 120_000_000);
     }
 }

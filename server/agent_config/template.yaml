@@ -37,13 +37,23 @@ global:
     # unit: MiB
     # range: [128, 100000]
     # enum_options: []
-    # modification: hot_update
+    # modification: agent_restart
     # ee_feature: false
     # description:
     #   en: |-
     #     deepflow-agent uses cgroups to limit memory usage.
+    #
+    #     Note:
+    #     - Memory of the dedicated deepflow-agent is not limited
+    #     - Memory limits for container deepflow-agent are enforced by container
+    #     - Memory limits for container deepflow-agent in the same cluster need to be consistent
     #   ch: |-
-    #     deepflow-agent 使用 cgroups 限制自身的 memory 用量.
+    #     deepflow-agent 使用 cgroups 限制自身的 memory 用量。
+    #
+    #     注意：
+    #     - 专属采集器内存不受限制
+    #     - 容器采集器内存限制由容器管理工具来实现
+    #     - 同集群的容器采集器内存限制需要一致
     # upgrade_from: max_memory
     max_memory: 768
     # type: int
@@ -479,16 +489,17 @@ global:
     # description:
     #   en: |-
     #     CPU affinity is the tendency of a process to run on a given CPU for as long as possible
-    #     without being migrated to other processors. Invalid ID will be ignored. Currently only
-    #     works for dispatcher threads. Example:
+    #     without being migrated to other processors. Invalid ID will be ignored. The setting
+    #     applies to existing deepflow-agent threads as well, except self-managed kick-kern.*
+    #     eBPF threads. Example:
     #     ```yaml
     #     global:
     #       tunning:
     #         cpu_affinity: [1, 3, 5, 7, 9]
     #     ```
     #   ch: |-
-    #     操作系统尽可能使用指定 ID 的 CPU 核运行 deepflow-agent 进程。无效的 ID 将被忽略。当前仅对
-    #     dispatcher 线程生效。举例：
+    #     操作系统尽可能使用指定 ID 的 CPU 核运行 deepflow-agent 进程。无效的 ID 将被忽略。该配置
+    #     会作用于已存在的 deepflow-agent 线程，但 self-managed 的 kick-kern.* eBPF 线程除外。举例：
     #     ```yaml
     #     global:
     #       tunning:
@@ -503,7 +514,7 @@ global:
     # unit:
     # range: [-20, 19]
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -520,7 +531,7 @@ global:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -588,7 +599,7 @@ global:
     # unit:
     # range: [1s, 3600s]
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -630,8 +641,13 @@ global:
     #   en: |-
     #     Whether to synchronize the clock to the deepflow-server, this behavior
     #     will not change the time of the deepflow-agent running environment.
+    #
+    #     Notice: Before enabling NTP, the controller needs to first start the NTP service. The agent will
+    #     only continue to work after the time synchronization is complete.
     #   ch: |-
     #     deepflow-agent 是否向 deepflow-server 做 NTP 同步的开关。
+    #
+    #     注意：开启 NTP 前控制器需要先开启 NTP 服务，直到完成同步时间后采集器才会继续运行。
     # upgrade_from: ntp_enabled
     enabled: false
     # type: duration
@@ -802,6 +818,7 @@ global:
     #   ch: |-
     #     设置 deepflow-agent 的 gRPC socket 缓冲区大小。
     # upgrade_from: static_config.grpc-buffer-size
+    # deprecated: true
     grpc_buffer_size: 5
     # type: int
     # name:
@@ -938,7 +955,7 @@ global:
       # unit:
       # range: []
       # enum_options: []
-      # modification: agent_restart
+      # modification: hot_update
       # ee_feature: false
       # description:
       #   en: |-
@@ -1155,7 +1172,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1171,7 +1188,7 @@ inputs:
     # unit:
     # range: [0ns, 1h]
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1180,7 +1197,7 @@ inputs:
     #     '0ns' means disabled, do not configure a value less than `1s` except for 0.
     #
     #     Note: When enabling this feature, the specific process list must also be specified in `inputs.proc.process_matcher`,
-    #     i.e., `inputs.proc.socket_info_sync_interval` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
+    #     i.e., `proc.socket_list` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
     #     Additionally, ensure `inputs.proc.enabled` is configured to **true**.
     #   ch: |-
     #     进程 Socket 信息的同步周期。
@@ -1188,7 +1205,7 @@ inputs:
     #     '0ns' 表示不开启，除 '0ns' 外不要配置小于 `1s` 的值。
     #
     #     注意：开启此功能时，需要同时在 `inputs.proc.process_matcher` 中进一步指定具体的进程列表，
-    #     即 `inputs.proc.process_matcher.[*].enabled_features` 中需要包含 `inputs.proc.socket_info_sync_interval`。
+    #     即 `inputs.proc.process_matcher.[*].enabled_features` 中需要包含 `proc.socket_list`。
     #     另外，也要注意确认 `inputs.proc.enabled` 已配置为 **true**。
     # upgrade_from: static_config.os-proc-socket-sync-interval
     socket_info_sync_interval: 0ns
@@ -1199,7 +1216,7 @@ inputs:
     # unit:
     # range: [1s, 1h]
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1221,7 +1238,7 @@ inputs:
       # unit:
       # range: []
       # enum_options: []
-      # modification: agent_restart
+      # modification: hot_update
       # ee_feature: false
       # description:
       #   en: |-
@@ -1273,7 +1290,7 @@ inputs:
       # unit:
       # range: []
       # enum_options: []
-      # modification: agent_restart
+      # modification: hot_update
       # ee_feature: false
       # description:
       #   en: |-
@@ -1289,7 +1306,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1304,7 +1321,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   ch: |-
@@ -1420,7 +1437,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1438,7 +1455,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: [process_name, cmdline, cmdline_with_args, parent_process_name, tag]
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1455,8 +1472,8 @@ inputs:
     #   ch: 匹配语言
     # unit:
     # range: []
-    # enum_options: [java, golang, python, nodejs, dotnet]
-    # modification: agent_restart
+    # enum_options: [java, golang, python, lua, php, nodejs, dotnet]
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1473,7 +1490,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1490,7 +1507,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1507,7 +1524,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1525,7 +1542,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1543,7 +1560,7 @@ inputs:
     # unit:
     # range: []
     # enum_options: []
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   en: |-
@@ -1561,21 +1578,37 @@ inputs:
     # unit:
     # range: []
     # enum_options:
-    #   - proc.gprocess_info
-    #   - proc.golang_symbol_table
-    #   - proc.socket_list
+    #   - proc.gprocess_info:
+    #       ch: 同步进程资源信息，并为 eBPF 原始观测数据注入所在观测点上的进程标签
+    #       en: Synchronize process resource information and inject process tags from the observation point into raw eBPF data
+    #   - proc.golang_symbol_table:
+    #       ch: 解析 Golang 特有符号表，用于 Golang 进程裁剪了标准符号表时的剖析数据优化
+    #       en: Parse Golang-specific symbol tables to optimize profiling data when Golang processes prune the standard symbol table
+    #   - proc.socket_list:
+    #       ch: 同步进程的活跃 Socket 信息，用于为应用和网络观测数据注入通信双方的进程标签
+    #       en: Synchronize active socket information of processes to inject process labels for both peers in application and network observation data
     #   #- proc.proc_event
-    #   - ebpf.socket.uprobe.golang
-    #   - ebpf.socket.uprobe.tls
+    #   - ebpf.socket.uprobe.golang:
+    #       ch: 为 Golang 进程开启 eBPF uprobe，用于协程追踪并采集 Golang HTTP2/HTTPS 通信
+    #       en: Enable eBPF uprobe for Golang processes to trace goroutines and capture Golang HTTP/2 and HTTPS communications
+    #   - ebpf.socket.uprobe.tls:
+    #       ch: 为 TLS 通信开启 eBPF uprobe，用于采集非 Golang 进程的加密通信观测数据
+    #       en: Enable eBPF uprobe for TLS communications to capture encrypted communication data from non-Golang processes
     #   #- ebpf.socket.uprobe.rdma
     #   #- ebpf.file.io_event
     #   #- ebpf.file.management_event
-    #   - ebpf.profile.on_cpu
-    #   - ebpf.profile.off_cpu
-    #   - ebpf.profile.memory
+    #   - ebpf.profile.on_cpu:
+    #       ch: 开启 On-CPU 持续剖析功能
+    #       en: Enable continuous On-CPU profiling
+    #   - ebpf.profile.off_cpu:
+    #       ch: 开启 Off-CPU 持续剖析功能
+    #       en: Enable continuous Off-CPU profiling
+    #   - ebpf.profile.memory:
+    #       ch: 开启内存持续剖析功能
+    #       en: Enable continuous memory profiling
     #   #- ebpf.profile.cuda
     #   #- ebpf.profile.hbm
-    # modification: agent_restart
+    # modification: hot_update
     # ee_feature: false
     # description:
     #   ch: |-
@@ -1607,7 +1640,27 @@ inputs:
         only_in_container: false
         rewrite_name: $3
         enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+      - match_regex: \bjava( +\S+)* +-(?:cp|classpath) +\S+ +(?P<CLASS_NAME>[$_A-Za-z][$_0-9A-Za-z]*(?:\.[$_A-Za-z][$_0-9A-Za-z]*)*)
+        match_type: cmdline_with_args
+        only_in_container: false
+        rewrite_name: ${CLASS_NAME}
+        enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
       - match_regex: \bpython(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+        match_type: cmdline_with_args
+        only_in_container: false
+        rewrite_name: $4
+        enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+      - match_regex: \b(?:lua|luajit)(\S)*( +-\S+)* +(\S*/)*([^ /]+)
+        match_type: cmdline_with_args
+        only_in_container: false
+        rewrite_name: $5
+        enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+      - match_regex: \bphp(\d+)?(-fpm|-cli|-cgi)?( +-\S+)* +(\S*/)*([^ /]+\.php)
+        match_type: cmdline_with_args
+        only_in_container: false
+        rewrite_name: $5
+        enabled_features: [ebpf.profile.on_cpu, proc.gprocess_info]
+      - match_regex: \b(node|nodejs)( +--\S+)* +(\S*/)*([^ /]+\.js)
         match_type: cmdline_with_args
         only_in_container: false
         rewrite_name: $4
@@ -2501,20 +2554,34 @@ inputs:
       # upgrade_from: static_config.trim-tunnel-types
       tunnel_trim_protocols: []
 
-      # type: int
+      # type: string 
       # name:
       #   en: Packet Segmentation Reassembly Ports
       #   ch: TCP分段重组端口
       # unit:
-      # range: [1, 65535]
+      # range: []
       # enum_options: []
       # modification: agent_restart
       # ee_feature: true
       # description:
       #   en: |-
       #     For the specified ports, consecutive TCP packets will be aggregated together for application log parsing.
+      #
+      #     Example: 
+      #
+      #     packet_segmentation_reassembly:
+      #     - 1000
+      #     - 2000-2010
+      #     - 5000
       #   ch: |-
       #     对指定端口的流，相邻的两个TCP分段 Packet 聚合在一起解析应用日志
+      #
+      #     配置示例：
+      #
+      #     packet_segmentation_reassembly:
+      #     - 1000
+      #     - 2000-2010
+      #     - 5000
       # upgrade_from: static_config.packet-segmentation-reassembly
       packet_segmentation_reassembly: []
 
@@ -2674,6 +2741,11 @@ inputs:
           #     - Use the command `cat /proc/<PID>/maps | grep "libssl.so"` to check if it contains
           #       information about openssl. If it does, it indicates that this process is using the
           #       openssl library.
+          #     - If "libssl.so" is not found above, it may indicate that the program
+          #       is statically linked with OpenSSL. In that case, you can verify it by:
+          #       running the command `sudo nm /proc/<PID>/exe | grep SSL_write`.
+          #       If the output contains symbols such as `0000000000502ac0 T SSL_write`,
+          #       it means the process is using a statically linked OpenSSL library.
           #
           #     After enabled, deepflow-agent will retrieve process information that
           #     matches the regular expression, hooking the corresponding encryption/decryption
@@ -2681,24 +2753,33 @@ inputs:
           #     to the following:
           #     ```
           #     [eBPF] INFO openssl uprobe, pid:1005, path:/proc/1005/root/usr/lib64/libssl.so.1.0.2k
+          #     OR
+          #     [eBPF] INFO openssl uprobe, pid:28890, path:/proc/28890/root/usr/sbin/nginx
           #     ```
           #
-          #     Note: When enabling this feature, the specific process list must also be specified in `inputs.proc.process_matcher`,
+          #     Note: When this feature is enabled, Envoy mTLS traffic can be automatically traced.
+          #     For non-Envoy traffic, the specific process list must also be specified in `inputs.proc.process_matcher`,
           #     i.e., `ebpf.socket.uprobe.tls` must be included in `inputs.proc.process_matcher.[*].enabled_features`.
           #   ch: |-
           #     是否启用使用 openssl 库的进程以支持 HTTPS 协议数据采集。
           #
           #     可通过以下方式判断应用进程是否能够使用 `Uprobe hook openssl 库`来采集加密数据：
-          #     - 执行命令`cat /proc/<PID>/maps | grep "libssl.so"`，若包含 openssl 相关信息
+          #     - 执行命令`sudo cat /proc/<PID>/maps | grep "libssl.so"`，若包含 openssl 相关信息
           #       则说明该进程正在使用 openssl 库。
+          #     - 如果上面没有搜到 "libssl.so" 也可能是静态编译了，这时候我们可以通过下面方式确认：
+          #       执行命令 `sudo nm /proc/<PID>/exe | grep SSL_write` 若包含 `SSL_write` 相关信息如：`0000000000502ac0 T SSL_write`
+          #       则说明该进程正在使用静态编译的 openssl 库。
           #
           #     启用后，deepflow-agent 将获取符合正则表达式匹配的进程信息，并 Hook openssl 库的相应加解密接口。
           #     在日志中您会看到类似如下信息：
           #     ```
           #     [eBPF] INFO openssl uprobe, pid:1005, path:/proc/1005/root/usr/lib64/libssl.so.1.0.2k
+          #     或者
+          #     [eBPF] INFO openssl uprobe, pid:28890, path:/proc/28890/root/usr/sbin/nginx
           #     ```
           #
-          #     注意：开启此功能时，需要同时在 `inputs.proc.process_matcher` 中进一步指定具体的进程列表，
+          #     注意：开启此功能后，Envoy mTLS 流量可自动完成追踪；
+          #     若为非 Envoy 流量，则需要同时在 `inputs.proc.process_matcher` 中进一步指定具体的进程列表，
           #     即 `inputs.proc.process_matcher.[*].enabled_features` 中需要包含 `ebpf.socket.uprobe.tls`。
           # upgrade_from: static_config.ebpf.uprobe-openssl-trace-enabled, static_config.ebpf.uprobe-process-name-regexs.openssl
           enabled: false
@@ -2990,6 +3071,62 @@ inputs:
           ports: ""
       # type: section
       # name:
+      #   en: SockOps
+      #   ch: SockOps
+      # description:
+      sock_ops:
+        # type: section
+        # name:
+        #   en: TCP Option Trace
+        #   ch: TCP Option Trace
+        # description:
+        tcp_option_trace:
+          # type: bool
+          # name:
+          #   en: TCP Option Tracing
+          #   ch: TCP Option 注入
+          # unit:
+          # range: []
+          # enum_options: []
+          # modification: hot_update
+          # ee_feature: false
+          # description:
+          #   en: |-
+          #     Whether to enable the tcp-option tracing SockOps program, which injects DeepFlow metadata
+          #     (for example, process PID) into a custom TCP option for eligible connections.
+          #     Note: This feature requires cgroup v2 (unified hierarchy) and kernel > 5.10. On hosts
+          #     using cgroup v1 the SockOps program will fail to attach and the agent will log a warning.
+          #     Compatibility: validated on x86 with kernel > 5.10; on arm we have only tested with
+          #     kernel 6.8 so far.
+          #     Limitation: PID tracking relies on the per-CPU syscall map in. Under CPU congestion,
+          #     softirqs handling TCP may run on a different CPU than the userspace thread, so the
+          #     injected metadata can be missing or stale.
+          #   ch: |-
+          #     是否开启 TCP Option Tracing SockOps 程序，用于在满足条件的 TCP 连接上注入 DeepFlow 元数据（如进程 PID）。
+          #     注意：该功能依赖 cgroup v2（统一层级）和内核版本 > 5.10。在 cgroup v1 主机上 SockOps 绑定会失败.
+          #     兼容性：已在 x86 上验证内核 > 5.10；arm 目前仅在 6.8 内核上测试。
+          #     限制：PID 跟踪依赖per-CPU syscall map。CPU 拥堵、软中断可能在不同 CPU 运行时，注入的元数据可能缺失或过期。
+          enabled: false
+          # type: int
+          # name:
+          #   en: PID Injection Window
+          #   ch: PID 注入窗口
+          # unit: Bytes
+          # range: [0, 1048576]
+          # enum_options: []
+          # modification: hot_update
+          # ee_feature: false
+          # description:
+          #   en: |-
+          #     Minimum number of TCP payload bytes between PID injections. Default 16KB matches the
+          #     legacy behavior; smaller windows increase frequency, larger windows decrease it. Set to
+          #     0 to disable sampling and inject on every eligible packet.
+          #   ch: |-
+          #     控制 PID 注入之间的最小 TCP 负载间隔字节数。缺省为 16KB，与历史行为一致；值越小注入越频繁，值越大越稀疏。
+          #     设置为0关闭采样窗口功能，对所有数据包注入。
+          sampling_window_bytes: 16384
+      # type: section
+      # name:
       #   en: Tunning
       #   ch: 调优
       # description:
@@ -3050,6 +3187,39 @@ inputs:
         #     目前适用于 socket trace 和 uprobe Golang/OpenSSL trace 功能。禁用内存预分配大约会减少45M的内存占用。
         # upgrade_from: static_config.ebpf.map-prealloc-disabled
         map_prealloc_disabled: false
+        # type: bool
+        # name:
+        #   en: Enable the fentry/fexit feature
+        #   ch: 启用fentry/fexit特性
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     Explanation of Using fentry/fexit Features
+        #     - Compared to traditional kprobes, fentry and fexit programs offer higher performance and
+        #       availability, providing approximately 5%-10% performance improvement.
+        #     - Some Linux kernels do not fully support this feature, which may lead to kernel bugs and
+        #       node crashes. Known bug fixes include:
+        #       - Bug fix for TencentOS Linux kernel 5.4.119
+        #         [https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423](https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423)
+        #       - Bug fix for Alibaba Cloud Linux kernel 5.10.23
+        #         [https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861](https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861)
+        #     - Kernel recommendation: To enable the fentry/fexit feature, it is recommended to use Linux
+        #       kernel 5.10.28 or later to ensure stability and performance.
+        #   ch: |-
+        #     使用 fentry/fexit 特性说明
+        #     - 相比传统的 kprobes，fentry 和 fexit 程序提供了更高的性能和可用性，可带来约 5%–10% 的性能提升。
+        #     - 部分 Linux 内核对该特性支持不够完善，可能导致内核 BUG 和节点崩溃。已知的 BUG 修复包括：
+        #       - TencentOS Linux kernel 5.4.119 的修复
+        #         [https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423](https://github.com/torvalds/linux/commit/c3d6324f841bab2403be6419986e2b1d1068d423)
+        #       - Alibaba Cloud Linux kernel 5.10.23 的修复
+        #         [https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861](https://github.com/gregkh/linux/commit/e21d2b92354b3cd25dd774ebb0f0e52ff04a7861)
+        #     - 内核建议：若要启用 fentry/fexit 特性，推荐使用 Linux kernel 5.10.28 及以上版本，以确保稳定性和性能。
+        # upgrade_from:
+        fentry_enabled: false
       # type: section
       # name:
       #   en: Preprocess
@@ -3082,7 +3252,7 @@ inputs:
         #     条事件数据占用的字节数上限受 `processors.request_log.tunning.payload_truncation` 控制）。在 Syscall 数据乱序较严重
         #     导致应用调用采集不全的环境中，可适当调大该参数。
         # upgrade_from: static_config.ebpf.syscall-out-of-order-cache-size
-        out_of_order_reassembly_cache_size: 16
+        out_of_order_reassembly_cache_size: 256
         # type: string
         # name:
         #   en: OOOR Protocols
@@ -3103,12 +3273,32 @@ inputs:
         #
         #     Supported protocols: [https://www.deepflow.io/docs/features/l7-protocols/overview/](https://www.deepflow.io/docs/features/l7-protocols/overview/)
         #
-        #     Attention: use `HTTP2` for `gRPC` Protocol.
+        #     Attention: configuring `HTTP2` or `gRPC` will enable both protocols.
         #   ch: |-
         #     配置后 deepflow-agent 将对指定应用协议的处理增加乱序重排过程。注意：（1）开启特性将消耗更多的内存，因此
-        #     需关注 agent 内存用量；（2）如需对`gRPC`协议乱序重排，请配置`HTTP2`协议。
+        #     需关注 agent 内存用量；（2）配置`HTTP2`或`gRPC`会全部开启这两个协议
         # upgrade_from: static_config.ebpf.syscall-out-of-order-reassembly
         out_of_order_reassembly_protocols: []
+        # type: duration
+        # name:
+        #   en: OOOR Timeout
+        #   ch: 乱序重排（OOOR）超时时间
+        # unit:
+        # range: [100ms, 1s]
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: true
+        # description:
+        #   en: |-
+        #     When the OOOR cache data times out, it will be output directly. This parameter can be adjusted according to metric
+        #     `deepflow_agent_ebpf_collect.metrics.time_backtrack_max`.
+        #
+        #     Note: Increasing this value will consume more memory
+        #   ch: |-
+        #     OOOR 缓存的数据时间超时会直接输出, 可以根据采集器指标 `deepflow_agent_ebpf_collect.metrics.metrics.time_backtrack_max` 调整该参数。
+        #
+        #     注意：增大该值会消耗更多的内存
+        out_of_order_reassembly_timeout: 100ms
         # type: string
         # name:
         #   en: SR Protocols
@@ -3128,7 +3318,7 @@ inputs:
         #     protocol parsing. Note that `out_of_order_reassembly_protocols` must also be enabled for
         #     this feature to be effective.
         #     Supported protocols: [https://www.deepflow.io/docs/features/l7-protocols/overview/](https://www.deepflow.io/docs/features/l7-protocols/overview/)
-        #     Attention: use `HTTP2` for `gRPC` Protocol.
+        #     Attention: configuring `HTTP2` or `gRPC` will enable both protocols.
         #   ch: |-
         #     配置后 deepflow-agent 将对指定应用协议的处理增加分片重组过程，将多个 Syscall 的内容分片重组后再进行
         #     协议解析，以增强应用协议的采集成功率。
@@ -3136,7 +3326,7 @@ inputs:
         #     注意：
         #     1. 该特性的生效的前提条件是`out_of_order_reassembly_protocols`开启并生效；
         #        - 支持协议：[https://www.deepflow.io/docs/zh/features/l7-protocols/overview/](https://www.deepflow.io/docs/zh/features/l7-protocols/overview/)
-        #     2. 如需对`gRPC`协议乱序重排，请配置`HTTP2`协议。
+        #     2. 配置`HTTP2`或`gRPC`会全部开启这两个协议
         # upgrade_from: static_config.ebpf.syscall-segmentation-reassembly
         segmentation_reassembly_protocols: []
     # type: section
@@ -3177,7 +3367,7 @@ inputs:
         #     - All: Indicates that all IO events are collected.
         #
         #     Note:
-        #     - To obtain the full file path, we need to combine it with the process's mount information. However, 
+        #     - To obtain the full file path, we need to combine it with the process's mount information. However,
         #       some processes exit quickly after completing their tasks. When we attempt to process the file I/O
         #       data generated by such processes, the corresponding /proc/[pid]/mountinfo entry may no longer be
         #       available, resulting in incomplete paths (missing mount points). For processes with a lifetime
@@ -3213,6 +3403,27 @@ inputs:
         #     的文件 IO 事件将被忽略。
         # upgrade_from: static_config.ebpf.io-event-minimal-duration
         minimal_duration: 1ms
+        # type: bool
+        # name:
+        #   en: Virtual File Collection Enabled
+        #   ch: 启用虚拟文件采集
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     When set to true, the agent will collect file I/O events generated on
+        #     virtual file systems (such as /proc, /sys, /run, and other kernel
+        #     pseudo file systems).
+        #     When set to false, the agent will not collect file I/O events from
+        #     virtual file systems.
+        #   ch: |-
+        #     当设置为 true 时，deepflow-agent 将采集发生在虚拟文件系统上的文件
+        #     I/O 事件（例如 /proc、/sys、/run 等由内核动态生成的伪文件系统）。
+        #     当设置为 false 时，将不会采集虚拟文件系统上的文件 I/O 事件。
+        enable_virtual_file_collect: false
     # type: section
     # name: Profile
     # description:
@@ -3503,9 +3714,75 @@ inputs:
         #     Agent uses LRU cache to record process allocated addresses to avoid uncontrolled
         #     memory usage. Each record in this LRU is about 80B.
         #   ch: |-
-        #     采集器使用 LRU 缓存记录进程分配的地址，以避免内存使用失控。每个 LRU 条目大约占 80B 内存。
+        #     采集器使用 LRU 缓存记录进程分配的地址，以避免内存使用失控。每个 LRU 条目大约占 32B 内存。
         # upgrade_from:
         allocated_addresses_lru_len: 131072
+        # type: int
+        # name:
+        #   en: Sort length
+        #   ch: 排序长度
+        # unit:
+        # range: [0, 65536]
+        # enum_options: []
+        # modification: hot_update
+        # ee_feature: true
+        # description:
+        #   en: |-
+        #     In order to match mallocs and frees, memory profiler will sort data by timestamp before processing.
+        #     This parameter is the length of the sorted array.
+        #     When configuring this option, first adjust the `sort_interval` parameter according to the instructions,
+        #     and then refer to the agent performance statistics in `deepflow_agent_ebpf_memory_profiler`
+        #     `dequeued_by_length` and `dequeued_by_interval` metrics, appropriately reduce this parameter
+        #     while ensuring that the former is several times smaller than the latter.
+        #   ch: |-
+        #     为了匹配 mallocs 和 frees，内存剖析会在处理前对数据按时间戳排序。
+        #     该参数是排序数组的长度。
+        #     配置该选项时先按说明调整 `sort_interval` 参数，在参考采集器性能统计 `deepflow_agent_ebpf_memory_profiler` 中
+        #     `dequeued_by_length` 和 `dequeued_by_interval` 指标，在保证前者小于后者几倍的前提下适当调小该参数。
+        # upgrade_from:
+        sort_length: 16384
+        # type: duration
+        # name:
+        #   en: Sort interval
+        #   ch: 排序间隔
+        # unit:
+        # range: [1ns, 10s]
+        # enum_options: []
+        # modification: hot_update
+        # ee_feature: true
+        # description:
+        #   en: |-
+        #     In order to match mallocs and frees, memory profiler will sort data by timestamp before processing.
+        #     This parameter controls the max span of interval between the first and last item in the sorted array.
+        #     Refer to agent performance statistics in `deepflow_agent_ebpf_memory_profiler`,
+        #     making `time_backtracked` to 0. Configurion `sort_length` may also need to be increased.
+        #   ch: |-
+        #     为了匹配 mallocs 和 frees，内存剖析会在处理前对数据按时间戳排序。
+        #     该参数控制排序数组中第一个和最后一个元素之间的时间间隔的最大值。
+        #     配置该选项可以参考采集器性能统计 `deepflow_agent_ebpf_memory_profiler` 中
+        #     `time_backtracked` 指标，增大该参数使之为 0 即可。注意可能需要相应增大 `sort_length` 参数。
+        # upgrade_from:
+        sort_interval: 1500ms
+        # type: int
+        # name:
+        #   en: Queue Size
+        #   ch: 队列大小
+        # unit:
+        # range: [4096, 64000000]
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: true
+        # description:
+        #   en: |-
+        #     Memory profiler inner queue size.
+        #     Refer to agent performance statistics in `deepflow_agent_ebpf_memory_profiler`,
+        #     making `overwritten` to 0 and `pending` not exceeding this configuration.
+        #   ch: |-
+        #     内存剖析组件内部的队列大小。
+        #     配置该选项可以参考采集器性能统计 `deepflow_agent_ebpf_memory_profiler` 中
+        #     `overwritten` 和 `pending` 指标，增大该配置使得前者为 0，后者不高于该配置即可。
+        # upgrade_from:
+        queue_size: 32768
       # type: section
       # name:
       #   en: Preprocess
@@ -3534,6 +3811,405 @@ inputs:
         #     on-cpu 函数调用栈压缩，可以将带宽消耗降低 `x` 倍，但会使得 agent 额外消耗 `y%` 的 CPU。
         # upgrade_from: static_config.ebpf.preprocess.stack-compression
         stack_compression: true
+      # type: section
+      # name:
+      #   en: Language-specific Profiling
+      #   ch: 语言特定剖析
+      # description:
+      #   en: |-
+      #     Control which interpreter languages to profile. Disabling unused languages can save ~5-6 MB memory per language.
+      #     Total memory: ~17-20 MB (all enabled), ~6.1 MB (Python only), ~5.2 MB (PHP only), ~6.4 MB (Node.js only).
+      #   ch: |-
+      #     控制对哪些解释型语言进行剖析。禁用不使用的语言可以节省每个语言约 5-6 MB 内存。
+      #     总内存占用：~17-20 MB（全部启用），~6.1 MB（仅 Python），~5.2 MB（仅 PHP），~6.4 MB（仅 Node.js）。
+      languages:
+        # type: bool
+        # name:
+        #   en: Python profiling disabled
+        #   ch: 禁用 Python 剖析
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     Disable Python interpreter profiling. When disabled, Python process stack traces will not be collected,
+        #     saving approximately 6.1 MB of kernel memory (python_tstate_addr_map, python_unwind_info_map, python_offsets_map).
+        #   ch: |-
+        #     禁用 Python 解释器剖析。禁用后将不采集 Python 进程的函数调用栈，
+        #     可节省约 6.1 MB 内核内存（python_tstate_addr_map、python_unwind_info_map、python_offsets_map）。
+        python_disabled: false
+        # type: bool
+        # name:
+        #   en: PHP profiling disabled
+        #   ch: 禁用 PHP 剖析
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     Disable PHP interpreter profiling. When disabled, PHP process stack traces will not be collected,
+        #     saving approximately 5.2 MB of kernel memory (php_unwind_info_map, php_offsets_map).
+        #   ch: |-
+        #     禁用 PHP 解释器剖析。禁用后将不采集 PHP 进程的函数调用栈，
+        #     可节省约 5.2 MB 内核内存（php_unwind_info_map、php_offsets_map）。
+        php_disabled: false
+        # type: bool
+        # name:
+        #   en: Node.js profiling disabled
+        #   ch: 禁用 Node.js 剖析
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     Disable Node.js (V8) interpreter profiling. When disabled, Node.js process stack traces will not be collected,
+        #     saving approximately 6.4 MB of kernel memory (v8_unwind_info_map).
+        #   ch: |-
+        #     禁用 Node.js（V8）解释器剖析。禁用后将不采集 Node.js 进程的函数调用栈，
+        #     可节省约 6.4 MB 内核内存（v8_unwind_info_map）。
+        nodejs_disabled: false
+    # type: section
+    # name:
+    #   en: Network
+    #   ch: 网络
+    # description:
+    network:
+      # type: bool
+      # name: NIC optimization Enabled
+      # unit:
+      # range: []
+      # enum_options: []
+      # modification: hot_update
+      # ee_feature: true
+      # description:
+      #   en: |-
+      #     Whether to enable NIC optimization for enhanced multi-core packet
+      #     processing and burst traffic resilience.
+      #
+      #     When enabled, the system applies a combination of:
+      #       - RSS hardware queue configuration
+      #       - RX ring descriptor size tuning
+      #       - IRQ (interrupt) CPU affinity binding
+      #       - Optional XDP CPUMAP-based CPU redirection
+      #
+      #     This optimization mitigates scenarios where RSS hardware cannot hash
+      #     inner headers of encapsulated traffic (e.g., GRE, Double VLAN,
+      #     VXLAN, ERSPAN), which may otherwise cause traffic to be concentrated
+      #     on a single CPU core and lead to packet drops or performance bottlenecks.
+      #
+      #     RX ring tuning improves burst handling capability by increasing
+      #     the number of descriptors available for packet reception, reducing
+      #     the likelihood of ring overflow under high traffic conditions.
+      #
+      #     When XDP CPU redirect is enabled, packets are redistributed in
+      #     software across multiple CPU cores after initial reception,
+      #     providing better load balancing beyond hardware RSS capabilities.
+      #
+      #     Recommended to enable this feature when:
+      #       1) Traffic on the interface consists primarily of encapsulated
+      #          packets (e.g., verified via tcpdump showing GRE, Double VLAN,
+      #          VXLAN, etc.).
+      #       2) One CPU core shows near 100% softirq utilization (e.g.,
+      #          observed via `top` with per-CPU view), while other CPUs
+      #          remain underutilized.
+      #
+      #     For optimal performance, IRQ CPUs and XDP redirect CPUs should be
+      #     configured on the same NUMA node as the physical NIC.
+      #
+      #   ch: |-
+      #     是否启用网卡优化功能，用于提升多核环境下的网络包处理能力
+      #     以及突发流量承载能力。
+      #
+      #     开启后将综合进行以下优化：
+      #       - RSS 硬件队列数量配置
+      #       - RX ring 描述符数量调优
+      #       - 硬件中断与 CPU 亲和性绑定（IRQ 绑核）
+      #       - 可选的 XDP CPUMAP 软件重定向分发
+      #
+      #     该优化主要解决 RSS 硬件无法基于封装报文内层头部
+      #     （如 GRE、Double VLAN、VXLAN、ERSPAN）进行哈希分摊的问题，
+      #     避免流量集中在单个 CPU 上造成过载和丢包。
+      #
+      #     通过调整 RX ring 描述符数量，可提升突发流量场景下的
+      #     接收缓存能力，降低 ring 满导致的丢包风险。
+      #
+      #     在启用 XDP CPU Redirect 时，数据包会在接收后通过
+      #     CPUMAP 在多个 CPU 核心之间进行软件层重分发，
+      #     从而突破硬件 RSS 的能力限制，实现更均衡的负载分布。
+      #
+      #     建议在以下场景开启该功能：
+      #       1）使用 tcpdump 抓包发现该接口流量主要为 GRE、
+      #          Double VLAN、VXLAN 等封装报文；
+      #       2）通过 `top`（按 1）观察各 CPU 软中断占用率时，
+      #          发现某一个 CPU 的 softirq 接近 100%，
+      #          而其他 CPU 软中断占用率明显偏低。
+      #
+      #     为获得最佳性能，建议将中断 CPU 和 XDP 重定向 CPU
+      #     配置在与物理网卡相同的 NUMA 节点上。
+      nic_opt_enabled: false
+      # type: dict
+      # name:
+      #   en: NIC Optimize
+      #   ch: 网卡优化配置
+      # unit:
+      # range: []
+      # enum_options: []
+      # modification: hot_update
+      # ee_feature: true
+      # description:
+      #   en: |-
+      #     Configure NIC-level performance optimizations for specific interfaces.
+      #
+      #     This feature improves packet processing scalability and burst handling
+      #     by tuning hardware RSS queues, interrupt CPU affinity, RX ring size,
+      #     and optional XDP CPUMAP-based CPU redirection.
+      #
+      #     Recommended when:
+      #       - Traffic is primarily encapsulated (GRE, Double VLAN, VXLAN, ERSPAN).
+      #       - One CPU shows near 100% softirq usage while others are idle.
+      #
+      #     To achieve better performance, the program will automatically disable the
+      #     irqbalance service to prevent network interface interrupts from migrating
+      #     between CPUs.
+      #
+      #     Multiple NIC optimize entries can be configured for different interfaces.
+      #
+      #     Example:
+      #     ```yaml
+      #     inputs:
+      #       ebpf:
+      #         network:
+      #           nic_opt_enabled: true
+      #           nic_optimize:
+      #           - interface: eth0
+      #             rx_ring_size: 4096
+      #             rss_channel_count: 2
+      #             irq_cpu_list: 1,2
+      #             xdp_cpu_redirect: true
+      #             xdp_queue_size: 2048
+      #             xdp_cpu_redirect_list: 4,5,6,7
+      #           - interface: eth1
+      #             rx_ring_size: 4096
+      #             rss_channel_count: 2
+      #             irq_cpu_list: 1,2
+      #             xdp_cpu_redirect: true
+      #             xdp_queue_size: 2048
+      #             xdp_cpu_redirect_list: 4,5,6,7
+      #     ```
+      #
+      #   ch: |-
+      #     针对指定网卡接口进行性能优化配置。
+      #
+      #     该功能通过调优 RSS 队列、中断绑核、RX ring 大小、
+      #     以及可选的 XDP CPUMAP 重定向机制，提升多核扩展能力
+      #     和突发流量承载能力。
+      #
+      #     建议在以下场景开启：
+      #       - 接口流量主要为 GRE、Double VLAN、VXLAN、ERSPAN 等封装报文；
+      #       - 某个 CPU 的 softirq 占用率接近 100%，而其他 CPU 空闲。
+      #
+      #     为了获得更好的性能，程序会自动停用 irqbalance 服务，以防止网卡中断在 CPU 之间迁移。
+      #
+      #     可为多个接口分别配置优化策略。
+      #
+      #     样例:
+      #     ```yaml
+      #     inputs:
+      #       ebpf:
+      #         network:
+      #           nic_opt_enabled: true
+      #           nic_optimize:
+      #           - interface: eth0
+      #             rx_ring_size: 4096
+      #             rss_channel_count: 2
+      #             irq_cpu_list: 1,2
+      #             xdp_cpu_redirect: true
+      #             xdp_queue_size: 2048
+      #             xdp_cpu_redirect_list: 4,5,6,7
+      #           - interface: eth1
+      #             rx_ring_size: 4096
+      #             rss_channel_count: 2
+      #             irq_cpu_list: 1,2
+      #             xdp_cpu_redirect: true
+      #             xdp_queue_size: 2048
+      #             xdp_cpu_redirect_list: 4,5,6,7
+      #     ```
+      # upgrade_from:
+      # ---
+      # type: string
+      # name:
+      #   en: Interface
+      #   ch: 网卡接口
+      # description:
+      #   en: |-
+      #     Name of the network interface to optimize.
+      #
+      #   ch: |-
+      #     需要进行优化的网卡接口名称。
+      # ---
+      # interface: ""
+      # ---
+      # type: int
+      # name:
+      #   en: RX Ring Size
+      #   ch: RX Ring 描述符数量
+      # description:
+      #   en: |-
+      #     Number of RX descriptors in NIC receive ring.
+      #
+      #     Increasing this value improves burst traffic buffering
+      #     and reduces packet drops caused by ring overflow.
+      #     Specifically, use `ethtool -g <iface>` to check the current
+      #     configuration, and adjust to an appropriate value based on your workload.
+      #
+      #     0 (default) means keep the original state and ignore this setting.
+      #
+      #   ch: |-
+      #     网卡接收环（RX ring）的描述符数量。
+      #
+      #     增大该值可提升突发流量场景下的缓存能力，
+      #     降低因 ring 满导致的丢包风险。
+      #     具体使用`ethtool -g <iface>` 查看当前配置，根据实际情况调整到合适的值。
+      #
+      #     默认值为 0 表示保持原状忽略此项配置。
+      # ---
+      # rx_ring_size: 0
+      # ---
+      # type: int
+      # name:
+      #   en: RSS Channel Count
+      #   ch: RSS 队列数量
+      # description:
+      #   en: |-
+      #     Number of hardware RSS queues.
+      #     Determines how many queues packets are distributed to after
+      #     hardware hash calculation.
+      #
+      #     Maximum supported value is typically 16 and must not exceed
+      #     the number of logical CPU cores.
+      #     Specifically, use `ethtool -l <iface>` to check the current configuration
+      #     and adjust to an appropriate value based on your workload.
+      #
+      #     When XDP CPU redirect is enabled, it is recommended to set this to 1.
+      #     0 (default) means keep the original state and ignore this setting.
+      #
+      #   ch: |-
+      #     RSS 硬件队列数量。
+      #     数据包在物理网卡完成哈希后，将分发到指定数量的队列并触发中断。
+      #
+      #     最大一般支持 16，且不要超过逻辑 CPU 核数。
+      #     具体使用`ethtool -l <iface>` 查看当前配置，根据实际情况调整到合适的值。
+      #
+      #     当启用 XDP CPU Redirect 时建议设置为 1。
+      #     默认值为 0 表示保持原状忽略此项配置。
+      # ---
+      # rss_channel_count: 0
+      # ---
+      # type: string
+      # name:
+      #   en: Hardware IRQ CPU List
+      #   ch: 硬件中断 CPU 列表
+      # description:
+      #   en: |-
+      #     CPU ID or comma-separated CPU list used for handling NIC interrupts.
+      #
+      #     Recommended to match the number of RSS queues.
+      #     If XDP CPU redirect is enabled, only one CPU is required.
+      #
+      #     Value can be:
+      #       - Specific CPU list (e.g., 2,4,6)
+      #       - "local" (auto match CPUs in local NUMA node)
+      #
+      #     CPUs should be located on the same NUMA node as the NIC.
+      #
+      #   ch: |-
+      #     用于处理网卡硬件中断的 CPU ID 或 CPU 列表。
+      #
+      #     数量建议与 RSS 队列数量一致。
+      #     若启用 XDP CPU Redirect，仅需指定一个 CPU。
+      #
+      #     可设置为：
+      #       - 指定 CPU 列表（如 2,4,6）
+      #       - local（自动匹配本地 NUMA 节点 CPU）
+      #
+      #     建议所选 CPU 与物理网卡位于同一 NUMA 节点。
+      # ---
+      # irq_cpu_list: ""
+      # ---
+      # type: bool
+      # name:
+      #   en: Enable XDP CPU Redirect
+      #   ch: 启用 XDP CPU 重定向
+      # description:
+      #   en: |-
+      #     Enable XDP CPUMAP redirect to redistribute packets across CPUs
+      #     in software.
+      #
+      #     Useful when hardware RSS cannot distribute encapsulated traffic
+      #     (e.g., Double VLAN, ERSPAN) evenly across CPUs, resulting in
+      #     single-core overload and packet drops.
+      #
+      #   ch: |-
+      #     是否启用 XDP CPUMAP 重定向分发。
+      #
+      #     用于解决硬件 RSS 无法对封装报文
+      #     （如 Double VLAN、ERSPAN 等）进行均匀分摊，
+      #     导致单核过载和丢包的问题。
+      # ---
+      # xdp_cpu_redirect: false
+      # ---
+      # type: int
+      # name:
+      #   en: XDP Queue Size
+      #   ch: XDP 队列大小
+      # description:
+      #   en: |-
+      #     Size of the XDP CPUMAP queue.
+      #
+      #     Valid range: [512, 8192]. Powers of two are recommended.
+      #
+      #     Larger values improve burst tolerance but consume more memory.
+      #
+      #   ch: |-
+      #     XDP CPUMAP 队列大小。
+      #
+      #     取值范围：[512, 8192]，建议配置为 2 的幂。
+      #
+      #     增大可提升突发流量承载能力，但会占用更多内存。
+      # ---
+      # xdp_queue_size: 2048
+      # ---
+      # type: string
+      # name:
+      #   en: XDP Redirect CPU List
+      #   ch: XDP 重定向 CPU 列表
+      # description:
+      #   en: |-
+      #     CPU list used for processing packets after XDP redirection.
+      #
+      #     Format example: 4,6,8
+      #
+      #   ch: |-
+      #     XDP 重定向后用于处理数据包的 CPU 列表。
+      #
+      #     填写样式如：4,6,8
+      # ---
+      # xdp_cpu_redirect_list: ""
+      #
+      nic_optimize:
+        - interface: ""
+          rx_ring_size: 0
+          rss_channel_count: 0
+          irq_cpu_list: ""
+          xdp_cpu_redirect: false
+          xdp_queue_size: 2048
+          xdp_cpu_redirect_list: ""
     # type: section
     # name:
     #   en: Tunning
@@ -3582,6 +4258,48 @@ inputs:
       userspace_worker_threads: 1
       # type: int
       # name:
+      #   en: Kick Thread Nice Value
+      #   ch: Kick 线程 Nice 值
+      # unit:
+      # range: [-20, 19]
+      # enum_options: []
+      # modification: agent_restart
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     Controls the Linux nice value of per-CPU kick threads.
+      #
+      #     These threads wake up after the periodic timer expires and issue a
+      #     lightweight syscall to trigger kernel-side timeout checks that flush
+      #     batched eBPF data.
+      #
+      #     Pay attention to this option when `metrics.period_push_max_delay`
+      #     under `deepflow_tenant -> deepflow_agent_ebpf_collector` in Metrics
+      #     Center reaches 199 ms. This means the periodic push delay has hit
+      #     the exceeded marker, and the value can be decreased appropriately to
+      #     give the kick threads more scheduling preference.
+      #
+      #     Smaller nice values mean higher scheduling preference. Larger nice
+      #     values mean lower scheduling preference. Valid values range from
+      #     -20 to 19. A negative value may require CAP_SYS_NICE or a sufficient
+      #     RLIMIT_NICE. This can still affect other workloads.
+      #   ch: |-
+      #     控制每个 CPU 上 kick 线程使用的 Linux nice 值。
+      #
+      #     这些线程会在周期性定时器到期后唤醒，并通过轻量级 syscall
+      #     触发内核侧超时检查，将批量 eBPF 数据从缓冲区中推送出来。
+      #
+      #     当“指标中心”中 `deepflow_tenant -> deepflow_agent_ebpf_collector`
+      #     下的 `metrics.period_push_max_delay` 达到 199ms 时，需要关注这个
+      #     配置项。这说明周期性 push 延迟已经触发超限标记，此时可以适当降低
+      #     该配置项的取值，以提高 kick 线程的调度倾向。
+      #
+      #     更小的 nice 值意味着更高的调度倾向，更大的 nice 值意味着更低的
+      #     调度倾向。取值范围为 -20 到 19。负值可能需要 CAP_SYS_NICE 或
+      #     足够的 RLIMIT_NICE。该配置仍然可能对其他负载产生影响。
+      kick_kern_nice: 0
+      # type: int
+      # name:
       #   en: Perf Pages Count
       #   ch: Perf Page 数量
       # unit:
@@ -3595,9 +4313,11 @@ inputs:
       #     value is `2^n (5 <= n <= 13)`. Used for perf data transfer. If the
       #     value is between `2^n` and `2^(n+1)`, it will be automatically adjusted
       #     by the ebpf configurator to the minimum value `2^n`.
+      #     The page size is 4 KB.
       #   ch: |-
       #     内核共享内存占用的页数。值为 `2^n (5 <= n <= 13)`。用于 perf 数据传输。
       #     如果值在 `2^n` 和 `2^(n+1)` 之间，将自动调整到最小值 `2^n`。
+      #     页的大小为4KB。
       # upgrade_from: static_config.ebpf.perf-pages-count
       perf_pages_count: 128
       # type: int
@@ -4231,10 +4951,10 @@ inputs:
     # description:
     #   en: |-
     #     Whether to enable receiving external data sources such as Prometheus,
-    #     Telegraf, OpenTelemetry, and SkyWalking.
+    #     Telegraf, OpenTelemetry, SkyWalking and Vector.
     #   ch: |-
     #     开关开启后，deepflow-agent 将开启外部数据的接收服务接口，以集成来自 Prometheus、
-    #     Telegraf、OpenTelemetry 和 Skywalking 的数据。
+    #     Telegraf、OpenTelemetry 和 Skywalking、Vector 的数据。
     # upgrade_from: external_agent_http_proxy_enabled
     enabled: true
     # type: int
@@ -4670,6 +5390,23 @@ processors:
       receiver_queue_size: 65536
       # type: int
       # name:
+      #   en: Sender Queue Size
+      #   ch: Sender 队列大小
+      # unit:
+      # range: [4096, 64000000]
+      # enum_options: []
+      # modification: agent_restart
+      # ee_feature: true
+      # description:
+      #   en: |-
+      #     The length of the following queues:
+      #     - 2-pcap-batch-to-sender
+      #   ch: |-
+      #     设置 deepflow-agent 的 2-pcap-batch-to-sender 队列大小。
+      # upgrade_from:
+      sender_queue_size: 8192
+      # type: int
+      # name:
       #   en: Buffer Size Per Flow
       #   ch: 每个 Flow 的缓冲区大小
       # unit:
@@ -4839,6 +5576,69 @@ processors:
       #     新周期。
       # upgrade_from: static_config.l7-protocol-inference-ttl
       inference_result_ttl: 60s
+      # type: dict
+      # name:
+      #   en: Inference whitelist
+      #   ch: 推理白名单
+      # unit:
+      # range: []
+      # enum_options: []
+      # modification: hot_update
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     Application protocol port whitelist, currently only supports eBPF traffic. When eBPF data is on the whitelist,
+      #     the application table is no longer used to query the application protocol. The corresponding application protocol
+      #     is obtained by polling all currently supported protocols. Having too much data on the whitelist greatly reduces the
+      #     processing performance of eBPF data.
+      #
+      #     Configuration Key:
+      #     - process_name: Process name, regular expressions are not supported
+      #     - port_list: Port Whitelist
+      #   ch: |-
+      #     应用协议端口白名单列表，目前仅支持 eBPF 流量。当 eBPF 数据在白名单列表中时，不会再使用应用表查询应用协议，
+      #     对应的应用协议通过轮训目前所有支持的协议来获取，白名单数据过多会降低 eBPF 数据的处理性能。
+      #
+      #     配置键：
+      #     - process_name: 进程名称，不支持正则表达式
+      #     - port_list: 端口白名单列表
+      # ---
+      # type: string
+      # name:
+      #   en: Process name
+      #   ch: 进程名称
+      # unit:
+      # range: []
+      # enum_options: []
+      # modification: agent_restart
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     Process name
+      #   ch: |-
+      #     进程名称
+      # ---
+      # process_name: ""
+      # ---
+      # type: int
+      # name:
+      #   en: Port list
+      #   ch: 端口列表
+      # unit:
+      # range: []
+      # enum_options: []
+      # modification: agent_restart
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     Port list
+      #   ch: |-
+      #     端口列表
+      # ---
+      # port_list: []
+      inference_whitelist:
+      - process_name: envoy
+        port_list: [15001, 15006]
       # type: string
       # name:
       #   en: Enabled Protocols
@@ -4926,6 +5726,282 @@ processors:
           # upgrade_from: static_config.oracle-parse-config.resp-0x04-extra-byte
           resp_0x04_extra_byte: false
         # type: section
+        # name: ISO8583
+        # description:
+        iso8583:
+          # type: bool
+          # name:
+          #   en: Value Translation
+          #   ch: 数据翻译
+          # unit:
+          # range: []
+          # enum_options: []
+          # modification: agent_restart
+          # ee_feature: true
+          # description:
+          #   en: |-
+          #     Whether to perform field value translation.
+          #   ch: |-
+          #     是否对解析后的数据进行查表翻译后展示。
+          #
+          #       - 支持翻译的字段列表:
+          #
+          #     |  支持翻译的字段       | 示例（翻译前）|示例（翻译后）          | 备注         |
+          #     |-----------------------|-------------- |----------------------- |--------------|
+          #     | 0-报文类型标识符      | 0100          | 0100-授权类请求        |              |
+          #     | 3-交易处理码          | 300000        | 300000-余额查询        |              |
+          #     | 32-受理机构标识码     | 6100****      | 6100-中国邮政储蓄银行  | 翻译前4位    |
+          #     | 39-应答码             | 00            | 00-承兑或交易成功      |              |
+          #     | 49-交易货币代码       | 156           | 156-人民币元           |              |
+          translation_enabled: true
+          # type: bool
+          # name:
+          #   en: PAN Obfuscate
+          #   ch: 卡号脱敏
+          # unit:
+          # range: []
+          # enum_options: []
+          # modification: agent_restart
+          # ee_feature: true
+          # description:
+          #   en: |-
+          #     Whether to obfuscate the Primary Account Number (PAN).
+          #   ch: |-
+          #     是否对卡号脱敏。
+          pan_obfuscate: true
+          # type: string
+          # name:
+          #   en: Extract Fields
+          #   ch: 提取字段
+          # unit:
+          # range: []
+          # enum_options: []
+          # modification: agent_restart
+          # ee_feature: true
+          # description:
+          #   en: |-
+          #    Extracted fields are displayed in `data native tags`.
+          #      - Example: `extract_fields: 0,2-33`
+          #    Field Reference:
+          #
+          #    | Field No. | Description |
+          #    |-----------|-------------|
+          #    | 0   | Message Type Identifier (MTI) |
+          #    | 1   | Bitmap |
+          #    | 2   | Primary Account Number (PAN) |
+          #    | 3   | Processing Code |
+          #    | 4   | Amount, Transaction |
+          #    | 5   | Amount, Settlement |
+          #    | 6   | Amount, Cardholder Billing |
+          #    | 7   | Transmission Date & Time |
+          #    | 9   | Conversion Rate, Settlement |
+          #    | 10  | Conversion Rate, Cardholder Billing |
+          #    | 11  | System Trace Audit Number (STAN) |
+          #    | 12  | Local Transaction Time |
+          #    | 13  | Local Transaction Date |
+          #    | 14  | Expiration Date |
+          #    | 15  | Settlement Date |
+          #    | 16  | Conversion Date |
+          #    | 18  | Merchant Type |
+          #    | 19  | Acquiring Institution Country Code |
+          #    | 22  | POS Entry Mode Code |
+          #    | 23  | Card Sequence Number |
+          #    | 25  | POS Condition Code |
+          #    | 26  | POS PIN Capture Code |
+          #    | 28  | Transaction Fee |
+          #    | 32  | Acquiring Institution Identification Code |
+          #    | 33  | Forwarding Institution Identification Code |
+          #    | 35  | Track 2 Data |
+          #    | 36  | Track 3 Data |
+          #    | 37  | Retrieval Reference Number (RRN) |
+          #    | 38  | Authorization Identification Response |
+          #    | 39  | Response Code |
+          #    | 41  | Card Acceptor Terminal ID |
+          #    | 42  | Card Acceptor ID Code |
+          #    | 43  | Card Acceptor Name/Location |
+          #    | 44  | Additional Response Data |
+          #    | 45  | Track 1 Data |
+          #    | 48  | Additional Data – Private |
+          #    | 49  | Currency Code, Transaction |
+          #    | 50  | Currency Code, Settlement |
+          #    | 51  | Currency Code, Cardholder Billing |
+          #    | 52  | PIN Data |
+          #    | 53  | Security Related Control Information |
+          #    | 54  | Additional Amounts (Balance) |
+          #    | 55  | ICC Data (EMV Data) |
+          #    | 56  | Additional Data |
+          #    | 57  | Additional Transaction Data |
+          #    | 59  | Detail Data / Reserved for National Use |
+          #    | 60  | Reserved for Private Use |
+          #    | 61  | Cardholder Authentication Information |
+          #    | 62  | Switch Data |
+          #    | 63  | Network Data |
+          #    | 70  | Network Management Information Code |
+          #    | 90  | Original Data Elements |
+          #    | 96  | Message Security Code |
+          #    | 100 | Receiving Institution Identification Code |
+          #    | 102 | Account Identification 1 |
+          #    | 103 | Account Identification 2 |
+          #    | 104 | Additional Data |
+          #    | 113 | Additional Data |
+          #    | 116 | Additional Data |
+          #    | 117 | Additional Data |
+          #    | 121 | Reserved by China UnionPay (CUPS) |
+          #    | 122 | Reserved for Acquirer |
+          #    | 123 | Reserved for Issuer |
+          #    | 125 | Additional Data |
+          #    | 126 | Additional Data |
+          #    | 128 | Message Authentication Code (MAC) |
+          #   ch: |-
+          #    提取字段展示在`数据原生标签`
+          #      - 配置样例: `extract_fields: 0,2-33`
+          #
+          #    字段对照表:
+          #
+          #    | 字段号 | 说明 |
+          #    |--------|----------|
+          #    | 0  | 报文类型标识符 |
+          #    | 1  | 位图 |
+          #    | 2  | 主账号 |
+          #    | 3  | 交易处理码 |
+          #    | 4  | 交易金额 |
+          #    | 5  | 清算金额 |
+          #    | 6  | 持卡人扣账金额 |
+          #    | 7  | 交易传输时间 |
+          #    | 9  | 清算汇率 |
+          #    | 10 | 持卡人扣账汇率 |
+          #    | 11 | 系统跟踪号 |
+          #    | 12 | 受卡方所在地时间 |
+          #    | 13 | 受卡方所在地日期 |
+          #    | 14 | 卡有效期 |
+          #    | 15 | 清算日期 |
+          #    | 16 | 兑换日期 |
+          #    | 18 | 商户类型 |
+          #    | 19 | 商户国家代码 |
+          #    | 22 | 服务点输入方式码 |
+          #    | 23 | 卡序列号 |
+          #    | 25 | 服务点条件码 |
+          #    | 26 | 服务点 PIN 获取码 |
+          #    | 28 | 交易费 |
+          #    | 32 | 受理机构标识码 |
+          #    | 33 | 发送机构标识码 |
+          #    | 35 | 第二磁道数据 |
+          #    | 36 | 第三磁道数据 |
+          #    | 37 | 检索参考号 |
+          #    | 38 | 授权标识应答码 |
+          #    | 39 | 应答码 |
+          #    | 41 | 受卡机终端标识码 |
+          #    | 42 | 受卡方标识码 |
+          #    | 43 | 受卡方名称地址 |
+          #    | 44 | 附加响应数据 |
+          #    | 45 | 第一磁道数据 |
+          #    | 48 | 附加数据－私有 |
+          #    | 49 | 交易货币代码 |
+          #    | 50 | 清算货币代码 |
+          #    | 51 | 持卡人账户货币代码 |
+          #    | 52 | 个人标识码数据 |
+          #    | 53 | 安全控制信息 |
+          #    | 54 | 实际余额 |
+          #    | 55 | IC 卡数据域 |
+          #    | 56 | 附加信息 |
+          #    | 57 | 附加交易信息 |
+          #    | 59 | 明细查询数据 |
+          #    | 60 | 自定义域 |
+          #    | 61 | 持卡人身份认证信息 |
+          #    | 62 | 交换中心数据 |
+          #    | 63 | 金融网络数据 |
+          #    | 70 | 网络管理信息码 |
+          #    | 90 | 原始数据元 |
+          #    | 96 | 报文安全码 |
+          #    | 100 | 接收机构标识码 |
+          #    | 102 | 账户标识 1 |
+          #    | 103 | 账户标识 2 |
+          #    | 104 | 附加信息 |
+          #    | 113 | 附加信息 |
+          #    | 116 | 附加信息 |
+          #    | 117 | 附加信息 |
+          #    | 121 | CUPS 保留 |
+          #    | 122 | 受理方保留 |
+          #    | 123 | 发卡方保留 |
+          #    | 125 | 附加信息 |
+          #    | 126 | 附加信息 |
+          #    | 128 | 报文鉴别码 |
+          extract_fields: "2,7,11,32,33"
+        # type: section
+        # name: WebSphereMQ
+        # description:
+        web_sphere_mq:
+          # type: bool
+          # name:
+          #   en: Parse XML
+          #   ch: 解析 XML
+          # unit:
+          # range: []
+          # enum_options: []
+          # modification: agent_restart
+          # ee_feature: true
+          # description:
+          #   en: |-
+          #     Whether to parse XML.
+          #   ch: |-
+          #     是否解析 XML 数据内容。
+          parse_xml_enabled: true
+          # type: bool
+          # name:
+          #   en: Decompress Payload
+          #   ch: 解压数据包
+          # unit:
+          # range: []
+          # enum_options: []
+          # modification: agent_restart
+          # ee_feature: true
+          # description:
+          #   en: |-
+          #     Some web_sphere_mq messages use zlib compression. When this option is enabled,
+          #     the agent will decompress the data packets during parsing.
+          #   ch: |-
+          #     部分 web_sphere_mq 的消息中使用 zlib 压缩，开启此选项后，agent 在解析时会对数据包进行解压。
+          decompress_enabled: true
+          # type: bool
+          # name:
+          #   en: Attribute Field Filter
+          #   ch: 属性字段过滤器
+          # unit:
+          # range: []
+          # enum_options: []
+          # modification: agent_restart
+          # ee_feature: true
+          # description:
+          #   en: |-
+          #      Enabling this option will cause the agent to retain only the following fields in the XML during parsing, reducing data storage.
+          #      - Document.ComConf.ConfInf.MT
+          #      - Document.ComConf.ConfInf.MsgId
+          #      - Document.ComConf.ConfInf.MsgPrcCd
+          #      - Document.ComConf.ConfInf.MsgRefId
+          #      - Document.ComConf.ConfInf.OrigSndDt
+          #      - Document.ComConf.ConfInf.OrigSndr
+          #      - Document.ComuCnfm.MsgId
+          #      - Document.ComuCnfm.MsgProCd
+          #      - Document.ComuCnfm.MsgRefId
+          #      - Document.ComuCnfm.MsgTp
+          #      - Document.ComuCnfm.OrigSndDt
+          #      - Document.ComuCnfm.OrigSndr
+          #   ch: |-
+          #     开启此选项后，agent 在解析时 XML 仅保留如下字段，减少数据存储。
+          #     - Document.ComConf.ConfInf.MT
+          #     - Document.ComConf.ConfInf.MsgId
+          #     - Document.ComConf.ConfInf.MsgPrcCd
+          #     - Document.ComConf.ConfInf.MsgRefId
+          #     - Document.ComConf.ConfInf.OrigSndDt
+          #     - Document.ComConf.ConfInf.OrigSndr
+          #     - Document.ComuCnfm.MsgId
+          #     - Document.ComuCnfm.MsgProCd
+          #     - Document.ComuCnfm.MsgRefId
+          #     - Document.ComuCnfm.MsgTp
+          #     - Document.ComuCnfm.OrigSndDt
+          #     - Document.ComuCnfm.OrigSndr
+          filter_attributes_enabled: true
+        # type: section
         # name: MySQL
         # description:
         mysql:
@@ -4948,6 +6024,21 @@ processors:
           #     设置为 false 以关闭解压，提升性能。
           #     参考：[MySQL Source Code Documentation](https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_compression.html)
           decompress_payload: true
+          # type: bool
+          # name:
+          #   en: Endpoint Disabled 
+          #   ch: 提取 Endpoint 开关 
+          # unit:
+          # range: []
+          # enum_options: []
+          # modification: agent_restart
+          # ee_feature: false
+          # description:
+          #   en: |-
+          #     After turning it off, the actions and table names in the SQL statement will not be extracted into the endpoint.
+          #   ch: |-
+          #     关闭后不会提取 SQL 语句中的动作和表名放入 endpoint 中
+          endpoint_disabled: true
         # type: section
         # name: Grpc
         # description:
@@ -4970,49 +6061,9 @@ processors:
           streaming_data_enabled: false
       # type: dict
       # name:
-      #   en: custom protocol parsing
-      #   ch: 自定义协议解析 
-      # modification: agent_restart
-      # ee_feature: true
-      # description:
-      #   en: |-
-      #     Custom protocol parsing configuration, which can be used to parse custom protocols through simple rules.
-      #     Example:
-      #     ```yaml
-      #     - protocol_name: "your_protocol_name" # Protocol name, corresponding to l7_flow_log.l7_protocol_str
-      #       pre_filter:
-      #         port_list: 1-65535 # Pre-filter port, which can improve parsing performance
-      #       request_characters:  # Multiple features are ORed
-      #         - character: # Multiple match_keywords are ANDed
-      #           - match_keyword: abc  # Feature string
-      #             match_type: "string" # Possible values: "string", "hex"
-      #             match_ignore_case: false # wheather ignore case when match keywords, when match_type == string effected, default: false
-      #             match_from_beginning: false # Whether to match from the beginning of the payload
-      #       response_characters:
-      #         - character:
-      #           - match_keyword: 0123af
-      #             match_type: "hex"
-      #             match_from_beginning: false
-      #     ```
-      #   ch: |-
-      #     自定义协议解析配置，支持通过简单的规则识别用户自定义的 L7 协议。
-      #     示例：
-      #     ```yaml
-      #     - protorol_name: "your_protocol_name" # 协议名称，对应 l7_flow_log.l7_protocol_str，注意：必须存在一个 `processors.request_log.tag_extraction.custom_field_policies` 配置，否则无法上报识别结果
-      #       pre_filter:
-      #         port_list: 1-65535 # 预过滤端口，可以提高解析性能
-      #       request_characters:  # 多个特征之间是 OR 的关系
-      #         - character: # 多个 match_keyword 之间是 AND 的关系
-      #           - match_keyword: abc  # 特征字符串
-      #             match_type: "string" # 取值："string", "hex"
-      #             match_ignore_case: false # 匹配特征字符串是否忽略大小写，当 match_type == string 时生效，默认值: false
-      #             match_from_begining: false # 是否需要从 Payload 头部开始匹配
-      #       response_characters:
-      #         - character:
-      #           - match_keyword: 0123af
-      #             match_type: "hex"
-      #             match_from_begining: false
-      #     ```
+      #   en: Custom Protocol Parsing
+      #   ch: 自定义协议解析
+      # description: deprecated
       custom_protocols: []
     # type: section
     # name:
@@ -5071,11 +6122,13 @@ processors:
         Redis: 1-65535
         MongoDB: 1-65535
         Memcached: 11211
+        ISO8583: 1-65535
         Kafka: 1-65535
         MQTT: 1-65535
         AMQP: 1-65535
         OpenWire: 1-65535
         NATS: 1-65535
+        WebSphereMQ: 1-65535
         Pulsar: 1-65535
         ZMTP: 1-65535
         RocketMQ: 1-65535
@@ -5232,11 +6285,13 @@ processors:
         Redis: []
         MongoDB: []
         Memcached: []
+        ISO8583: []
         Kafka: []
         MQTT: []
         AMQP: []
         OpenWire: []
         NATS: []
+        WebSphereMQ: []
         Pulsar: []
         ZMTP: []
         RocketMQ: []
@@ -5251,7 +6306,7 @@ processors:
       # unit:
       # range: []
       # enum_options: []
-      # modification: agent_restart
+      # modification: hot_update
       # ee_feature: false
       # description:
       #   en: |-
@@ -5484,6 +6539,23 @@ processors:
         #     如果指定多个值，优先级从前到后降低。插件重写的字段优先级最高。
         # upgrade_from: http_log_x_request_id
         x_request_id: [X_Request_ID]
+        # type: bool
+        # name:
+        #   en: Multiple TraceID Collection
+        #   ch: 多 TraceID 采集
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: hot_update
+        # ee_feature: true
+        # description:
+        #   en: |-
+        #     When configured as `false`, only one TraceID is collected.
+        #     When configured as `true`, multiple TraceIDs will be collected.
+        #   ch: |-
+        #     - 配置为 `false` 时，根据配置 `APM TraceID` 采集到第一个匹配的 TraceID 就不继续采集。
+        #     - 配置为 `true` 时，采集所有匹配到的 TraceID。
+        multiple_trace_id_collection: true
         # type: string
         # name: APM TraceID
         # unit:
@@ -5498,13 +6570,42 @@ processors:
         #     setting it to empty.
         #     If multiple values are specified, the first match will be used.
         #     Fields rewritten by plugins have the highest priority.
+        #
+        #     Supports extracting the trace id from the following headers, in the following format:
+        #     - traceparent: 00-TRACEID-SPANID-01
+        #     - sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+        #     - sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+        #     - sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+        #     - uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+        #     - b3: TRACEID-SPANID-1
         #   ch: |-
         #     配置该参数后，deepflow-agent 会尝试从 HTTP 和 RPC header 中匹配特征字段，并将匹配到
         #     的结果填充到应用调用日志的`trace_id`字段中，作为调用链追踪的特征值。参数支持填写多个不同的
         #     特征字段，中间用`,`分隔。
         #     如果指定多个值，优先级从前到后降低。插件重写的字段优先级最高。
+        #
+        #     支持从如下 Header 中提取 trace id，其格式如下:
+        #     - traceparent: 00-TRACEID-SPANID-01
+        #     - sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+        #     - sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+        #     - sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+        #     - uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+        #     - b3: TRACEID-SPANID-1
         # upgrade_from: http_log_trace_id
         apm_trace_id: [traceparent, sw8]
+        # type: bool
+        # name: Copy APM TraceID
+        # unit:
+        # range: []
+        # enum_options: []
+        # modification: hot_update
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     When set to true, the APM TraceID will be copied to the attribute.apm_trace_id field.
+        #   ch: |-
+        #     设置为 true 时，将会抄写 APM TraceID 至 attribute.apm_trace_id 字段中。
+        copy_apm_trace_id: false
         # type: string
         # name: APM SpanID
         # unit:
@@ -5519,11 +6620,27 @@ processors:
         #     setting it to empty.
         #     If multiple values are specified, the first match will be used.
         #     Fields rewritten by plugins have the highest priority.
+        #
+        #     Supports extracting the span id from the following headers, in the following format:
+        #     - traceparent: 00-TRACEID-SPANID-01
+        #     - sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+        #     - sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+        #     - sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+        #     - uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+        #     - b3: TRACEID-SPANID-1
         #   ch: |-
         #     配置该参数后，deepflow-agent 会尝试从 HTTP 和 RPC header 中匹配特征字段，并将匹配到
         #     的结果填充到应用调用日志的`span_id`字段中，作为调用链追踪的特征值。参数支持填写多个不同的
         #     特征字段，中间用`,`分隔。
         #     如果指定多个值，优先级从前到后降低。插件重写的字段优先级最高。
+        #
+        #     支持从如下 Header 中提取 span id，其格式如下:
+        #     - traceparent: 00-TRACEID-SPANID-01
+        #     - sw3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING 
+        #     - sw6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+        #     - sw8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+        #     - uber-trace-id: TRACEID:SPANID:PARENTSPANID:FLAGS
+        #     - b3: TRACEID-SPANID-1
         # upgrade_from: http_log_span_id
         apm_span_id: [traceparent, sw8]
       # type: section
@@ -5718,83 +6835,9 @@ processors:
         HTTP2: []
       # type: dict
       # name:
-      #   en: Custom Fields Policies
-      #   ch: 自定义字段提取策略
-      # unit:
-      # range: []
-      # modification: agent_restart
-      # ee_feature: true
-      # description:
-      #   en: |-
-      #     Custom field extraction policies, used to extract custom fields from L7 protocols
-      #     Example:
-      #     ```yaml
-      #     - policy_name: "my_policy" # name of current policy
-      #       protocol_name: HTTP # protocol name, if protocol is Grpc, please set it to HTTP2, optional values: HTTP/HTTP2/Dubbo/SofaRPC/Custom/...
-      #       custom_protocol_name: "my_protocol"  # when protocol_name is Custom are effected, and there must be a `processors.request_log.application_protocol_inference.custom_protocols` configuration with the same name, otherwise it cannot be parsed
-      #       port_list: 1-65535
-      #       fields:
-      #       - field_name: "my_field"
-      #         field_match_type: "string"  # optional values: "string"
-      #         field_match_ignore_case: "false" # wheather ignore case when match field, default: false
-      #         field_match_keyword: "abc"  # can be filled with additional characters to improve accuracy, for example `"\"abc\": \""`
-      #
-      #         subfield_match_keyword: "y" # in some cases, we need to extract a subfield, for example, in the HTTP Cookie field, we only need to extract part of it, such as extracting the value corresponding to y from `abc: x=1,y=2,z=3` (the value is `x=1,y=2,z=3`)
-      #         separator_between_subfield_kv_pair: "," # default: empty
-      #         separator_between_subfield_key_and_value: "=" # default: empty
-      #
-      #         field_type: "http_url_field" # field type of extraction, optional values: http_url_field/header_field/payload_json_value/payload_xml_value/payload_hessian2_value, default value: header_field
-      #         traffic_direction: request # could be limited to search only in request (or only in response), optional values: request/response/both, default value: both
-      #         check_value_charset: false # used for checking whether the extracted result is legal
-      #         value_primary_charset: ["digits", "alphabets", "chinese"] # used for checking the character set of the extracted result, optional values: digits/alphabets/chinese
-      #         value_special_charset: ".-_" # used for checking the character set of the extracted result
-      #         attribute_name: "xyz" # this field will appear in the calling log's attribute.xyz, default value is empty, if empty, this field will not be added to attribute
-      #         rewrite_native_tag: version # rewrite can fill in one of the following fields to overwrite the corresponding field value: version/request_type/request_domain/request_resource/request_id/endpoint/response_code/response_exception/response_result/trace_id/span_id/x_request_id/http_proxy_client
-      #         rewrite_response_status: # rewrite response_status field, when response_code is in success_values array, response_status will be set to success, otherwise set to server_error
-      #           success_values: []
-      #         metric_name: "xyz"  # this field will appear in the calling log's metrics.xyz, default value is empty
-      #     ```
-      #     notice: the different values of field_type will affect the extraction method of the field, as follows:
-      #     - `http_url_field`: extract field from HTTP URL parameters at the end of the URL, such as `?key=value&key2=value2`
-      #     - `header_field`: extract field from the Header part of HTTP/Dubbo/SofaRPC/... protocols, such as HTTP Header like `key: value`
-      #     - `payload_json_value`: extract field from Json Payload, such as `"key": 1`, or `"key": "value"`, or `"key": None`, etc.
-      #     - `payload_xml_value`: extract field from XML Payload, such as `<key attr="xxx">value</key>`
-      #     - `payload_hessian2_value`: extract field from Payload encoded with Hessian2
-      #   ch: |-
-      #     自定义字段提取策略，用于通过简单的规则提取 L7 协议中可能存在的自定义字段
-      #     示例：
-      #     ```yaml
-      #     - policy_name: "my_policy" # 策略名称
-      #       protocol_name: HTTP # 协议名称，如要解析 Grpc 请配置为 HTTP2，可选值： HTTP/HTTP2/Dubbo/SofaRPC/Custom/...
-      #       custom_protocol_name: "my_protocol"  # 当 protocol_name 为 Custom 时生效，注意：此时必须存在一个 `processors.request_log.application_protocol_inference.custom_protocols` 配置，且自定义名称协议名称相等，否则无法解析
-      #       port_list: 1-65535
-      #       fields:
-      #       - field_name: "my_field" # 配置的字段
-      #         field_match_type: "string" # 可选值："string"
-      #         field_match_ignore_case: "false" # 当匹配 field 时是否忽略大小写，默认值：false
-      #         field_match_keyword: "abc" # 可以填写额外的字符以提升匹配准确率，例如 `"\"abc\": \""`
-      #
-      #         subfield_match_keyword: "y" # 有些情况下，我们需要提取一个子字段，例如 HTTP 的 Cookie 字段中，我们仅仅只需要提取其中的一部分，例如，我们要从 `abc: x=1,y=2,z=3` 的 Value（`x=1,y=2,z=3`）中提取 y 对应的值
-      #         separator_between_subfield_kv_pair: "," # 用于分割 key-value 键值对的分隔符，默认值：空
-      #         separator_between_subfield_key_and_value: "=" # 用于分割 key 和 value 的分隔符，默认值：空
-      #
-      #         field_type: "http_url_field" # 字段的提取类型，可选值：http_url_field/header_field/payload_json_value/payload_xml_value/payload_hessian2_value，默认值为 `header_field`，含义见下方说明
-      #         traffic_direction: request # 可以限定仅在请求（或仅在响应）中搜索，默认值为 both，可选值：request/response/both
-      #         check_value_charset: false # 可用于检查提取结果是否合法
-      #         value_primary_charset: ["digits", "alphabets", "chinese"] # 提取结果校验字符集，可选值：digits/alphabets/chinese
-      #         value_special_charset: ".-_" # 提取结果校验字符集，额外校验这些特殊字符
-      #         attribute_name: "xyz" # 此时该字段将会出现在调用日志的 attribute.xyz 中，默认值为空，为空时该字段不会加入到 attribute 内
-      #         rewrite_native_tag: version # rewrite 可以填写以下几种字段之一，用于覆写对应字段的值：version/request_type/request_domain/request_resource/request_id/endpoint/response_code/response_exception/response_result/trace_id/span_id/x_request_id/http_proxy_client
-      #         rewrite_response_status: # rewrite response_status 字段，当 response_code 在 success_values 数组中时，会将 response_status 设置为 success，否则设置为 server_error
-      #           success_values: []
-      #         metric_name: "xyz" # 此时该字段将会出现在调用日志的 metrics.xyz 中，默认值为空
-      #     ```
-      #     注意，其中 field_type 的不同值会影响到该字段的提取方式，具体如下：
-      #     - `http_url_field`：从 HTTP URL 末尾的参数中提取字段，URL 末尾形如：`?key=value&key2=value2`
-      #     - `header_field`：从 HTTP/Dubbo/SofaRPC/...等协议的 Header 部分提取字段，例如 HTTP 的 Header 形如：`key: value`
-      #     - `payload_json_value`：从 Json Payload 中提取字段，形如：`"key": 1`,  或者 `"key": "value"`,  或者 `"key": None`, 等等 ...
-      #     - `payload_xml_value`：从 XML Payload 中提取字段，形如：`<key attr="xxx">value</key>`
-      #     - `payload_hessian2_value`：Payload 使用 Hessian2 编码，从中提取字段
+      #   en: Custom Protocol Parsing
+      #   ch: 自定义协议解析
+      # description: deprecated
       custom_field_policies: []
       # type: string
       # name:
@@ -5819,6 +6862,96 @@ processors:
       #     - 各类语句中的 value 信息
       # upgrade_from: static_config.l7-protocol-advanced-features.obfuscate-enabled-protocols
       obfuscate_protocols: [Redis]
+      # type: section
+      # name:
+      #   en: Raw Data
+      #   ch: 原始数据
+      # description:
+      #   en: 控制提取 L7 日志对应的原始数据
+      #   ch: Control the extraction of raw data corresponding to the L7 logs
+      raw:
+        # type: int
+        # name:
+        #   en: Length of extracted request header
+        #   ch: 提取的请求头长度
+        # unit:
+        # range: [0, 16384]
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     When set to a value greater than 0, for call logs with abnormal states, the request Header is automatically collected
+        #     (truncated to $error_request_header bytes) into attribute.request_header. Recommended for temporary use only for the
+        #     following reasons:
+        #     - On one hand, directly storing the header carries a certain risk of exposing sensitive information, which may
+        #       lead to compliance issues.
+        #     - On the other hand, it can also cause all request header (currently only for the HTTP protocol) to be cached
+        #       until the response status is parsed to determine whether to send them, consuming collector resources.
+        #   ch: |-
+        #     当设置为大于 0 的值时，对于状态异常的调用日志，自动采集请求 Header（截断到 $error_request_header 字节）到 attribute.request_header，
+        #     因如下原因此功能仅建议临时使用：
+        #     - 一方面直接存储 Header 有一定的敏感信息暴露风险，可能导致合规问题
+        #     - 另一方面也会导致（目前仅 HTTP 协议）所有 Request Header 被缓存，直到等到解析到 Response 状态才能判断是否发送，消耗采集器资源
+        error_request_header: 0
+        # type: int
+        # name:
+        #   en: Length of extracted request header
+        #   ch: 提取的请求头长度
+        # unit:
+        # range: [0, 16384]
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     When set to a value greater than 0, for call logs with abnormal states, the response Header is automatically collected
+        #     (truncated to $error_response_header bytes) into attribute.response_header.
+        #   ch: |-
+        #     当设置为大于 0 的值时，对于状态异常的调用日志，自动采集响应 Header（截断到 $error_response_header 字节）到 attribute.response_header。
+        error_response_header: 0
+        # type: int
+        # name:
+        #   en: Length of extracted response header
+        #   ch: 提取的响应头长度
+        # unit:
+        # range: [0, 16384]
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     When set to a value greater than 0, for call logs with abnormal status, the request payload is automatically
+        #     collected (truncated to $error_request_payload) into attribute.request_payload. Recommended for temporary use
+        #     only for the following reasons:
+        #     - On one hand, directly storing the payload carries a certain risk of exposing sensitive information, which may
+        #       lead to compliance issues.
+        #     - On the other hand, it can also cause all request payloads (currently only for the HTTP protocol) to be cached
+        #       until the response status is parsed to determine whether to send them, consuming collector resources.
+        #   ch: |-
+        #     当设置为大于 0 的值时，对于状态异常的调用日志，自动采集请求 Payload（截断到 $error_request_payload）到
+        #     attribute.request_payload，因以下原因此功能仅建议临时使用：
+        #     - 一方面直接存储 Payload 有一定的敏感信息暴露风险，可能导致合规问题
+        #     - 另一方面也会导致（目前仅 HTTP 协议）所有 Request Payload 被缓存，直到等到解析到 Response 状态才能判断是否发送，
+        #       消耗采集器资源
+        error_request_payload: 0
+        # type: int
+        # name:
+        #   en: Length of extracted request header
+        #   ch: 提取的请求头长度
+        # unit:
+        # range: [0, 16384]
+        # enum_options: []
+        # modification: agent_restart
+        # ee_feature: false
+        # description:
+        #   en: |-
+        #     The default value is 256, which means collecting the first 256 bytes of an abnormal response payload and placing
+        #     them into attribute.response_payload. When set to 0, it means that abnormal response payloads are not collected.
+        #   ch: |-
+        #     默认值为 256，表示采集异常响应 Payload 的前 256 字节，放到 attribute.response_payload 当设置为 0 时，表示不采集
+        #     异常响应 Payload
+        error_response_payload: 256
     # type: section
     # name:
     #   en: Tunning
@@ -6020,9 +7153,21 @@ processors:
         # description:
         #   en: |-
         #     Service port list, priority lower than TCP SYN flags.
+        #
+        #     The server determines the priority order from highest to lowest as:
+        #     - TCP Flags: SYN|ACK, GPID
+        #     - Layer 7 Parsing
+        #     - `server_ports` Configuration
+        #     - Packet Count (The side with more sent packets is the server.)
         #   ch: |-
         #     deepflow-agent 有可能会错误的判断长流的方向，如果某个端口一定是服务端端口，
         #     可配置在此处避免误判断。
+        #
+        #     服务端判定优先级从高到低为：
+        #     - TCP Flags 中 SYN|ACK、GPID
+        #     - L7 层解析
+        #     - `server_ports` 配置 
+        #     - Packet 计数（发送包数多的为服务端）
         # upgrade_from: static_config.server-ports
         server_ports: []
         # type: bool
@@ -6095,7 +7240,7 @@ processors:
         # unit:
         # range: [1s, 1d]
         # enum_options: []
-        # modification: agent_restart
+        # modification: hot_update
         # ee_feature: false
         # description:
         #   en: |-
@@ -6109,7 +7254,7 @@ processors:
         # unit:
         # range: [1s, 1d]
         # enum_options: []
-        # modification: agent_restart
+        # modification: hot_update
         # ee_feature: false
         # description:
         #   en: |-
@@ -6123,7 +7268,7 @@ processors:
         # unit:
         # range: [1s, 1d]
         # enum_options: []
-        # modification: agent_restart
+        # modification: hot_update
         # ee_feature: false
         # description:
         #   en: |-
@@ -6137,7 +7282,7 @@ processors:
         # unit:
         # range: [1s, 1d]
         # enum_options: []
-        # modification: agent_restart
+        # modification: hot_update
         # ee_feature: false
         # description:
         #   en: |-
@@ -6182,17 +7327,29 @@ processors:
       # ee_feature: false
       # description:
       #   en: |-
-      #     Maximum number of flows that can be stored in FlowMap, It will also affect the capacity of
-      #     the RRT cache, Example: `rrt-cache-capacity` = `flow-count-limit`. When `rrt-cache-capacity`
-      #     is not enough, it will be unable to calculate the rrt of l7. When `inputs.cbpf.common.capture_mode`
-      #     is `Physical Mirror` and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
+      #     Maximum number of flows that can be stored in FlowMap. When `inputs.cbpf.common.capture_mode` is `Physical Mirror`
+      #     and concurrent_flow_limit is less than or equal to 65535, it will be forced to u32::MAX.
       #   ch: |-
-      #     FlowMap 中存储的最大并发 Flow 数量。该配置同时影响 RRT 缓存容量。
-      #     例如：`rrt-cache-capacity` = `flow-count-limit`。当 `rrt-cache-capacity` 不足时，
-      #     将无法计算 L7 的 RRT。当 `inputs.cbpf.common.capture_mode` 为 `物理网络镜像` 并且该配置值小于等于 65535 时，
-      #     将会被强制设置为 u32::MAX。
+      #     FlowMap 中存储的最大并发 Flow 数量。当 `inputs.cbpf.common.capture_mode` 为 `物理网络镜像` 并且该配置值小于等
+      #     于 65535 时，将会被强制设置为 u32::MAX。
       # upgrade_from: static_config.flow.flow-count-limit
       concurrent_flow_limit: 65535
+      # type: int
+      # name:
+      #   en: RRT Cache Capacity
+      #   ch: RRT 缓存容量
+      # unit:
+      # range: [1024, 64000000]
+      # enum_options: []
+      # modification: agent_restart
+      # ee_feature: false
+      # description:
+      #   en: |-
+      #     The capacity of the RRT Cache table in FlowMap. This table is used to calculate RRT latency metrics. If it is too large,
+      #     it will cause high memory usage in the agent; if it is too small, RRT metrics may be missing.
+      #   ch: |-
+      #     FlowMap 中 RRT Cache 表的容量。该表用于计算 RRT 延迟指标，过大会导致采集器内存占用高，过小会导致RRT指标缺失。
+      rrt_cache_capacity: 16000
       # type: int
       # name:
       #   en: Memory Pool Size
@@ -7056,6 +8213,18 @@ outputs:
 #   en: Plugins
 #   ch: 插件
 # description:
+#   en: |-
+#     Plugin support
+#     When both plugins and custom extraction policies match, the priority is:
+#     1. Plugin extraction
+#     2. Custom field policies extraction
+#     3. Agent default extraction
+#   ch: |-
+#     插件支持
+#     同时匹配插件和自定义提取策略时，优先级为：
+#     1. 插件提取
+#     2. 自定义字段提取
+#     3. 采集器默认提取
 plugins:
   # type: string
   # name:

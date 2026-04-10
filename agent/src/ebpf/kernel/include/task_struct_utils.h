@@ -111,13 +111,14 @@ static __inline void *infer_and_get_socket_from_fd(int fd_num, struct member_fie
 	// 0xcd8 for 4.14.105-1-tlinux3-0023.1
 	// 0x7c8 for 4.19.90-25.24.v2101.ky10.aarch64
 	// 0xa98 for 4.14.105-19-0019 tlinux
+	// 0xa90 for 4.15.0 ubuntu 
 	int files_offset_array[] = {
 		0x6c0, 0x790, 0x7b0, 0xa80, 0xa88, 0xaa0, 0xaa8, 0xab0, 0xab8, 0xac0,
 		0xac8, 0xad0, 0xad8, 0xae0, 0xae8, 0xaf0, 0xaf8, 0xb00, 0xb08, 0xb10,
 		0xb18, 0xb20, 0xb48, 0xb50, 0xb58, 0xb60, 0xb68, 0xb70, 0xb78, 0xb90,
 		0xb98, 0xba0, 0xbb0, 0x740, 0xbc0, 0xbc8, 0xbd0, 0xbd8, 0xbe0, 0xbe8,
 		0xbf0, 0xbf8, 0xc00, 0xc08, 0xcc8, 0xd08, 0x6b8, 0xb88, 0xcd8, 0x7c8,
-		0xa98
+		0xa98, 0xa90
 	};
 #endif
 /* *INDENT-ON* */
@@ -136,7 +137,7 @@ static __inline void *infer_and_get_socket_from_fd(int fd_num, struct member_fie
 						      sizeof(private_data),
 						      file +
 						      offset->
-						      struct_files_private_data_offset);
+						      struct_file_private_data_offset);
 				if (private_data != NULL) {
 					socket = private_data;
 					bpf_probe_read_kernel(&__socket,
@@ -164,7 +165,7 @@ static __inline void *infer_and_get_socket_from_fd(int fd_num, struct member_fie
 	}
 
 	bpf_probe_read_kernel(&private_data, sizeof(private_data),
-			      file + offset->struct_files_private_data_offset);
+			      file + offset->struct_file_private_data_offset);
 
 	if (private_data == NULL) {
 		return NULL;
@@ -224,7 +225,7 @@ static __inline void *get_socket_from_fd(int fd_num,
 			      file + data_off);
 #else
 	bpf_probe_read_kernel(&private_data, sizeof(private_data),
-			      file + offset->struct_files_private_data_offset);
+			      file + offset->struct_file_private_data_offset);
 #endif
 	if (private_data == NULL) {
 		return NULL;

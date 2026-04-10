@@ -17,9 +17,12 @@
 mod comment_parser;
 mod consts;
 
-use std::cell::Cell;
-use std::io::Read;
-use std::str;
+use std::{
+    borrow::Cow,
+    cell::Cell,
+    io::Read,
+    str::{self, SplitWhitespace},
+};
 
 use flate2::bufread::ZlibDecoder;
 use log::{debug, trace};
@@ -27,8 +30,7 @@ use serde::Serialize;
 
 use super::{
     sql_check::{is_mysql, is_valid_sql, trim_head_comment_and_get_first_word},
-    sql_obfuscate::attempt_obfuscation,
-    ObfuscateCache,
+    sql_obfuscate::CachedObfuscator,
 };
 
 use self::consts::*;
@@ -37,20 +39,38 @@ use crate::{
         enums::IpProtocol,
         flow::{L7PerfStats, L7Protocol, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     config::handler::{L7LogDynamicConfig, LogParserConfig},
     flow_generator::{
         error,
         protocol_logs::{
-            pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
-            set_captured_byte, value_is_default, AppProtoHead, L7ResponseStatus, LogMessageType,
+            consts::APM_TRACE_ID_ATTR,
+            pb_adapter::{
+                ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, TraceInfo,
+            },
+            set_captured_byte, value_is_default, AppProtoHead, L7ResponseStatus, PrioStrings,
+            BASE_FIELD_PRIORITY,
         },
     },
     utils::bytes,
 };
-use public::l7_protocol::L7ProtocolChecker;
+use public::l7_protocol::{
+    Field, FieldSetter, L7Log, L7LogAttribute, L7ProtocolChecker, LogMessageType,
+};
+use public_derive::L7Log;
+
+cfg_if::cfg_if! {
+    if #[cfg(feature = "enterprise")] {
+        use enterprise_utils::l7::custom_policy::{
+            custom_field_policy::{PolicySlice, Store, enums::{Op, Source}},
+            enums::TrafficDirection,
+        };
+
+        use crate::flow_generator::protocol_logs::auto_merge_custom_field;
+    }
+}
 
 const SERVER_STATUS_CODE_MIN: u16 = 1000;
 const CLIENT_STATUS_CODE_MIN: u16 = 2000;
@@ -109,48 +129,84 @@ impl From<Error> for error::Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Serialize, Debug, Default, Clone)]
+#[derive(L7Log, Serialize, Debug, Default, Clone)]
+#[l7_log(request_type.getter = "MysqlInfo::get_command")]
+#[l7_log(request_domain.skip = "true")]
+#[l7_log(trace_id.getter = "MysqlInfo::get_trace_id", trace_id.setter = "MysqlInfo::set_trace_id")]
+#[l7_log(endpoint.getter = "MysqlInfo::endpoint_field", endpoint.setter = "MysqlInfo::set_endpoint")]
+#[l7_log(response_result.skip = "true")]
+#[l7_log(x_request_id.skip = "true")]
+#[l7_log(http_proxy_client.skip = "true")]
+#[l7_log(biz_type.skip = "true")]
+#[l7_log(biz_code.skip = "true")]
+#[l7_log(biz_scenario.skip = "true")]
 pub struct MysqlInfo {
     msg_type: LogMessageType,
     #[serde(skip)]
     is_tls: bool,
+    endpoint_disabled: bool,
 
     // Server Greeting
+    #[l7_log(version)]
     #[serde(rename = "version", skip_serializing_if = "value_is_default")]
     pub protocol_version: u8,
     // request
+    #[l7_log(request_type)]
     #[serde(rename = "request_type")]
     pub command: u8,
+    #[l7_log(request_resource)]
     #[serde(rename = "request_resource", skip_serializing_if = "value_is_default")]
     pub context: String,
     // response
     pub response_code: u8,
+    #[l7_log(response_code)]
     #[serde(skip)]
     pub error_code: Option<i32>,
     #[serde(rename = "sql_affected_rows", skip_serializing_if = "value_is_default")]
     pub affected_rows: u64,
+    #[l7_log(response_exception)]
     #[serde(
         rename = "response_execption",
         skip_serializing_if = "value_is_default"
     )]
     pub error_message: String,
+    #[l7_log(response_status)]
     #[serde(rename = "response_status")]
     pub status: L7ResponseStatus,
+    pub endpoint: Option<String>,
 
     rrt: u64,
     // This field is extracted in the following message:
     // 1. Response message corresponding to COM_STMT_PREPARE request
     // 2. COM_STMT_EXECUTE request message
+    #[l7_log(request_id)]
     statement_id: u32,
 
     captured_request_byte: u32,
     captured_response_byte: u32,
 
-    trace_id: Option<String>,
+    trace_ids: PrioStrings,
+    #[serde(skip)]
+    copy_apm_trace_id: bool,
     span_id: Option<String>,
 
     #[serde(skip)]
     is_on_blacklist: bool,
+
+    #[serde(skip)]
+    attributes: Vec<KeyVal>,
+
+    #[serde(skip_serializing_if = "value_is_default")]
+    biz_response_code: String,
+}
+
+impl L7LogAttribute for MysqlInfo {
+    fn add_attribute(&mut self, name: Cow<'_, str>, value: Cow<'_, str>) {
+        self.attributes.push(KeyVal {
+            key: name.into_owned(),
+            val: value.into_owned(),
+        });
+    }
 }
 
 impl L7ProtocolInfoInterface for MysqlInfo {
@@ -188,6 +244,13 @@ impl L7ProtocolInfoInterface for MysqlInfo {
     // all unmerged responses are skipped because segmented responses can produce multiple OK responses
     fn skip_send(&self) -> bool {
         self.msg_type == LogMessageType::Response
+    }
+
+    fn get_endpoint(&self) -> Option<String> {
+        match self.endpoint_field() {
+            Field::Str(s) => Some(s.into_owned()),
+            _ => None,
+        }
     }
 }
 
@@ -265,12 +328,144 @@ impl MysqlInfo {
         }
     }
 
+    fn endpoint_field(&self) -> Field<'_> {
+        if self.endpoint_disabled {
+            return Field::None;
+        }
+        match self.endpoint.as_deref() {
+            Some(endpoint) => Field::Str(Cow::Borrowed(endpoint)),
+            None if !self.context.is_empty() => Field::Str(Cow::Borrowed(&self.context)),
+            None => Field::None,
+        }
+    }
+
+    fn set_endpoint(&mut self, endpoint: FieldSetter) {
+        if self.endpoint_disabled {
+            return;
+        }
+        match endpoint.into_inner() {
+            Field::Str(s) if !s.is_empty() => self.endpoint = Some(s.into_owned()),
+            _ => self.endpoint = None,
+        }
+    }
+
+    fn get_table_name_from_sql(
+        sql: &mut SplitWhitespace,
+        key: &'static str,
+        action: &'static str,
+    ) -> Option<String> {
+        let mut flag = false;
+        for word in sql {
+            if word.eq_ignore_ascii_case(key) {
+                flag = true;
+                continue;
+            }
+            if flag {
+                let Some(first_quote) = word.find('`') else {
+                    return Some(format!("{} {}", action, word));
+                };
+                if first_quote + 1 >= word.len() {
+                    return Some(format!("{} {}", action, word));
+                }
+                let word = &word[first_quote + 1..];
+                let Some(second_quote) = word.find('`') else {
+                    return Some(format!("{} {}", action, word));
+                };
+                return Some(format!("{} {}", action, &word[..second_quote]));
+            }
+        }
+
+        None
+    }
+
+    fn generate_endpoint(&mut self) {
+        if self.endpoint_disabled {
+            return;
+        }
+        self.endpoint = None;
+        if self.context.is_empty() {
+            return;
+        }
+
+        let mut words = self.context.split_whitespace();
+        let Some(action) = words.next() else {
+            return;
+        };
+
+        match action.to_ascii_uppercase().as_str() {
+            // select * from table_name
+            // SELECT count(*) AS count_1 FROM
+            //   (SELECT user_app_biz_path.id AS user_app_biz_path_id FROM user_app_biz_path WHERE user_app_biz_path.app_biz_lcuid = '03bc900c-8632-4d9f-8baa-de7d869e4711') AS anon_1
+            "SELECT" => {
+                let mut last = self.context.as_str();
+                for word in words.rev() {
+                    if word.eq_ignore_ascii_case("from") {
+                        self.endpoint = Some(format!("SELECT {}", last.trim_matches('`')));
+                        return;
+                    }
+                    last = word;
+                }
+            }
+            // insert into table_name
+            "INSERT" => {
+                if let Some(table_name) =
+                    Self::get_table_name_from_sql(&mut words, "into", "INSERT")
+                {
+                    self.endpoint = Some(table_name);
+                    return;
+                }
+            }
+            // update table_name set ...
+            "UPDATE" => {
+                if let Some(table_name) = words.next() {
+                    self.endpoint = Some(format!("UPDATE {}", table_name.trim_matches('`')));
+                    return;
+                }
+            }
+            // delete from table_name
+            "DELETE" => {
+                if let Some(table_name) =
+                    Self::get_table_name_from_sql(&mut words, "from", "DELETE")
+                {
+                    self.endpoint = Some(table_name);
+                    return;
+                }
+            }
+            "ALTER" => {
+                if let Some(table_name) =
+                    Self::get_table_name_from_sql(&mut words, "table", "ALTER")
+                {
+                    self.endpoint = Some(table_name);
+                    return;
+                }
+            }
+            "CREATE" => {
+                if let Some(table_name) =
+                    Self::get_table_name_from_sql(&mut words, "table", "CREATE")
+                {
+                    self.endpoint = Some(table_name);
+                    return;
+                }
+            }
+            "DROP" => {
+                if let Some(table_name) = Self::get_table_name_from_sql(&mut words, "table", "DROP")
+                {
+                    self.endpoint = Some(table_name);
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn request_string(
         &mut self,
-        config: Option<&LogParserConfig>,
+        param: &ParseParam,
         payload: &[u8],
-        obfuscate_cache: &Option<ObfuscateCache>,
+        _parser: &mut MysqlLog,
+        #[cfg(feature = "enterprise")] custom_policies: Option<PolicySlice>,
     ) -> Result<()> {
+        let config = param.parse_config.as_ref();
         let payload = mysql_string(payload);
         if (self.command == COM_QUERY || self.command == COM_STMT_PREPARE) && !is_mysql(payload) {
             return Err(Error::InvalidSqlStatement);
@@ -278,24 +473,26 @@ impl MysqlInfo {
         let Ok(sql_string) = str::from_utf8(payload) else {
             return Err(Error::InvalidSqlStatement);
         };
+
+        #[cfg(feature = "enterprise")]
+        if let Some(policies) = custom_policies {
+            policies.apply(
+                &mut _parser.custom_field_store,
+                self,
+                TrafficDirection::REQUEST,
+                Source::Sql(sql_string, None),
+            );
+        }
+
         if let Some(c) = config {
             self.extract_trace_and_span_id(&c.l7_log_dynamic, sql_string);
         }
-        let context = match attempt_obfuscation(obfuscate_cache, payload) {
-            Some(mut m) => {
-                let valid_len = match str::from_utf8(&m) {
-                    Ok(_) => m.len(),
-                    Err(e) => e.valid_up_to(),
-                };
-                m.truncate(valid_len);
-                unsafe {
-                    // SAFTY: str in m is checked to be valid utf8 up to `valid_len`
-                    String::from_utf8_unchecked(m)
-                }
-            }
-            _ => String::from_utf8_lossy(payload).to_string(),
+        let obfuscator = CachedObfuscator::new(param.obfuscate_cache.clone());
+        self.context = match obfuscator.apply(sql_string) {
+            Ok(obfuscated) => obfuscated.into_owned(),
+            _ => sql_string.to_string(),
         };
-        self.context = context;
+        self.generate_endpoint();
         Ok(())
     }
 
@@ -305,14 +502,27 @@ impl MysqlInfo {
             return;
         }
         debug!("extract id from sql {sql}");
-        'outer: for comment in comment_parser::MysqlCommentParserIter::new(sql) {
+        for comment in comment_parser::MysqlCommentParserIter::new(sql) {
             trace!("comment={comment}");
             for (key, value) in KvExtractor::new(comment) {
                 trace!("key={key} value={value}");
-                for tt in config.trace_types.iter() {
-                    if tt.check(key) {
-                        self.trace_id = tt.decode_trace_id(value).map(|s| s.to_string());
-                        break;
+                for (index, tt) in config.trace_types.iter().enumerate() {
+                    if !tt.check(key) {
+                        continue;
+                    }
+                    if let Some(trace_id) = tt.decode_trace_id(value) {
+                        if self.copy_apm_trace_id {
+                            self.copy_apm_trace_id = false;
+                            self.attributes.push(KeyVal {
+                                key: APM_TRACE_ID_ATTR.to_string(),
+                                val: trace_id.clone().into_owned(),
+                            });
+                        }
+                        self.trace_ids
+                            .push(index as u8 + BASE_FIELD_PRIORITY, trace_id);
+                        if !config.multiple_trace_id_collection {
+                            break;
+                        }
                     }
                 }
                 for st in config.span_types.iter() {
@@ -321,17 +531,11 @@ impl MysqlInfo {
                         break;
                     }
                 }
-                if self.trace_id.is_some() && config.span_types.is_empty()
-                    || self.span_id.is_some() && config.trace_types.is_empty()
-                    || self.trace_id.is_some() && self.span_id.is_some()
-                {
-                    break 'outer;
-                }
             }
         }
         debug!(
             "extracted trace_id={:?} span_id={:?}",
-            self.trace_id, self.span_id
+            self.trace_ids, self.span_id
         );
     }
 
@@ -347,14 +551,35 @@ impl MysqlInfo {
                 || t.request_type.is_on_blacklist(self.get_command_str());
         }
     }
+
+    fn get_command(&self) -> Field<'_> {
+        Field::Str(Cow::Borrowed(self.get_command_str()))
+    }
+
+    fn get_trace_id(&self) -> Field<'_> {
+        if let Some(trace_id) = self.trace_ids.first() {
+            return Field::Str(Cow::Borrowed(trace_id));
+        }
+        Field::None
+    }
+
+    fn set_trace_id(&mut self, trace_id: FieldSetter) {
+        let (prio, trace_id) = (trace_id.prio(), trace_id.into_inner());
+        match trace_id {
+            Field::Str(s) => {
+                self.trace_ids.push(prio, s);
+            }
+            _ => return,
+        }
+    }
 }
 
 impl From<MysqlInfo> for L7ProtocolSendLog {
     fn from(f: MysqlInfo) -> Self {
         let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         let log = L7ProtocolSendLog {
             captured_request_byte: f.captured_request_byte,
@@ -381,21 +606,33 @@ impl From<MysqlInfo> for L7ProtocolSendLog {
             req: L7Request {
                 req_type: String::from(f.get_command_str()),
                 resource: f.context,
+                endpoint: f.endpoint.unwrap_or_default(),
                 ..Default::default()
             },
             resp: L7Response {
                 status: f.status,
                 code: f.error_code,
-                exception: f.error_message,
+                exception: if f.status != L7ResponseStatus::Ok {
+                    f.error_message
+                } else {
+                    Default::default()
+                },
                 ..Default::default()
             },
             ext_info: Some(ExtendedInfo {
+                attributes: {
+                    if f.attributes.is_empty() {
+                        None
+                    } else {
+                        Some(f.attributes)
+                    }
+                },
                 request_id: f.statement_id.into(),
                 ..Default::default()
             }),
-            trace_info: if f.trace_id.is_some() || f.span_id.is_some() {
+            trace_info: if !f.trace_ids.is_default() || f.span_id.is_some() {
                 Some(TraceInfo {
-                    trace_id: f.trace_id,
+                    trace_ids: f.trace_ids.into_sorted_vec(),
                     span_id: f.span_id,
                     ..Default::default()
                 })
@@ -403,9 +640,22 @@ impl From<MysqlInfo> for L7ProtocolSendLog {
                 None
             },
             flags,
+            biz_response_code: f.biz_response_code,
             ..Default::default()
         };
         return log;
+    }
+}
+
+impl From<&MysqlInfo> for LogCache {
+    fn from(info: &MysqlInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: L7ProtocolInfoInterface::get_endpoint(info),
+            ..Default::default()
+        }
     }
 }
 
@@ -424,29 +674,29 @@ fn give_buffer(buffer: Vec<u8>) {
 #[derive(Default)]
 pub struct MysqlLog {
     pub protocol_version: u8,
-    perf_stats: Option<L7PerfStats>,
-    obfuscate_cache: Option<ObfuscateCache>,
+    perf_stats: Vec<L7PerfStats>,
 
     // This field is extracted in the COM_STMT_PREPARE request and calculate based on SQL statements
     pc: ParameterCounter,
     has_request: bool,
     has_login: bool,
 
-    last_is_on_blacklist: bool,
-
     // if compression is enabled, both requests and responses will have compression header
     has_compressed_header: Option<bool>,
+
+    #[cfg(feature = "enterprise")]
+    custom_field_store: Store,
 }
 
 impl L7ProtocolParserInterface for MysqlLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() || param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
 
         if self.has_compressed_header.is_none() {
             if let Err(_) = self.check_compressed_header(payload) {
-                return false;
+                return None;
             }
         }
 
@@ -459,7 +709,11 @@ impl L7ProtocolParserInterface for MysqlLog {
         );
         give_buffer(decompress_buffer);
 
-        ret
+        if ret {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(
@@ -471,24 +725,50 @@ impl L7ProtocolParserInterface for MysqlLog {
             return Err(error::Error::InvalidIpProtocol);
         }
 
-        let mut info = MysqlInfo::default();
-        info.protocol_version = self.protocol_version;
-        info.is_tls = param.is_tls();
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
+        let (copy_apm_trace_id, multiple_trace_id_collection) = param
+            .parse_config
+            .map(|c| {
+                (
+                    c.l7_log_dynamic.copy_apm_trace_id,
+                    c.l7_log_dynamic.multiple_trace_id_collection,
+                )
+            })
+            .unwrap_or((false, false));
+        let endpoint_disabled = param
+            .parse_config
+            .as_ref()
+            .map(|c| c.mysql_endpoint_disabled)
+            .unwrap_or_else(|| LogParserConfig::default().mysql_endpoint_disabled);
+        let mut info = MysqlInfo {
+            protocol_version: self.protocol_version,
+            is_tls: param.is_tls(),
+            endpoint_disabled,
+            copy_apm_trace_id,
+            trace_ids: PrioStrings::new(multiple_trace_id_collection),
+            ..Default::default()
         };
 
         if self.has_compressed_header.is_none() {
             let _ = self.check_compressed_header(payload)?;
         }
 
+        #[cfg(feature = "enterprise")]
+        let custom_policies = {
+            self.custom_field_store.clear();
+            param
+                .parse_config
+                .as_ref()
+                .and_then(|c| c.get_custom_field_policies(L7Protocol::MySQL.into(), param))
+        };
+
         let mut decompress_buffer = take_buffer();
         let result = self.parse(
-            param.parse_config,
+            param,
             &mut decompress_buffer,
             payload,
-            param.direction,
             &mut info,
+            #[cfg(feature = "enterprise")]
+            custom_policies,
         );
         give_buffer(decompress_buffer);
         match result {
@@ -525,41 +805,27 @@ impl L7ProtocolParserInterface for MysqlLog {
             Err(e) => return Err(e.into()),
         }
 
+        #[cfg(feature = "enterprise")]
+        self.merge_custom_field_operations(custom_policies, &mut info);
+
         set_captured_byte!(info, param);
         if let Some(config) = param.parse_config {
             info.set_is_on_blacklist(config);
         }
-        if !info.is_on_blacklist && !self.last_is_on_blacklist {
-            match param.direction {
-                PacketDirection::ClientToServer => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req());
-                }
-                PacketDirection::ServerToClient => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp());
+        self.perf_stats.clear();
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if info.msg_type == LogMessageType::Response {
+                if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                    info.endpoint = Some(endpoint);
                 }
             }
-            match info.status {
-                L7ResponseStatus::ClientError => {
-                    self.perf_stats
-                        .as_mut()
-                        .map(|p: &mut L7PerfStats| p.inc_req_err());
-                }
-                L7ResponseStatus::ServerError => {
-                    self.perf_stats
-                        .as_mut()
-                        .map(|p: &mut L7PerfStats| p.inc_resp_err());
-                }
-                _ => {}
+            if let Some(stats) = info.perf_stats(param) {
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
             }
-            if info.msg_type == LogMessageType::Request || info.msg_type == LogMessageType::Response
-            {
-                info.cal_rrt(param, &None).map(|(rrt, _)| {
-                    info.rrt = rrt;
-                    self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-                });
-            }
+            self.perf_stats.push(perf_stat);
         }
-        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::MysqlInfo(info)))
         } else {
@@ -575,12 +841,8 @@ impl L7ProtocolParserInterface for MysqlLog {
         L7Protocol::MySQL
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
-    }
-
-    fn set_obfuscate_cache(&mut self, obfuscate_cache: Option<ObfuscateCache>) {
-        self.obfuscate_cache = obfuscate_cache;
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -778,15 +1040,16 @@ impl MysqlLog {
     }
 
     fn request(
-        config: Option<&LogParserConfig>,
+        &mut self,
+        param: &ParseParam,
         payload: &[u8],
-        pc: &mut ParameterCounter,
         info: &mut MysqlInfo,
-        obfuscate_cache: &Option<ObfuscateCache>,
+        #[cfg(feature = "enterprise")] custom_policies: Option<PolicySlice>,
     ) -> Result<LogMessageType> {
         if payload.len() < COMMAND_LEN {
             return Err(Error::Truncated(TruncationType::Request));
         }
+        let config = param.parse_config.as_ref();
         info.command = payload[COMMAND_OFFSET];
         let mut msg_type = LogMessageType::Request;
         match info.command {
@@ -797,32 +1060,37 @@ impl MysqlLog {
             COM_FIELD_LIST | COM_STMT_FETCH => (),
             COM_INIT_DB | COM_QUERY => {
                 info.request_string(
-                    config,
+                    param,
                     &payload[COMMAND_OFFSET + COMMAND_LEN..],
-                    obfuscate_cache,
+                    self,
+                    #[cfg(feature = "enterprise")]
+                    custom_policies,
                 )?;
             }
             COM_STMT_PREPARE => {
                 info.request_string(
-                    config,
+                    param,
                     &payload[COMMAND_OFFSET + COMMAND_LEN..],
-                    obfuscate_cache,
+                    self,
+                    #[cfg(feature = "enterprise")]
+                    custom_policies,
                 )?;
                 if let Some(config) = config {
                     if config
                         .obfuscate_enabled_protocols
                         .is_disabled(L7Protocol::MySQL)
                     {
-                        pc.set(info.context.as_bytes());
+                        self.pc.set(info.context.as_bytes());
                     }
                 }
             }
             COM_STMT_EXECUTE => {
                 info.statement_id(&payload[STATEMENT_ID_OFFSET..]);
                 if payload.len() > EXECUTE_STATEMENT_PARAMS_OFFSET {
-                    pc.get(&payload[EXECUTE_STATEMENT_PARAMS_OFFSET..], info);
+                    self.pc
+                        .get(&payload[EXECUTE_STATEMENT_PARAMS_OFFSET..], info);
                 }
-                pc.reset();
+                self.pc.reset();
             }
             COM_PING => {}
             _ => return Err(Error::CommandNotSupported(info.command)),
@@ -926,7 +1194,7 @@ impl MysqlLog {
         str::from_utf8(&payload[..n]).ok()
     }
 
-    fn login(payload: &[u8], info: &mut MysqlInfo) -> Result<()> {
+    fn login(payload: &[u8], mut info: Option<&mut MysqlInfo>) -> Result<()> {
         if payload.len() < LOGIN_USERNAME_OFFSET {
             return Err(Error::Truncated(TruncationType::Login));
         }
@@ -944,14 +1212,40 @@ impl MysqlLog {
             return Err(Error::InvalidLoginInfo("bad filter"));
         }
 
-        match Self::string_null(&payload[LOGIN_USERNAME_OFFSET..]) {
+        let mut offset = LOGIN_USERNAME_OFFSET;
+        let username = match Self::string_null(&payload[offset..]) {
             Some(context) if context.is_ascii() => {
-                info.context = format!("Login username: {}", context);
+                offset += context.len() + 1;
+                Some(context)
             }
             _ => return Err(Error::InvalidLoginInfo("username not found or not ascii")),
-        }
+        };
 
-        info.status = L7ResponseStatus::Ok;
+        let mut database = None;
+        if let Some(info) = info.as_mut() {
+            info.status = L7ResponseStatus::Ok;
+
+            // CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+            if offset < payload.len() {
+                offset += payload[offset] as usize + 1;
+            }
+
+            if offset < payload.len()
+                && (client_capabilities_flags & CONNECT_WITH_DB) == CONNECT_WITH_DB
+            {
+                database = Self::string_null(&payload[offset..]);
+            }
+
+            if let Some(username) = username {
+                info.context = if let Some(database) = database {
+                    format!("Login username: {} db: {}", username, database)
+                } else {
+                    format!("Login username: {}", username)
+                };
+
+                info.generate_endpoint();
+            }
+        }
 
         Ok(())
     }
@@ -970,7 +1264,7 @@ impl MysqlLog {
     ) -> bool {
         let decompress = config
             .map(|c| c.mysql_decompress_payload)
-            .unwrap_or(LogParserConfig::default().mysql_decompress_payload);
+            .unwrap_or_else(|| LogParserConfig::default().mysql_decompress_payload);
 
         let mut parser = match PayloadParser::new(decompress, has_compressed_header, payload) {
             Ok(parser) => parser,
@@ -1000,10 +1294,7 @@ impl MysqlLog {
                 let context = mysql_string(&payload[1..]);
                 context.is_ascii() && is_mysql(context)
             }
-            _ if header.seq_id != 0 => {
-                let mut log_info = MysqlInfo::default();
-                MysqlLog::login(payload, &mut log_info).is_ok()
-            }
+            _ if header.seq_id != 0 => MysqlLog::login(payload, None).is_ok(),
             _ => false,
         }
     }
@@ -1042,15 +1333,16 @@ impl MysqlLog {
     // return is_greeting?
     fn parse(
         &mut self,
-        config: Option<&LogParserConfig>,
+        param: &ParseParam,
         decompress_buffer: &mut Vec<u8>,
         payload: &[u8],
-        direction: PacketDirection,
         info: &mut MysqlInfo,
+        #[cfg(feature = "enterprise")] custom_policies: Option<PolicySlice>,
     ) -> Result<bool> {
+        let (config, direction) = (param.parse_config.as_ref(), param.direction);
         let decompress = config
             .map(|c| c.mysql_decompress_payload)
-            .unwrap_or(LogParserConfig::default().mysql_decompress_payload);
+            .unwrap_or_else(|| LogParserConfig::default().mysql_decompress_payload);
 
         let mut parser =
             PayloadParser::new(decompress, self.has_compressed_header.unwrap(), payload)?;
@@ -1090,8 +1382,13 @@ impl MysqlLog {
         };
         match msg_type {
             LogMessageType::Request if header.seq_id == 0 => {
-                msg_type =
-                    Self::request(config, payload, &mut self.pc, info, &self.obfuscate_cache)?;
+                msg_type = self.request(
+                    param,
+                    payload,
+                    info,
+                    #[cfg(feature = "enterprise")]
+                    custom_policies,
+                )?;
                 if msg_type == LogMessageType::Request {
                     self.has_request = true;
                     self.has_login = false;
@@ -1100,7 +1397,7 @@ impl MysqlLog {
             LogMessageType::Request
                 if direction == PacketDirection::ClientToServer && header.seq_id == 1 =>
             {
-                Self::login(payload, info)?;
+                Self::login(payload, Some(info))?;
                 self.has_login = true;
             }
             LogMessageType::Response
@@ -1123,6 +1420,23 @@ impl MysqlLog {
         info.msg_type = msg_type;
 
         Ok(false)
+    }
+
+    #[cfg(feature = "enterprise")]
+    fn merge_custom_field_operations(
+        &mut self,
+        policies: Option<PolicySlice>,
+        info: &mut MysqlInfo,
+    ) {
+        let Some(policies) = policies else {
+            return;
+        };
+        for op in self.custom_field_store.drain_with(policies, &*info) {
+            match &op.op {
+                Op::AddMetric(_, _) | Op::SaveHeader(_) | Op::SavePayload(_) => (),
+                _ => auto_merge_custom_field(op, info),
+            }
+        }
     }
 }
 
@@ -1378,10 +1692,10 @@ mod tests {
     use super::*;
 
     use crate::{
-        common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
-        config::{handler::TraceType, ExtraLogFields},
-        flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        common::{flow::PacketDirection, l7_protocol_log::L7PerfCache},
+        config::handler::{L7LogDynamicConfigBuilder, TraceType},
+        flow_generator::{protocol_logs::PrioStrings, L7_RRT_CACHE_CAPACITY},
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/mysql";
@@ -1413,22 +1727,10 @@ mod tests {
                 },
                 None => continue,
             };
-            let is_mysql = mysql.check_payload(
-                payload,
-                &ParseParam::new(
-                    packet as &MetaPacket,
-                    log_cache.clone(),
-                    Default::default(),
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    Default::default(),
-                    true,
-                    true,
-                ),
-            );
 
             let mut param = ParseParam::new(
                 &*packet,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -1438,6 +1740,7 @@ mod tests {
             param.parse_config = Some(&log_config);
             param.set_captured_byte(payload.len());
 
+            let is_mysql = mysql.check_payload(payload, &param).is_some();
             let info = mysql.parse_payload(payload, &param);
 
             if let Ok(info) = info {
@@ -1592,6 +1895,7 @@ mod tests {
 
         let capture = Capture::load_pcap(Path::new(FILE_DIR).join(pcap));
         let mut packets = capture.collect::<Vec<_>>();
+        let mut perf_stat = L7PerfStats::default();
 
         let first_src_mac = packets[0].lookup_key.src_mac;
         for packet in packets.iter_mut() {
@@ -1603,7 +1907,7 @@ mod tests {
             if packet.get_l4_payload().is_some() {
                 let param = &ParseParam::new(
                     &*packet,
-                    rrt_cache.clone(),
+                    Some(rrt_cache.clone()),
                     Default::default(),
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     Default::default(),
@@ -1611,9 +1915,12 @@ mod tests {
                     true,
                 );
                 let _ = mysql.parse_payload(packet.get_l4_payload().unwrap(), param);
+                for i in mysql.perf_stats() {
+                    perf_stat.sequential_merge(&i);
+                }
             }
         }
-        mysql.perf_stats.unwrap()
+        perf_stat
     }
 
     #[test]
@@ -1642,10 +1949,6 @@ mod tests {
 
     #[test]
     fn comment_extractor() {
-        flexi_logger::Logger::try_with_env()
-            .unwrap()
-            .start()
-            .unwrap();
         let testcases = vec![
             (
                 "/* traceparent: 00-trace_id-span_id-01 */ SELECT * FROM table",
@@ -1669,25 +1972,24 @@ mod tests {
             ),
         ];
         let mut info = MysqlInfo::default();
-        let config = L7LogDynamicConfig::new(
-            vec![],
-            vec![],
-            vec![
+        let config: L7LogDynamicConfig = L7LogDynamicConfigBuilder {
+            proxy_client: vec![],
+            x_request_id: vec![],
+            trace_types: vec![
                 TraceType::TraceParent,
                 TraceType::Customize("TraceID".to_owned()),
                 TraceType::Customize("jrnno".to_owned()),
             ],
-            vec![TraceType::TraceParent],
-            ExtraLogFields::default(),
-            false,
-            #[cfg(feature = "enterprise")]
-            std::collections::HashMap::new(),
-        );
+            span_types: vec![TraceType::TraceParent],
+            ..Default::default()
+        }
+        .into();
         for (input, tid, sid) in testcases {
-            info.trace_id = None;
+            info.trace_ids = PrioStrings::new(config.multiple_trace_id_collection);
             info.span_id = None;
             info.extract_trace_and_span_id(&config, input);
-            assert_eq!(info.trace_id.as_ref().map(|s| s.as_str()), tid);
+            let trace_ids = info.trace_ids.clone().into_sorted_vec();
+            assert_eq!(trace_ids.first().unwrap(), tid.unwrap());
             assert_eq!(info.span_id.as_ref().map(|s| s.as_str()), sid);
         }
     }

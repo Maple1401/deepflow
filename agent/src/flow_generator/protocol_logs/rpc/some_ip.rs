@@ -16,19 +16,20 @@
 
 use serde::Serialize;
 
+use public::l7_protocol::LogMessageType;
+
 use crate::{
     common::{
         flow::{L7PerfStats, L7Protocol, PacketDirection},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     flow_generator::{
         error::{Error, Result},
         protocol_logs::{
             pb_adapter::{ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response},
             set_captured_byte, swap_if, value_is_default, AppProtoHead, L7ResponseStatus,
-            LogMessageType,
         },
     },
 };
@@ -127,9 +128,9 @@ impl L7ProtocolInfoInterface for SomeIpInfo {
 impl From<SomeIpInfo> for L7ProtocolSendLog {
     fn from(f: SomeIpInfo) -> Self {
         let flags = if f.is_tls {
-            EbpfFlags::TLS.bits()
+            ApplicationFlags::TLS.bits()
         } else {
-            EbpfFlags::NONE.bits()
+            ApplicationFlags::NONE.bits()
         };
         let attributes = vec![KeyVal {
             key: "client_id".to_string(),
@@ -165,33 +166,52 @@ impl From<SomeIpInfo> for L7ProtocolSendLog {
     }
 }
 
+impl From<&SomeIpInfo> for LogCache {
+    fn from(info: &SomeIpInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.resp_status,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SomeIpLog {
-    perf_stats: Option<L7PerfStats>,
-    last_is_on_blacklist: bool,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 impl L7ProtocolParserInterface for SomeIpLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
 
         let Ok(header) = SomeIpHeader::try_from(payload) else {
-            return false;
+            return None;
         };
 
-        header.check()
+        if header.check() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
         let mut info = SomeIpInfo::default();
         self.parse(payload, &mut info, param)?;
         info.is_tls = param.is_tls();
         set_captured_byte!(info, param);
+        self.perf_stats.clear();
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if let Some(stats) = info.perf_stats(param) {
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
+            }
+            self.perf_stats.push(perf_stat);
+        }
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::SomeIpInfo(info)))
         } else {
@@ -203,8 +223,8 @@ impl L7ProtocolParserInterface for SomeIpLog {
         L7Protocol::SomeIp
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -227,14 +247,8 @@ impl SomeIpLog {
             | E_UNKNOWN_METHOD
             | E_WRONG_PROTOCOL_VERSION
             | E_WRONG_INTERFACE_VERSION
-            | E_WRONG_MESSAGE_TYPE => {
-                self.perf_stats.as_mut().map(|p| p.inc_req_err());
-                L7ResponseStatus::ClientError
-            }
-            _ => {
-                self.perf_stats.as_mut().map(|p| p.inc_resp_err());
-                L7ResponseStatus::ServerError
-            }
+            | E_WRONG_MESSAGE_TYPE => L7ResponseStatus::ClientError,
+            _ => L7ResponseStatus::ServerError,
         }
     }
 
@@ -286,12 +300,9 @@ mod tests {
             l7_protocol_log::{L7ParseResult, L7PerfCache, L7ProtocolParserInterface, ParseParam},
             MetaPacket,
         },
-        config::{
-            handler::{L7LogDynamicConfig, LogParserConfig, TraceType},
-            ExtraLogFields,
-        },
+        config::handler::{L7LogDynamicConfigBuilder, LogParserConfig, TraceType},
         flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/some_ip";
@@ -319,7 +330,7 @@ mod tests {
             };
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -328,18 +339,15 @@ mod tests {
             );
             param.set_captured_byte(payload.len());
 
-            let config = L7LogDynamicConfig::new(
-                vec![],
-                vec![],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                ExtraLogFields::default(),
-                false,
-                #[cfg(feature = "enterprise")]
-                std::collections::HashMap::new(),
-            );
+            let config = L7LogDynamicConfigBuilder {
+                proxy_client: vec![],
+                x_request_id: vec![],
+                trace_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                span_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                ..Default::default()
+            };
             let parse_config = &LogParserConfig {
-                l7_log_dynamic: config.clone(),
+                l7_log_dynamic: config.into(),
                 ..Default::default()
             };
 
@@ -351,7 +359,7 @@ mod tests {
                     L7ParseResult::Single(s) => {
                         output.push_str(&serde_json::to_string(&s).unwrap());
                         output.push_str(
-                            format!(" check: {}", some_ip.check_payload(payload, param)).as_str(),
+                            format!(" check: {:?}", some_ip.check_payload(payload, param)).as_str(),
                         );
                         output.push_str("\n");
                     }
@@ -359,7 +367,7 @@ mod tests {
                         for i in m {
                             output.push_str(&serde_json::to_string(&i).unwrap());
                             output.push_str(
-                                format!(" check: {}", some_ip.check_payload(payload, param))
+                                format!(" check: {:?}", some_ip.check_payload(payload, param))
                                     .as_str(),
                             );
                             output.push_str("\n");

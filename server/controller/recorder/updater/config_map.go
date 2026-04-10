@@ -28,7 +28,27 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// ConfigMapMessageFactory ConfigMap资源的消息工厂
+type ConfigMapMessageFactory struct{}
+
+func (f *ConfigMapMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedConfigMaps{}
+}
+
+func (f *ConfigMapMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedConfigMap{}
+}
+
+func (f *ConfigMapMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedConfigMaps{}
+}
+
+func (f *ConfigMapMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedConfigMapFields{}
+}
 
 type ConfigMap struct {
 	UpdaterBase[
@@ -36,36 +56,12 @@ type ConfigMap struct {
 		*diffbase.ConfigMap,
 		*metadbmodel.ConfigMap,
 		metadbmodel.ConfigMap,
-		*message.AddedConfigMaps,
-		message.AddedConfigMaps,
-		message.AddNoneAddition,
-		*message.UpdatedConfigMap,
-		message.UpdatedConfigMap,
-		*message.UpdatedConfigMapFields,
-		message.UpdatedConfigMapFields,
-		*message.DeletedConfigMaps,
-		message.DeletedConfigMaps,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewConfigMap(wholeCache *cache.Cache, cloudData []cloudmodel.ConfigMap) *ConfigMap {
 	updater := &ConfigMap{
-		newUpdaterBase[
-			cloudmodel.ConfigMap,
-			*diffbase.ConfigMap,
-			*metadbmodel.ConfigMap,
-			metadbmodel.ConfigMap,
-			*message.AddedConfigMaps,
-			message.AddedConfigMaps,
-			message.AddNoneAddition,
-			*message.UpdatedConfigMap,
-			message.UpdatedConfigMap,
-			*message.UpdatedConfigMapFields,
-			message.UpdatedConfigMapFields,
-			*message.DeletedConfigMaps,
-			message.DeletedConfigMaps,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_CONFIG_MAP_EN,
 			wholeCache,
 			db.NewConfigMap().SetMetadata(wholeCache.GetMetadata()),
@@ -73,14 +69,14 @@ func NewConfigMap(wholeCache *cache.Cache, cloudData []cloudmodel.ConfigMap) *Co
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
+	updater.setDataGenerator(updater)
 	updater.toLoggable = true
-	return updater
-}
 
-func (h *ConfigMap) getDiffBaseByCloudItem(cloudItem *cloudmodel.ConfigMap) (diffBase *diffbase.ConfigMap, exists bool) {
-	diffBase, exists = h.diffBaseData[cloudItem.Lcuuid]
-	return
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &ConfigMapMessageFactory{})
+	}
+
+	return updater
 }
 
 func (h *ConfigMap) generateDBItemToAdd(cloudItem *cloudmodel.ConfigMap) (*metadbmodel.ConfigMap, bool) {
@@ -115,7 +111,7 @@ func (h *ConfigMap) generateDBItemToAdd(cloudItem *cloudmodel.ConfigMap) (*metad
 	}
 	dbItem := &metadbmodel.ConfigMap{
 		Name:           cloudItem.Name,
-		Data:           string(yamlData),
+		Data:           yamlData,
 		DataHash:       cloudItem.DataHash,
 		PodNamespaceID: podNamespaceID,
 		PodClusterID:   podClusterID,
@@ -130,7 +126,7 @@ func (h *ConfigMap) generateDBItemToAdd(cloudItem *cloudmodel.ConfigMap) (*metad
 	return dbItem, true
 }
 
-func (h *ConfigMap) generateUpdateInfo(diffBase *diffbase.ConfigMap, cloudItem *cloudmodel.ConfigMap) (*message.UpdatedConfigMapFields, map[string]interface{}, bool) {
+func (h *ConfigMap) generateUpdateInfo(diffBase *diffbase.ConfigMap, cloudItem *cloudmodel.ConfigMap) (types.UpdatedFields, map[string]interface{}, bool) {
 	structInfo := new(message.UpdatedConfigMapFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
@@ -140,13 +136,20 @@ func (h *ConfigMap) generateUpdateInfo(diffBase *diffbase.ConfigMap, cloudItem *
 	if diffBase.DataHash != cloudItem.DataHash {
 		mapInfo["data_hash"] = cloudItem.DataHash
 
-		yamlData, err := yaml.JSONToYAML([]byte(cloudItem.Data))
+		yamlDataBytes, err := yaml.JSONToYAML([]byte(cloudItem.Data))
 		if err != nil {
 			log.Errorf("failed to convert %s JSON data: %v to YAML: %s", h.resourceType, cloudItem.Data, h.metadata.LogPrefixes)
 			return nil, nil, false
 		}
-		mapInfo["data"] = string(yamlData)
-		structInfo.Data.Set(diffBase.Data, string(yamlData))
+
+		if compressedData, err := metadbmodel.AutoCompressedBytes(yamlDataBytes).Value(); err != nil {
+			log.Errorf("failed to compress %s YAML data: %v: %s", h.resourceType, yamlDataBytes, h.metadata.LogPrefixes)
+			return nil, nil, false
+		} else {
+			mapInfo["compressed_data"] = compressedData
+			structInfo.Data.Set(diffBase.Data, string(yamlDataBytes))
+		}
 	}
+
 	return structInfo, mapInfo, len(mapInfo) > 0
 }

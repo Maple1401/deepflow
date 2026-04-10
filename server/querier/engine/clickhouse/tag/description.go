@@ -56,7 +56,7 @@ var AUTO_CUSTOM_TAG_MAP = map[string][]string{}
 var AUTO_CUSTOM_TAG_CHECK_MAP = map[string][]string{}
 
 var tagNativeTagDB = []string{ckcommon.DB_NAME_EXT_METRICS, ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_PROFILE, ckcommon.DB_NAME_PROMETHEUS}
-var noCustomTagTable = []string{"traffic_policy", "l4_packet", "l7_packet", "alert_event"}
+var noCustomTagTable = []string{"traffic_policy", "l4_packet", "l7_packet", ckcommon.TABLE_NAME_ALERT_EVENT, ckcommon.TABLE_NAME_ALERT_RECORD}
 var noCustomTagDB = []string{ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT}
 
 var tagTypeToOperators = map[string][]string{
@@ -522,6 +522,16 @@ func LoadTagDescriptions(tagData map[string]interface{}) error {
 										selectPrefixTranslator = tagSelectPrefixTranslaterStr
 										iconIDTranslator = fmt.Sprintf("%s, 0", selectPrefixTranslator)
 										nodeTypeTranslator = fmt.Sprintf("%s, '%s'", selectPrefixTranslator, tagValue)
+									} else if strings.HasPrefix(tagValue, common.BIZ_SERVICE_GROUP) {
+										tagValueName := tagValue + suffix
+										autoServiceIDSuffix := "auto_service_id" + suffix
+										autoServiceTypeSuffix := "auto_service_type" + suffix
+										TagResoureMap[tagNameSuffix]["default"].TagTranslatorMap[tagNameSuffix+"_"+tagValueName] = fmt.Sprintf("dictGet('flow_tag.biz_service_map', 'service_group_name', toUInt64(%s))", autoServiceIDSuffix)
+										AlarmEventResourceMap[tagNameSuffix]["default"].TagTranslatorMap[tagValueName] = "tag_string_values[indexOf(tag_string_names,'" + tagValueName + "')]"
+										tagSelectPrefixTranslaterStr := fmt.Sprintf("(%s!=0 AND %s=%d)", autoServiceIDSuffix, autoServiceTypeSuffix, VIF_DEVICE_TYPE_CUSTOM_SERVICE)
+										selectPrefixTranslator = tagSelectPrefixTranslaterStr
+										iconIDTranslator = fmt.Sprintf("%s, 0", selectPrefixTranslator)
+										nodeTypeTranslator = fmt.Sprintf("%s, '%s'", selectPrefixTranslator, tagValue)
 									}
 									deviceType, ok := TAG_RESOURCE_TYPE_DEVICE_MAP[tagValue]
 									if ok {
@@ -682,6 +692,17 @@ func LoadTagDescriptions(tagData map[string]interface{}) error {
 										selectPrefixTranslator += " OR " + tagSelectPrefixTranslaterStr
 										iconIDTranslator += fmt.Sprintf(", %s, 0", tagSelectPrefixTranslaterStr)
 										nodeTypeTranslator += fmt.Sprintf(", %s, '%s'", tagSelectPrefixTranslaterStr, tagValue)
+									} else if strings.HasPrefix(tagValue, common.BIZ_SERVICE_GROUP) {
+										tagValueName := tagValue + suffix
+										autoServiceIDSuffix := "auto_service_id" + suffix
+										autoServiceTypeSuffix := "auto_service_type" + suffix
+										tagSelectFilterStr := fmt.Sprintf("dictGet('flow_tag.biz_service_map', 'service_group_name', toUInt64(%s))", autoServiceIDSuffix)
+										TagResoureMap[tagNameSuffix]["default"].TagTranslatorMap[tagNameSuffix+"_"+tagValueName] = fmt.Sprintf("IF(%s, '', %s)", selectPrefixTranslator, tagSelectFilterStr)
+										AlarmEventResourceMap[tagNameSuffix]["default"].TagTranslatorMap[tagValueName] = "tag_string_values[indexOf(tag_string_names,'" + tagValueName + "')]"
+										tagSelectPrefixTranslaterStr := fmt.Sprintf("(%s!=0 AND %s=%d)", autoServiceIDSuffix, autoServiceTypeSuffix, VIF_DEVICE_TYPE_CUSTOM_SERVICE)
+										selectPrefixTranslator += " OR " + tagSelectPrefixTranslaterStr
+										iconIDTranslator += fmt.Sprintf(", %s, 0", tagSelectPrefixTranslaterStr)
+										nodeTypeTranslator += fmt.Sprintf(", %s, '%s'", tagSelectPrefixTranslaterStr, tagValue)
 									}
 									deviceType, ok := TAG_RESOURCE_TYPE_DEVICE_MAP[tagValue]
 									if ok {
@@ -754,7 +775,7 @@ func GetStaticTagDescriptions(db, table string) (response *common.Result, err er
 					tagName, tagName + "_0", tagName + "_1", tagDisplayName, tagDisplayName, tagDisplayName, "auto_custom_tag",
 					"Custom Tag", []string{}, []bool{true, true, true}, AutoCustomTag.Description, AutoCustomTag.Description, AutoCustomTag.Description, AutoCustomTag.TagFields, false, []string{}, "",
 				})
-			} else if table == "alert_event" {
+			} else if table == ckcommon.TABLE_NAME_ALERT_EVENT || table == ckcommon.TABLE_NAME_ALERT_RECORD {
 				response.Values = append(response.Values, []interface{}{
 					tagName, tagName + "_0", tagName + "_1", tagDisplayName, tagDisplayName, tagDisplayName, "auto_custom_tag",
 					"Custom Tag", []string{}, []bool{true, true, true}, AutoCustomTag.Description, AutoCustomTag.Description, AutoCustomTag.Description, AutoCustomTag.TagFields, false, []string{"select", "group"}, "",
@@ -768,7 +789,7 @@ func GetStaticTagDescriptions(db, table string) (response *common.Result, err er
 		}
 	}
 
-	if slices.Contains([]string{ckcommon.DB_NAME_EXT_METRICS, ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_PROFILE, ckcommon.DB_NAME_PROMETHEUS}, db) {
+	if slices.Contains([]string{ckcommon.DB_NAME_EXT_METRICS, ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_PROMETHEUS}, db) || table == ckcommon.TABLE_NAME_IN_PROCESS {
 		response.Values = append(response.Values, []interface{}{
 			"tag", "tag", "tag", "tag", "tag", "tag", "map",
 			"Native Tag", []string{}, []bool{true, true, true}, "tag", "tag", "tag", "", false, []string{}, "",
@@ -787,9 +808,6 @@ func GetDynamicTagDescriptions(db, table, rawSql, queryCacheTTL, orgID string, u
 		Values: []interface{}{},
 	}
 	notSupportOperator := []string{}
-	if table == "alert_event" {
-		notSupportOperator = []string{"select", "group"}
-	}
 
 	// 查询 k8s_label
 	chClient := client.Client{
@@ -936,7 +954,7 @@ func GetDynamicTagDescriptions(db, table, rawSql, queryCacheTTL, orgID string, u
 	}
 
 	// 查询外部字段
-	if !slices.Contains([]string{ckcommon.DB_NAME_EXT_METRICS, ckcommon.DB_NAME_FLOW_LOG, ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_EVENT, ckcommon.DB_NAME_PROMETHEUS, ckcommon.DB_NAME_APPLICATION_LOG, "_prometheus"}, db) || (db == "flow_log" && table != "l7_flow_log") {
+	if !slices.Contains([]string{ckcommon.DB_NAME_EXT_METRICS, ckcommon.DB_NAME_FLOW_LOG, ckcommon.DB_NAME_DEEPFLOW_ADMIN, ckcommon.DB_NAME_DEEPFLOW_TENANT, ckcommon.DB_NAME_EVENT, ckcommon.DB_NAME_PROFILE, ckcommon.DB_NAME_PROMETHEUS, ckcommon.DB_NAME_APPLICATION_LOG, "_prometheus"}, db) || (db == ckcommon.DB_NAME_FLOW_LOG && table != ckcommon.TABLE_NAME_L7_FLOW_LOG) || (db == ckcommon.DB_NAME_PROFILE && table != ckcommon.TABLE_NAME_IN_PROCESS) {
 		return response, nil
 	}
 	externalChClient := client.Client{
@@ -972,8 +990,8 @@ func GetDynamicTagDescriptions(db, table, rawSql, queryCacheTTL, orgID string, u
 			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table FROM flow_tag.prometheus_custom_field WHERE field_type='tag' AND (%s) GROUP BY tag_name, table ORDER BY tag_name ASC LIMIT %s", whereSql, limit)
 		} else if table == "" {
 			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table FROM flow_tag.%s_custom_field WHERE field_type='tag' AND (%s) GROUP BY tag_name, table ORDER BY tag_name ASC LIMIT %s", db, whereSql, limit)
-		} else if table == "alert_event" {
-			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table, field_value_type FROM flow_tag.%s_custom_field WHERE table='%s' AND field_type='tag' AND (%s) GROUP BY tag_name, table, field_value_type ORDER BY tag_name ASC LIMIT %s", db, table, whereSql, limit)
+		} else if table == ckcommon.TABLE_NAME_ALERT_EVENT || table == ckcommon.TABLE_NAME_ALERT_RECORD {
+			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table, field_type FROM flow_tag.%s_custom_field WHERE table='%s' AND field_type in ('tag', 'custom_tag') AND (%s) GROUP BY tag_name, table, field_type ORDER BY tag_name ASC LIMIT %s", db, table, whereSql, limit)
 		} else {
 			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table FROM flow_tag.%s_custom_field WHERE table='%s' AND field_type='tag' AND (%s) GROUP BY tag_name, table ORDER BY tag_name ASC LIMIT %s", db, table, whereSql, limit)
 		}
@@ -982,8 +1000,8 @@ func GetDynamicTagDescriptions(db, table, rawSql, queryCacheTTL, orgID string, u
 			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table FROM flow_tag.prometheus_custom_field WHERE field_type='tag' GROUP BY tag_name, table ORDER BY tag_name ASC LIMIT %s", limit)
 		} else if table == "" {
 			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table FROM flow_tag.%s_custom_field WHERE field_type='tag' GROUP BY tag_name, table ORDER BY tag_name ASC LIMIT %s", db, limit)
-		} else if table == "alert_event" {
-			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table, field_value_type FROM flow_tag.%s_custom_field WHERE table='%s' AND field_type='tag' GROUP BY tag_name, table, field_value_type ORDER BY tag_name ASC LIMIT %s", db, table, limit)
+		} else if table == ckcommon.TABLE_NAME_ALERT_EVENT || table == ckcommon.TABLE_NAME_ALERT_RECORD {
+			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table, field_type FROM flow_tag.%s_custom_field WHERE table='%s' AND field_type in ('tag', 'custom_tag') GROUP BY tag_name, table, field_type ORDER BY tag_name ASC LIMIT %s", db, table, limit)
 		} else {
 			externalSql = fmt.Sprintf("SELECT field_name AS tag_name, table FROM flow_tag.%s_custom_field WHERE table='%s' AND field_type='tag' GROUP BY tag_name, table ORDER BY tag_name ASC LIMIT %s", db, table, limit)
 		}
@@ -1005,12 +1023,15 @@ func GetDynamicTagDescriptions(db, table, rawSql, queryCacheTTL, orgID string, u
 				externalTag, externalTag, externalTag, externalTag, externalTag, externalTag, "map_item",
 				"Native Tag", tagTypeToOperators["string"], []bool{true, true, true}, externalTag, externalTag, externalTag, "", false, notSupportOperator, tableName,
 			})
-		} else if table == "alert_event" {
+		} else if table == ckcommon.TABLE_NAME_ALERT_EVENT || table == ckcommon.TABLE_NAME_ALERT_RECORD {
 			externalTag := tagName.(string)
 			var categoryValue string
-			// fieltValueType := _tagName.([]interface{})[2]
-			if strings.HasPrefix(externalTag, "cloud.tag.") || strings.HasPrefix(externalTag, "k8s.label.") || strings.HasPrefix(externalTag, "os.app.") || strings.HasPrefix(externalTag, "k8s.annotation.") || strings.HasPrefix(externalTag, "k8s.env.") {
+			fieldType := _tagName.([]interface{})[2]
+			if strings.HasPrefix(externalTag, "cloud.tag.") || strings.HasPrefix(externalTag, "k8s.label.") || strings.HasPrefix(externalTag, "os.app.") || strings.HasPrefix(externalTag, "k8s.annotation.") || strings.HasPrefix(externalTag, "k8s.env.") || fieldType == "custom_tag" {
 				categoryValue = "Custom Tag"
+				if fieldType == "custom_tag" {
+					externalTag = "custom_tag." + externalTag
+				}
 				response.Values = append(response.Values, []interface{}{
 					externalTag, externalTag, externalTag, externalTag, externalTag, externalTag, "map_item",
 					categoryValue, tagTypeToOperators["string"], []bool{true, true, true}, externalTag, externalTag, externalTag, "", false, notSupportOperator, tableName,
@@ -1020,12 +1041,6 @@ func GetDynamicTagDescriptions(db, table, rawSql, queryCacheTTL, orgID string, u
 				response.Values = append(response.Values, []interface{}{
 					externalTag, externalTag, externalTag, externalTag, externalTag, externalTag, "map_item",
 					categoryValue, tagTypeToOperators["string"], []bool{true, true, true}, externalTag, externalTag, externalTag, "", false, notSupportOperator, tableName,
-				})
-			} else {
-				categoryValue = _tagName.([]interface{})[2].(string)
-				response.Values = append(response.Values, []interface{}{
-					externalTag, externalTag, externalTag, externalTag, externalTag, externalTag, categoryValue,
-					categoryValue, tagTypeToOperators[categoryValue], []bool{true, true, true}, externalTag, externalTag, externalTag, "", false, notSupportOperator, tableName,
 				})
 			}
 
@@ -1082,7 +1097,7 @@ func GetDynamicMetric(db, table, metric string) (response *common.Result) {
 		},
 		Values: []interface{}{},
 	}
-	if table == "alert_event" {
+	if table == ckcommon.TABLE_NAME_ALERT_EVENT || table == ckcommon.TABLE_NAME_ALERT_RECORD {
 		return
 	}
 
@@ -1101,7 +1116,6 @@ func GetDynamicMetric(db, table, metric string) (response *common.Result) {
 			metric, metric, metric, metric, metric, metric, "map_item",
 			"Native Tag", tagTypeToOperators["string"], []bool{true, true, true}, "", "", "", "", false, []string{}, "",
 		})
-		return
 	}
 	return
 }
@@ -1116,19 +1130,23 @@ func GetAlertEventTagDescriptions(staticTag, dynamicTag *common.Result) (respons
 	}
 	valuesMap := map[string]interface{}{}
 	staticValues := staticTag.Values
-	dynamiicValues := dynamicTag.Values
+	dynamicValues := dynamicTag.Values
 	for _, staticItem := range staticValues {
 		valuesMap[staticItem.([]interface{})[0].(string)] = staticItem
 	}
 
 	// if dynamiic tag_name not in staticvalues, add to result
-	for _, dynamicItem := range dynamiicValues {
-		dynamicTagName := strings.TrimSuffix(dynamicItem.([]interface{})[0].(string), "_0")
-		dynamicTagName = strings.TrimSuffix(dynamicTagName, "_1")
-		dynamicTagName = strings.TrimSuffix(dynamicTagName, "_id")
-		if valuesMap[dynamicTagName] == nil && valuesMap[dynamicItem.([]interface{})[0].(string)] == nil {
+	for _, dynamicItem := range dynamicValues {
+		dynamicTagName := dynamicItem.([]interface{})[0].(string)
+		if strings.HasPrefix(dynamicTagName, "custom_tag.") {
 			valuesMap[dynamicTagName] = dynamicItem
+		} else {
+			dynamicTagNameNosuffix := strings.TrimSuffix(dynamicTagName, "_0")
+			dynamicTagNameNosuffix = strings.TrimSuffix(dynamicTagNameNosuffix, "_1")
+			dynamicTagNameNoID := strings.TrimSuffix(dynamicTagNameNosuffix, "_id")
+			valuesMap[dynamicTagNameNoID] = dynamicItem
 		}
+
 	}
 
 	for _, value := range valuesMap {
@@ -1157,7 +1175,7 @@ func GetTagDescriptions(db, table, rawSql, queryCacheTTL, orgID string, useQuery
 	if err != nil {
 		return
 	}
-	if table == "alert_event" {
+	if table == ckcommon.TABLE_NAME_ALERT_EVENT || table == ckcommon.TABLE_NAME_ALERT_RECORD {
 		return GetAlertEventTagDescriptions(staticResponse, dynamicResponse)
 	}
 	response.Values = append(response.Values, staticResponse.Values...)
@@ -1328,7 +1346,7 @@ func GetTagValues(db, table, sql, queryCacheTTL, orgID, language string, useQuer
 	}
 
 	// K8s Labels是动态的,不需要去tag_description里确认
-	if strings.HasPrefix(tag, "k8s.label.") || strings.HasPrefix(tag, "k8s.annotation.") || strings.HasPrefix(tag, "k8s.env.") || strings.HasPrefix(tag, "cloud.tag.") || strings.HasPrefix(tag, "os.app.") {
+	if strings.HasPrefix(tag, "k8s.label.") || strings.HasPrefix(tag, "k8s.annotation.") || strings.HasPrefix(tag, "k8s.env.") || strings.HasPrefix(tag, "cloud.tag.") || strings.HasPrefix(tag, "os.app.") || strings.HasPrefix(tag, common.BIZ_SERVICE_GROUP) {
 		return GetTagResourceValues(db, table, sql)
 	}
 	// 外部字段是动态的,不需要去tag_description里确认
@@ -1365,7 +1383,7 @@ func GetTagValues(db, table, sql, queryCacheTTL, orgID, language string, useQuer
 		DB: db, Table: table, TagName: tag,
 	}]
 	if !ok {
-		if table == "alert_event" {
+		if table == ckcommon.TABLE_NAME_ALERT_EVENT || table == ckcommon.TABLE_NAME_ALERT_RECORD {
 			return nil, sqlList, nil
 		} else {
 			return nil, sqlList, errors.New(fmt.Sprintf("no tag %s in %s.%s", tag, db, table))
@@ -1514,15 +1532,26 @@ func GetTagResourceValues(db, table, rawSql string) (*common.Result, []string, e
 		for _, deviceType := range autoMap[tag] {
 			autoDeviceTypes = append(autoDeviceTypes, strconv.Itoa(deviceType))
 		}
+		deviceWhereSql := whereSql
 		if whereSql != "" {
-			whereSql += fmt.Sprintf("AND devicetype in (%s)", strings.Join(autoDeviceTypes, ","))
+			deviceWhereSql += fmt.Sprintf("AND devicetype in (%s)", strings.Join(autoDeviceTypes, ","))
 		} else {
-			whereSql = fmt.Sprintf("WHERE devicetype in (%s)", strings.Join(autoDeviceTypes, ","))
+			deviceWhereSql = fmt.Sprintf("WHERE devicetype in (%s)", strings.Join(autoDeviceTypes, ","))
 		}
 		sql = fmt.Sprintf(
 			"SELECT deviceid AS value,name AS display_name,devicetype AS device_type,uid, icon_id FROM device_map %s GROUP BY value, display_name, device_type, uid, icon_id ORDER BY %s ASC %s",
-			whereSql, orderBy, limitSql,
+			deviceWhereSql, orderBy, limitSql,
 		)
+		// custom biz service
+		if tag == "auto_service" {
+			customBizServiceSql := fmt.Sprintf(
+				"SELECT id AS value, name AS display_name, %d AS device_type, uid, icon_id FROM custom_biz_service_map %s GROUP BY value, display_name, device_type, uid, icon_id ORDER BY %s ASC %s",
+				VIF_DEVICE_TYPE_CUSTOM_BIZ_SERVICE, whereSql, orderBy, limitSql,
+			)
+			sqlList = append(sqlList, sql)
+			sqlList = append(sqlList, customBizServiceSql)
+			return nil, sqlList, nil
+		}
 	} else if tag == "vpc" || tag == "l2_vpc" {
 		sql = fmt.Sprintf("SELECT id as value,name AS display_name,uid FROM l3_epc_map %s GROUP BY value, display_name, uid ORDER BY %s ASC %s", whereSql, orderBy, limitSql)
 	} else if tag == "ip" {
@@ -1562,6 +1591,8 @@ func GetTagResourceValues(db, table, rawSql string) (*common.Result, []string, e
 		sql = fmt.Sprintf("SELECT device_id AS value, device_name AS display_name FROM vtap_port_map %s GROUP BY value, display_name ORDER BY %s ASC %s", whereSql, orderBy, limitSql)
 	} else if tag == "pod_ingress" {
 		sql = fmt.Sprintf("SELECT id as value, name AS display_name FROM pod_ingress_map %s GROUP BY value, display_name ORDER BY %s ASC %s", whereSql, orderBy, limitSql)
+	} else if tag == "biz_service.group" {
+		sql = fmt.Sprintf("SELECT service_group_name as value, service_group_name AS display_name FROM biz_service_map %s GROUP BY value, display_name ORDER BY %s ASC %s", whereSql, orderBy, limitSql)
 	} else if strings.HasPrefix(tag, "k8s.label.") {
 		labelTag := strings.TrimPrefix(tag, "k8s.label.")
 		if whereSql != "" {

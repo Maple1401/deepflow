@@ -35,7 +35,7 @@ type ConfigMap struct {
 func NewConfigMap(cfg config.Config, q *queue.OverwriteQueue) *ConfigMap {
 	mng := &ConfigMap{
 		newManagerComponent(ctrlCommon.RESOURCE_TYPE_CONFIG_MAP_EN, q),
-		newCUDSubscriberComponent(ctrlCommon.RESOURCE_TYPE_CONFIG_MAP_EN, SubTopic(pubsub.TopicResourceUpdatedMessage)),
+		newCUDSubscriberComponent(ctrlCommon.RESOURCE_TYPE_CONFIG_MAP_EN, SubTopic(pubsub.TopicResourceUpdatedFull)),
 		cfg,
 	}
 	mng.SetSubscriberSelf(mng)
@@ -76,7 +76,7 @@ func (c *ConfigMap) OnResourceUpdated(md *message.Metadata, msg interface{}) {
 		eventapi.TagVPCID(item.VPCID),
 		eventapi.TagAttributes(
 			[]string{eventapi.AttributeNameConfigName, eventapi.AttributeNameConfig, eventapi.AttributeNameConfigDiff},
-			[]string{item.Name, item.Data, diff}),
+			[]string{item.Name, string(item.Data), diff}),
 	}
 
 	c.enqueueIfInsertIntoMetadbFailed(

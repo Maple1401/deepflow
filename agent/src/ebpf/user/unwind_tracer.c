@@ -52,9 +52,6 @@ static proc_event_list_t proc_events = { .head = { .prev = &proc_events.head, .n
 static pthread_mutex_t g_unwind_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static unwind_table_t *g_unwind_table = NULL;
 
-static pthread_mutex_t g_python_unwind_table_lock = PTHREAD_MUTEX_INITIALIZER;
-static python_unwind_table_t *g_python_unwind_table = NULL;
-
 static struct {
     bool dwarf_enabled;
     struct {
@@ -193,11 +190,33 @@ static bool requires_dwarf_unwind_table(int pid) {
 }
 
 int unwind_tracer_init(struct bpf_tracer *tracer) {
-    int32_t offset = read_offset_of_stack_in_task_struct();
-    if (offset < 0) {
+    /* Initialize unwind_sysinfo with task_struct offsets */
+    int32_t stack_offset = read_offset_of_stack_in_task_struct();
+    if (stack_offset < 0) {
         ebpf_warning("unwind tracer init: failed to get field stack offset in task struct from btf");
         ebpf_warning("unwinder may not handle in kernel perf events correctly");
-    } else if (!bpf_table_set_value(tracer, MAP_UNWIND_SYSINFO_NAME, 0, &offset)) {
+    }
+
+    /* Get tpbase_offset for TLS access (needed for Python multi-threading support) */
+    int64_t tpbase_offset = read_tpbase_offset();
+    if (tpbase_offset < 0) {
+        ebpf_warning("unwind tracer init: failed to get tpbase offset from kernel");
+        ebpf_warning("Python multi-threaded profiling may not work correctly");
+        tpbase_offset = 0;
+    } else {
+        ebpf_info("unwind tracer init: tpbase_offset=%ld", tpbase_offset);
+    }
+
+    /* Update unwind_sysinfo map with both offsets */
+    struct {
+        uint32_t task_struct_stack_offset;
+        uint64_t tpbase_offset;
+    } sysinfo = {
+        .task_struct_stack_offset = stack_offset > 0 ? (uint32_t)stack_offset : 0,
+        .tpbase_offset = (uint64_t)tpbase_offset,
+    };
+
+    if (!bpf_table_set_value(tracer, MAP_UNWIND_SYSINFO_NAME, 0, &sysinfo)) {
         ebpf_warning("unwind tracer init: update %s error", MAP_UNWIND_SYSINFO_NAME);
         ebpf_warning("unwinder may not handle in kernel perf events correctly");
     }
@@ -218,65 +237,7 @@ int unwind_tracer_init(struct bpf_tracer *tracer) {
     g_unwind_table = table;
     pthread_mutex_unlock(&g_unwind_table_lock);
 
-    int unwind_info_map_fd = bpf_table_get_fd(tracer, MAP_PYTHON_UNWIND_INFO_NAME);
-    int offsets_map_fd = bpf_table_get_fd(tracer, MAP_PYTHON_OFFSETS_NAME);
-    if (unwind_info_map_fd < 0 || offsets_map_fd < 0) {
-        ebpf_warning("Failed to get unwind info map fd or offsets map fd\n");
-        return -1;
-    }
-    python_unwind_table_t *python_table = python_unwind_table_create(unwind_info_map_fd, offsets_map_fd);
-    pthread_mutex_lock(&g_python_unwind_table_lock);
-    g_python_unwind_table = python_table;
-    pthread_mutex_unlock(&g_python_unwind_table_lock);
-
-    // TODO: 创建 lua 剖析使用的 bpf table 并设置大小
-
     return 0;
-}
-
-/* *INDENT-OFF* */
-static struct symbol python_symbols[] = { { .type = PYTHON_UPROBE,
-                                            .symbol = "PyEval_SaveThread",
-                                            .probe_func = URETPROBE_FUNC_NAME(python_save_tstate_addr),
-                                            .is_probe_ret = true, }, };
-/* *INDENT-ON* */
-
-static void python_parse_and_register(int pid, struct tracer_probes_conf *conf) {
-    char *path = NULL;
-    int n = 0;
-
-    if (pid <= 1)
-        goto out;
-
-    if (!is_user_process(pid))
-        goto out;
-
-    // Python symbols may reside in the main executable or libpython.so
-    // Check both
-    path = get_elf_path_by_pid(pid);
-    if (path) {
-        n = add_probe_sym_to_tracer_probes(pid, path, conf, python_symbols, NELEMS(python_symbols));
-        if (n > 0) {
-            ebpf_info("python uprobe, pid:%d, path:%s\n", pid, path);
-            free(path);
-            return;
-        }
-    }
-
-    path = get_so_path_by_pid_and_name(pid, "python3");
-    if (!path) {
-        path = get_so_path_by_pid_and_name(pid, "python2");
-        if (!path) {
-            goto out;
-        }
-    }
-
-    ebpf_info("python uprobe, pid:%d, path:%s\n", pid, path);
-    add_probe_sym_to_tracer_probes(pid, path, conf, python_symbols, NELEMS(python_symbols));
-
-out:
-    free(path);
-    return;
 }
 
 void unwind_tracer_drop() {
@@ -287,19 +248,15 @@ void unwind_tracer_drop() {
         g_unwind_table = NULL;
     }
     pthread_mutex_unlock(&g_unwind_table_lock);
-
-    pthread_mutex_lock(&g_python_unwind_table_lock);
-    if (g_python_unwind_table) {
-        python_unwind_table_destroy(g_python_unwind_table);
-        g_python_unwind_table = NULL;
-    }
-    pthread_mutex_unlock(&g_python_unwind_table_lock);
 }
 
 void unwind_process_exec(int pid) {
     if (!dwarf_available() || !get_dwarf_enabled()) {
         return;
     }
+
+    // Enterprise hook for interpreter processing
+    extended_process_exec(pid);
 
     struct bpf_tracer *tracer = find_bpf_tracer(CP_TRACER_NAME);
     if (tracer == NULL || tracer->state != TRACER_RUNNING) {
@@ -316,10 +273,7 @@ void unwind_events_handle(void) {
     }
 
     struct process_create_event *event = NULL;
-    struct bpf_tracer *tracer = NULL;
-    int count = 0;
     pthread_mutex_lock(&g_unwind_table_lock);
-    pthread_mutex_lock(&g_python_unwind_table_lock);
     do {
         event = get_first_event(&proc_events);
         if (!event)
@@ -327,21 +281,6 @@ void unwind_events_handle(void) {
 
         if (get_sys_uptime() < event->expire_time) {
             break;
-        }
-
-        tracer = event->tracer;
-        if (tracer && is_python_process(event->pid)) {
-            python_unwind_table_load(g_python_unwind_table, event->pid);
-            pthread_mutex_lock(&tracer->mutex_probes_lock);
-            python_parse_and_register(event->pid, tracer->tps);
-            tracer_uprobes_update(tracer);
-            tracer_hooks_process(tracer, HOOK_ATTACH, &count);
-            pthread_mutex_unlock(&tracer->mutex_probes_lock);
-        }
-
-        if (tracer && is_lua_process(event->pid)) {
-            // TODO: 加载 lua 剖析使用的 bpf table
-            // TODO: 如果有相关 uprobe 则注册
         }
 
         if (g_unwind_table && requires_dwarf_unwind_table(event->pid)) {
@@ -352,7 +291,6 @@ void unwind_events_handle(void) {
         process_event_free(event);
 
     } while (true);
-    pthread_mutex_unlock(&g_python_unwind_table_lock);
     pthread_mutex_unlock(&g_unwind_table_lock);
 }
 
@@ -361,6 +299,9 @@ void unwind_process_exit(int pid) {
     if (!dwarf_available() || !get_dwarf_enabled()) {
         return;
     }
+
+    // Enterprise hook
+    extended_process_exit(pid);
 
     struct bpf_tracer *tracer = find_bpf_tracer(CP_TRACER_NAME);
     if (tracer == NULL || tracer->state != TRACER_RUNNING) {
@@ -384,14 +325,6 @@ void unwind_process_exit(int pid) {
         unwind_table_unload(g_unwind_table, pid);
     }
     pthread_mutex_unlock(&g_unwind_table_lock);
-
-    pthread_mutex_lock(&g_python_unwind_table_lock);
-    if (g_python_unwind_table) {
-        python_unwind_table_unload(g_python_unwind_table, pid);
-    }
-    pthread_mutex_unlock(&g_python_unwind_table_lock);
-
-    // TODO: 卸载 lua 剖析使用的 bpf table
 }
 
 // Ensure exclusive access to *unwind_table before calling this function
@@ -418,6 +351,9 @@ static int load_running_processes(struct bpf_tracer *tracer, unwind_table_t *unw
         pid = atoi(entry->d_name);
         if (!process_probing_check(pid))
             continue;
+
+        extended_process_exec(pid);
+
         if (requires_dwarf_unwind_table(pid)) {
             unwind_table_load(unwind_table, pid);
         }

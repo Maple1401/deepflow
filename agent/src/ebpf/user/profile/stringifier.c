@@ -61,14 +61,31 @@
 #include <bcc/bcc_syms.h>
 #include "../proc.h"
 #include "trace_utils.h"
+#include "../extended/extended.h"
 
 // static const char *k_err_tag = "[kernel stack trace error]";
 // static const char *u_err_tag = "[user stack trace error]";
-static const char *i_err_tag = "[interpreter stack trace error]";
+const char *i_err_tag = "[interpreter stack trace error]";
 static const char *lost_tag = "[stack trace lost]";
 static const char *k_sym_prefix = "[k] ";
 static const char *lib_sym_prefix = "[l] ";
 static const char *u_sym_prefix = "";
+
+// Stack trace structure definition (user-space copy of eBPF structure)
+// Must match the definition in perf_profiler.bpf.c
+#ifndef PERF_MAX_STACK_DEPTH
+#define PERF_MAX_STACK_DEPTH 127
+#endif
+
+typedef struct {
+	u8 len;                                    // Number of frames in the stack
+	u64 addrs[PERF_MAX_STACK_DEPTH];          // Frame addresses (or pointer_and_type for V8)
+	u8 frame_types[PERF_MAX_STACK_DEPTH];     // Frame type markers (FRAME_TYPE_*)
+	// Extra data for interpreter frames (2 u64s per frame)
+	// For V8: extra_data_a[i] = delta_or_marker, extra_data_b[i] = return_address
+	u64 extra_data_a[PERF_MAX_STACK_DEPTH];
+	u64 extra_data_b[PERF_MAX_STACK_DEPTH];
+} stack_t;
 
 /*
  * To track the scenario where stack data is missing in the eBPF
@@ -177,6 +194,26 @@ static char *kern_symbol_name_fetch(pid_t pid, struct bcc_symbol *sym)
 #define RUST_SYM_SUFFIX "::h0123456789abcdef"
 #define RUST_SYM_MAX_LEN 512
 
+static bool maybe_rust_symbol(const char *name) {
+	// According to https://github.com/rust-lang/rustc-demangle/blob/f053741061bd1686873a467a7d9ef22d2f1fb876/src/lib.rs#L93,
+	// rust symbols may contain a ".llvm." suffix, handle this first
+	if (strstr(name, ".llvm.") != NULL) {
+		return true;
+	}
+
+	// check memory related symbols
+	if (strstr(name, "__rust_alloc") != NULL || strstr(name, "__rust_dealloc") != NULL || strstr(name, "__rust_realloc") != NULL) {
+		return true;
+	}
+
+	// rust symbols ends with "::h0123456789abcdef", which is "::h" followed by 16 hex digits
+	// for example:
+	//     std::sys_common::backtrace::__rust_begin_short_backtrace::h4385d813972dd7eb
+	// try rustc_demangle if we see this pattern
+	int offset = strlen(name) - strlen(RUST_SYM_SUFFIX);
+	return offset > 0 && strncmp(name + offset, "::h", 3) == 0;
+}
+
 static char *proc_symbol_name_fetch(pid_t pid, struct bcc_symbol *sym)
 {
 	ASSERT(pid >= 0);
@@ -184,16 +221,7 @@ static char *proc_symbol_name_fetch(pid_t pid, struct bcc_symbol *sym)
 	int len = 0;
 	char *ptr = (char *)sym->demangle_name;
 
-	// According to https://github.com/rust-lang/rustc-demangle/blob/f053741061bd1686873a467a7d9ef22d2f1fb876/src/lib.rs#L93,
-	// rust symbols may contain a ".llvm." suffix, handle this first
-	bool maybe_rust_symbol = strstr(sym->demangle_name, ".llvm.") != NULL;
-	// rust symbols ends with "::h0123456789abcdef", which is "::h" followed by 16 hex digits
-	// for example:
-	//     std::sys_common::backtrace::__rust_begin_short_backtrace::h4385d813972dd7eb
-	// try rustc_demangle if we see this pattern
-	int offset = strlen(sym->demangle_name) - strlen(RUST_SYM_SUFFIX);
-	maybe_rust_symbol |= offset > 0 && strncmp(sym->demangle_name + offset, "::h", 3) == 0;
-	if (maybe_rust_symbol) {
+	if (maybe_rust_symbol(sym->demangle_name)) {
 		// likely a rust name
 		char rust_name[RUST_SYM_MAX_LEN];
 		memset(rust_name, 0, sizeof(rust_name));
@@ -367,21 +395,29 @@ static inline int symcache_resolve(pid_t pid, void *resolver, u64 address,
 	return ret;
 }
 
-static char *resolve_addr(struct bpf_tracer *t, pid_t pid, bool is_start_idx,
+/*
+ * Shared native resolver for both the C stringifier and the Rust Lua decoder.
+ * Lua’s logical stack may include TAG_CFUNC frames (Lua→C calls). Rust calls
+ * this helper to resolve those native PCs using the same symbol cache.
+ * the void *tracer_handle should be struct bpf_tracer *
+ */
+char *resolve_addr(void *tracer_handle, uint32_t pid, bool is_start_idx,
 			  u64 address, bool is_create, void *info_p)
 {
-	ASSERT(pid >= 0);
+	pid_t pid_signed = (pid_t)pid;
+
+	ASSERT(pid_signed >= 0);
 
 	int len = 0;
 	char *ptr = NULL;
 	char format_str[32];
 	struct bcc_symbol sym;
 	memset(&sym, 0, sizeof(sym));
-	void *resolver = get_symbol_cache(pid, is_create);
+	void *resolver = get_symbol_cache(pid_signed, is_create);
 	if (resolver == NULL)
 		goto resolver_err;
 
-	int ret = symcache_resolve(pid, resolver, address, &sym, info_p, &ptr);
+	int ret = symcache_resolve(pid_signed, resolver, address, &sym, info_p, &ptr);
 	if (ret == 0 && ptr) {
 		char *p = ptr;
 		/*
@@ -460,13 +496,42 @@ finish:
 
 static int get_stack_ips(struct bpf_tracer *t,
 			 const char *stack_map_name, int stack_id, u64 * ips,
-			 u64 ts)
+			 stack_t *full_stack, u64 ts)
 {
 	ASSERT(stack_id >= 0);
+
+	// Determine if this is a custom stack map (with frame_types and extra_data)
+	// or a regular stack map (only addresses)
+	bool is_custom_map = (strstr(stack_map_name, "custom") != NULL);
+
+	// Try to read full stack_t structure first (for interpreter stacks with V8/Python/PHP)
+	// Only attempt this if the map name indicates it's a custom map
+	if (full_stack && is_custom_map &&
+	    bpf_table_get_value(t, stack_map_name, stack_id, (void *)full_stack)) {
+		// Successfully read full stack_t structure, copy addrs to ips for compatibility
+		memcpy(ips, full_stack->addrs, sizeof(full_stack->addrs));
+
+		// Debug: Check if data is valid
+		int non_zero_count = 0;
+		for (int i = 0; i < PERF_MAX_STACK_DEPTH; i++) {
+			if (full_stack->addrs[i] != 0) non_zero_count++;
+		}
+		return ETR_OK;
+	}
+
+	// Fallback: read only addresses (for regular stack traces)
+	// CRITICAL FIX: Clear full_stack BEFORE reading data to avoid zeroing out the data
+	// we just read. When called with ips=stack.addrs and full_stack=&stack, the memset
+	// after bpf_table_get_value would zero out the stack addresses we just read.
+	if (full_stack) {
+		memset(full_stack, 0, sizeof(*full_stack));
+	}
 
 	if (!bpf_table_get_value(t, stack_map_name, stack_id, (void *)ips)) {
 		return ETR_NOTEXIST;
 	}
+
+	// Note: No need to memcpy ips to full_stack->addrs because they point to the same memory
 
 	return ETR_OK;
 }
@@ -491,8 +556,9 @@ static char *build_stack_trace_string(struct bpf_tracer *t,
 	u64 sentinel_addr = 0xcccccccccccccccc;
 	int i;
 
-	u64 ips[PERF_MAX_STACK_DEPTH];
-	memset(ips, 0, sizeof(ips));
+	// Use full stack_t structure to access frame_types and extra_data
+	stack_t stack;
+	memset(&stack, 0, sizeof(stack));
 
 	symbol_t symbols[MAX_SYMBOL_NUM];
 	memset(symbols, 0, sizeof(symbols));
@@ -507,21 +573,26 @@ static char *build_stack_trace_string(struct bpf_tracer *t,
 			return NULL;
 		}
 		symbol_t key = {};
-		while (bpf_get_next_key(map->fd, &key, &symbols[n_symbols]) == 0) {
-			int ret = bpf_lookup_elem(map->fd, &key, &symbol_ids[n_symbols]);
-			key = symbols[n_symbols];
+		symbol_t next_key = {};
+		while (bpf_get_next_key(map->fd, &key, &next_key) == 0 && n_symbols < MAX_SYMBOL_NUM) {
+			int ret = bpf_lookup_elem(map->fd, &next_key, &symbol_ids[n_symbols]);
 			if (ret == 0) {
+				symbols[n_symbols] = next_key;
 				n_symbols++;
 			}
+			key = next_key;
 		}
 	}
 
 	int ret;
-	if ((ret = get_stack_ips(t, stack_map_name, stack_id, ips, ts))) {
+	if ((ret = get_stack_ips(t, stack_map_name, stack_id, stack.addrs, &stack, ts))) {
 		stack_table_data_miss++;
 		*ret_val = ret;
 		return NULL;
 	}
+
+	// For debugging: stack.len is the number of frames
+	u64 *ips = stack.addrs;
 
 	char *str = NULL;
 	ret = VEC_OK;
@@ -538,10 +609,25 @@ static char *build_stack_trace_string(struct bpf_tracer *t,
 		if (start_idx == -1)
 			start_idx = i;
 
-		if (use_symbol_table) {
-			str = resolve_custom_symbol_addr(symbols, symbol_ids, n_symbols, (i == start_idx), ips[i]);
-		} else {
-			str = resolve_addr(t, pid, (i == start_idx), ips[i], new_cache, info_p);
+		/*
+		 * Use extended hook to resolve frame if it's special.
+		 * We pass possible extra data. If the frame type is 0 (normal),
+		 * this call should return NULL.
+		 */
+		str = extended_resolve_frame(pid, ips[i], stack.frame_types[i],
+					     stack.extra_data_a[i],
+					     stack.extra_data_b[i]);
+		if (str == NULL) {
+			/* Normal fallback */
+			if (use_symbol_table) {
+				str = resolve_custom_symbol_addr(symbols, symbol_ids,
+								 n_symbols,
+								 (i == start_idx),
+								 ips[i]);
+			} else {
+				str = resolve_addr(t, pid, (i == start_idx),
+						   ips[i], new_cache, info_p);
+			}
 		}
 		if (str) {
 			// ignore frames in library for memory profiling
@@ -592,6 +678,8 @@ failed:
 	return NULL;
 }
 
+
+
 static char *folded_stack_trace_string(struct bpf_tracer *t,
 				       int stack_id,
 				       pid_t pid,
@@ -604,7 +692,7 @@ static char *folded_stack_trace_string(struct bpf_tracer *t,
 
 	/*
 	 * Firstly, search the stack-trace hash to see if the
-	 * stack trace string has already been stored. 
+	 * stack trace string has already been stored.
 	 */
 	stack_str_hash_kv kv;
 	kv.key = (u64) stack_id;
@@ -616,6 +704,32 @@ static char *folded_stack_trace_string(struct bpf_tracer *t,
 
 	char *str = NULL;
 	int ret_val = 0;
+
+	/*
+	 * Lua frames require special handling via extended hook.
+	 * Lua uses its own stack format with encoded tag + pointer values.
+	 */
+	if (use_symbol_table) {
+		str = extended_format_lua_stack(t, pid, stack_id, stack_map_name,
+						h, new_cache, info_p);
+		if (str != NULL) {
+			/* Cache the result */
+			kv.key = (u64) stack_id;
+			kv.value = pointer_to_uword(str);
+			if (stack_str_hash_add_del(h, &kv, 1)) {
+				clib_mem_free((void *)str);
+				return NULL;
+			}
+			int ret = VEC_OK;
+			struct stack_str_hash_ext_data *ext = h->private;
+			vec_add1(ext->stack_str_kvps, kv, ret);
+			if (ret != VEC_OK) {
+				ebpf_warning("vec add failed\n");
+			}
+			return str;
+		}
+	}
+
 	str = build_stack_trace_string(t, stack_map_name, pid, stack_id,
 				       h, new_cache, &ret_val, info_p, ts,
 				       ignore_libs, use_symbol_table);
@@ -759,7 +873,11 @@ char *resolve_and_gen_stack_trace_str(struct bpf_tracer *t,
 
 	bool has_intpstack = v->intpstack > 0;
 	if (has_intpstack) {
-		i_trace_str = folded_stack_trace_string(t, v->intpstack, v->tgid, custom_stack_map_name, h, new_cache, info_p, v->timestamp, ignore_libs, true);
+		i_trace_str = folded_stack_trace_string(t, v->intpstack, v->tgid,
+							custom_stack_map_name, h,
+							new_cache, info_p,
+							v->timestamp,
+							ignore_libs, true);
 		if (i_trace_str != NULL) {
 			len += strlen(i_trace_str) + strlen(INCOMPLETE_PYTHON_STACK) + 2;
 		} else {
@@ -773,10 +891,20 @@ char *resolve_and_gen_stack_trace_str(struct bpf_tracer *t,
 		goto error;
 	}
 
-	/* trace_str = i_stack_str_fn() + ";" + u_stack_str_fn() + ";" + k_stack_str_fn(); */
+	/* trace_str combines user/interpreter/kstack strings in call-order (root -> leaf). */
 	int offset = 0;
 	if (i_trace_str && u_trace_str) {
-		offset += merge_python_stacks(trace_str + offset, len - offset, i_trace_str, u_trace_str);
+		/* Use extended merge */
+		int merged = extended_merge_stacks(trace_str + offset,
+						   len - offset, i_trace_str,
+						   u_trace_str, v->tgid);
+		if (merged > 0) {
+			offset += merged;
+		} else {
+			/* Fallback */
+			offset += snprintf(trace_str + offset, len - offset,
+					   "%s;%s", i_trace_str, u_trace_str);
+		}
 	} else if (i_trace_str) {
 		offset += snprintf(trace_str + offset, len - offset, "%s", i_trace_str);
 	} else if (u_trace_str) {
@@ -794,7 +922,7 @@ char *resolve_and_gen_stack_trace_str(struct bpf_tracer *t,
 	}
 
 	if (offset == 0) {
-		/* 
+		/*
 		 * The kernel can indicate the invalidity of a stack ID in two
 		 * different ways:
 		 *

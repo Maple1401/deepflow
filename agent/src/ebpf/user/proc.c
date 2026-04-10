@@ -158,13 +158,6 @@ static bool inline enable_proc_info_cache(void)
 void free_proc_cache(struct symbolizer_proc_info *p)
 {
 	int pid = (int)p->pid;
-	if (p->is_java) {
-		/* Delete target ns Java files */
-		if (pid > 0) {
-			clean_local_java_symbols_files(pid);
-		}
-	}
-
 	if (p->syms_cache) {
 		bcc_free_symcache((void *)p->syms_cache, p->pid);
 		free_symcache_count++;
@@ -293,14 +286,18 @@ static int del_proc_info_from_cache(struct symbolizer_cache_kvp *kv)
 }
 
 int get_proc_info_from_cache(pid_t pid, uint8_t * cid, int cid_size,
-			     uint8_t * name, int name_size, kern_dev_t s_dev,
-			     char *mount_point, char *mount_source,
-			     int mount_size, bool * is_nfs)
+			     uint8_t * name, int name_size, int mnt_id,
+			     uint32_t mntns_id, uint32_t *self_mntns_id,
+			     kern_dev_t s_dev, char *mount_point,
+			     char *mount_source, char *root,
+			     int mount_size, fs_type_t *file_type)
 {
+	int ret = -1;
 	symbol_caches_hash_t *h = &syms_cache_hash;
 	struct symbolizer_cache_kvp kv;
 	kv.k.pid = (u64) pid;
 	kv.v.proc_info_p = 0;
+	*self_mntns_id = 0;
 	memset(cid, 0, cid_size);
 	memset(name, 0, name_size);
 	memset(mount_point, 0, mount_size);
@@ -319,15 +316,17 @@ int get_proc_info_from_cache(pid_t pid, uint8_t * cid, int cid_size,
 			memcpy_s_inline((void *)name, name_size, p->comm,
 					sizeof(p->comm));
 		}
-		if (s_dev != DEV_INVALID)
-			find_mount_point_path(pid, &p->mntns_id, s_dev,
-					      mount_point, mount_source,
-					      mount_size, is_nfs);
+		*self_mntns_id = p->mntns_id;
 		AO_DEC(&p->use);
-		return 0;
+		ret = 0;
 	}
 
-	return -1;
+	if (s_dev != DEV_INVALID) {
+		get_mount_info(pid, mnt_id, mntns_id, s_dev, mount_point,
+			       mount_source, root, mount_size, file_type);
+	}
+
+	return ret;
 }
 
 static inline int add_proc_ev_info_to_ring(enum proc_act_type type,
@@ -345,8 +344,6 @@ static inline int add_proc_ev_info_to_ring(enum proc_act_type type,
 				       NULL);
 	if (nr < 1) {
 		clib_mem_free(ev_info);
-		ebpf_info("Failed to add process %d to the queue, so it "
-			  "was added to the vector instead.\n", kv->k.pid);
 		return -1;
 	}
 
@@ -718,10 +715,13 @@ void *get_symbol_cache(pid_t pid, bool new_cache)
 				 * for each java process's delay.
 				 * The same applies to non-Java processes, which also perform
 				 * random symbol table loading within one minute.
+				 * Do not add delay for agent itself.
 				 */
-				p->update_syms_table_time +=
-				    generate_random_integer
-				    (PROFILER_DEFER_RANDOM_MAX);
+				if (pid != getpid()) {
+					p->update_syms_table_time +=
+						generate_random_integer
+						(PROFILER_DEFER_RANDOM_MAX);
+				}
 			}
 
 			if (p->update_syms_table_time > 0
@@ -1018,15 +1018,19 @@ void check_and_update_proc_info(bool output_log)
 }
 
 int get_proc_info_from_cache(pid_t pid, uint8_t * cid, int cid_size,
-			     uint8_t * name, int name_size, kern_dev_t s_dev,
-			     char *mount_point, char *mount_source,
-			     int mount_size, bool * is_nfs)
+			     uint8_t * name, int name_size, int mnt_id,
+			     uint32_t mntns_id, uint32_t *self_mntns_id,
+			     kern_dev_t s_dev, char *mount_point,
+			     char *mount_source, char *root, int mount_size,
+			     fs_type_t *file_type)
 {
+	*self_mntns_id = 0;
 	memset(cid, 0, cid_size);
 	memset(name, 0, name_size);
 	memset(mount_point, 0, mount_size);
 	memset(mount_source, 0, mount_size);
-	*is_nfs = false;
+	memset(root, 0, mount_size);
+	*file_type = FS_TYPE_UNKNOWN;
 	return -1;
 }
 
@@ -1096,7 +1100,10 @@ void add_event_to_proc_list(proc_event_list_t * list, struct bpf_tracer *tracer,
 	event->pid = pid;
 	event->stime = get_process_starttime(pid);
 	event->path = path;
-	event->expire_time = get_sys_uptime() + PROC_EVENT_HANDLE_DELAY;
+	event->expire_time = get_sys_uptime();
+	if (pid != getpid()) {
+	    event->expire_time += PROC_EVENT_HANDLE_DELAY;
+	}
 
 	pthread_mutex_lock(&list->m);
 	list_add_tail(&event->list, &list->head);
@@ -1288,8 +1295,14 @@ int add_probe_sym_to_tracer_probes(int pid, const char *path,
 		 * address to a physical address.
 		 * For shared library binary files (ET_DYN), no conversion is needed.
 		 * ref: https://refspecs.linuxbase.org/elf/gabi4+/ch5.pheader.html
+		 *
+		 * ET_DYN indicates a position-independent loadable file.
+		 * It can be either a shared library (.so) or a PIE (Position Independent Executable).
+		 * - PIE executables use random load addresses (ASLR) for better security (modern default).
+		 * - Shared libraries are also ET_DYN but usually lack the executable bit.
+		 *   To distinguish between them, check if the file has executable permissions.
 		 */
-		if (bcc_elf_get_type(probe_sym->binary_path) == ET_EXEC) {
+		if (bcc_elf_is_exe(probe_sym->binary_path)) {
 			struct load_addr_t addr = {
 				.target_addr = probe_sym->entry,
 				.binary_addr = 0x0,
@@ -1302,6 +1315,7 @@ int add_probe_sym_to_tracer_probes(int pid, const char *path,
 			if (!addr.binary_addr) {
 				goto invalid;
 			}
+
 			probe_sym->entry = addr.binary_addr;
 		}
 

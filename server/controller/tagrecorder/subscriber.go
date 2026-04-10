@@ -17,15 +17,12 @@
 package tagrecorder
 
 import (
-	"fmt"
 	"slices"
 	"sync"
 
-	"gorm.io/gorm"
-
 	"github.com/deepflowio/deepflow/server/controller/config"
 	"github.com/deepflowio/deepflow/server/controller/db/metadb"
-	"github.com/deepflowio/deepflow/server/controller/recorder/constraint"
+	metadbmodel "github.com/deepflowio/deepflow/server/controller/db/metadb/model"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
 	msgconstraint "github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/constraint"
@@ -34,7 +31,7 @@ import (
 
 const hookerDeletePage = 0
 
-type deletePageHooker[MT constraint.MetadbModel, MDT msgconstraint.Delete, MDPT msgconstraint.DeletePtr[MDT]] interface {
+type deletePageHooker[MT metadbmodel.AssetResourceConstraint, MDT msgconstraint.Delete, MDPT msgconstraint.DeletePtr[MDT]] interface {
 	beforeDeletePage([]*MT, MDPT) []*MT
 }
 
@@ -123,6 +120,7 @@ func (c *SubscriberManager) getSubscribers() []Subscriber {
 		NewChPodClusterDevice(c.resourceTypeToIconID),
 		NewChProcessDevice(c.resourceTypeToIconID),
 		NewChCustomServiceDevice(c.resourceTypeToIconID),
+		NewChBizService(c.resourceTypeToIconID),
 
 		NewChAZ(c.domainLcuuidToIconID, c.resourceTypeToIconID),
 		NewChChost(),
@@ -176,7 +174,7 @@ type SubscriberDataGenerator[
 	MUT msgconstraint.Update,
 	MDPT msgconstraint.DeletePtr[MDT],
 	MDT msgconstraint.Delete,
-	MT constraint.MetadbModel,
+	MT metadbmodel.AssetResourceConstraint,
 	CT SubscriberMetaDBChModel,
 	KT SubscriberChModelKey,
 ] interface {
@@ -192,7 +190,7 @@ type SubscriberComponent[
 	MUT msgconstraint.Update,
 	MDPT msgconstraint.DeletePtr[MDT],
 	MDT msgconstraint.Delete,
-	MT constraint.MetadbModel,
+	MT metadbmodel.AssetResourceConstraint,
 	CT SubscriberMetaDBChModel,
 	KT SubscriberChModelKey,
 ] struct {
@@ -204,6 +202,7 @@ type SubscriberComponent[
 	subscriberDG        SubscriberDataGenerator[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]
 	hookers             map[int]interface{}
 	softDelete          bool
+	subscribeRecorder   bool // Whether to subscribe to recorder messages, default is true
 }
 
 func newSubscriberComponent[
@@ -213,7 +212,7 @@ func newSubscriberComponent[
 	MUT msgconstraint.Update,
 	MDPT msgconstraint.DeletePtr[MDT],
 	MDT msgconstraint.Delete,
-	MT constraint.MetadbModel,
+	MT metadbmodel.AssetResourceConstraint,
 	CT SubscriberMetaDBChModel,
 	KT SubscriberChModelKey,
 ](
@@ -224,6 +223,7 @@ func newSubscriberComponent[
 		resourceTypeName:    resourceTypeName,
 		hookers:             make(map[int]interface{}),
 		softDelete:          false,
+		subscribeRecorder:   true,
 	}
 	s.initDBOperator()
 	return s
@@ -244,10 +244,28 @@ func (s *SubscriberComponent[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]) initD
 func (s *SubscriberComponent[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]) generateKeyTargets(md *message.Metadata, sources []*MT) ([]KT, []CT) {
 	keys := []KT{}
 	targets := []CT{}
+	seenKeys := map[KT]bool{}
 	for _, item := range sources {
+		if item == nil {
+			log.Errorf("subscriber resource is nil")
+			continue
+		}
 		ks, ts := s.subscriberDG.sourceToTarget(md, item)
-		keys = append(keys, ks...)
-		targets = append(targets, ts...)
+		if len(ks) == 0 || len(ts) == 0 {
+			continue
+		}
+		if len(ks) != len(ts) {
+			log.Errorf("sourceToTarget returned mismatched lengths: keys=%d, targets=%d", len(ks), len(ts))
+			continue
+		}
+		// deduplicate
+		for i, k := range ks {
+			if !seenKeys[k] {
+				keys = append(keys, k)
+				targets = append(targets, ts[i])
+				seenKeys[k] = true
+			}
+		}
 	}
 	return keys, targets
 }
@@ -257,10 +275,20 @@ func (s *SubscriberComponent[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]) SetCo
 	s.dbOperator.setConfig(cfg)
 }
 
+func (s *SubscriberComponent[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]) setSubscribeRecorder(subscribeRecorder bool) {
+	s.subscribeRecorder = subscribeRecorder
+}
+
 func (s *SubscriberComponent[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]) Subscribe() {
-	pubsub.Subscribe(s.subResourceTypeName, pubsub.TopicResourceBatchAddedMessage, s)
-	pubsub.Subscribe(s.subResourceTypeName, pubsub.TopicResourceUpdatedMessage, s)
-	pubsub.Subscribe(s.subResourceTypeName, pubsub.TopicResourceBatchDeletedMessage, s)
+	if !s.subscribeRecorder {
+		return
+	}
+	pubsub.Subscribe(
+		s,
+		pubsub.NewSubscriptionSpec(s.subResourceTypeName, pubsub.TopicResourceBatchAddedFull),
+		pubsub.NewSubscriptionSpec(s.subResourceTypeName, pubsub.TopicResourceUpdatedFull),
+		pubsub.NewSubscriptionSpec(s.subResourceTypeName, pubsub.TopicResourceBatchDeletedFull),
+	)
 }
 
 // OnResourceBatchAdded implements interface Subscriber in recorder/pubsub/subscriber.go
@@ -278,29 +306,16 @@ func (s *SubscriberComponent[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]) OnRes
 // OnResourceBatchUpdated implements interface Subscriber in recorder/pubsub/subscriber.go
 func (s *SubscriberComponent[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]) OnResourceUpdated(md *message.Metadata, msg interface{}) {
 	updateMessage := msg.(MUPT)
+	dbItem := updateMessage.GetNewMetadbItem().(*MT)
+	dbItems := []*MT{dbItem}
+	db := md.GetDB()
+	// use add to complete addition and update of resource in ch table
+	keys, chItems := s.generateKeyTargets(md, dbItems)
+	s.dbOperator.batchPage(keys, chItems, s.dbOperator.add, db)
+	// delete resource from ch table
+	// such as ch_chost_cloud_tag, ch_pod_ns_cloud_tag, ch_pod_k8s_label,
+	// ch_pod_k8s_annotation, ch_pod_k8s_env, ch_pod_service_k8s_label, ch_pod_service_k8s_annotation
 	s.subscriberDG.onResourceUpdated(md, updateMessage)
-}
-
-func (s *SubscriberComponent[MAPT, MAT, MUPT, MUT, MDPT, MDT, MT, CT, KT]) updateOrSync(db *metadb.DB, key KT, updateInfo map[string]interface{}) {
-	condMap := key.Map()
-	if len(condMap) == 0 {
-		log.Errorf("%s key: %#v is empty", s.resourceTypeName, key, db.LogPrefixORGID)
-		return
-	}
-	query := db.GetGORMDB()
-	for k, v := range condMap {
-		query = query.Where(fmt.Sprintf("%s = ?", k), v)
-	}
-	var chItem CT
-	if err := query.First(&chItem).Error; err != nil {
-		if err != gorm.ErrRecordNotFound {
-			log.Errorf("failed to get %s by key %#v: %v", s.resourceTypeName, key, err, db.LogPrefixORGID)
-		}
-		return
-	}
-	if len(updateInfo) > 0 {
-		s.dbOperator.update(chItem, updateInfo, key, db)
-	}
 }
 
 // OnResourceBatchDeleted implements interface Subscriber in recorder/pubsub/subscriber.go

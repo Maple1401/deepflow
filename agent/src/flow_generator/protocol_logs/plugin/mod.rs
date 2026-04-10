@@ -15,7 +15,7 @@
  */
 
 use enum_dispatch::enum_dispatch;
-use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolEnum};
+use public::l7_protocol::{CustomProtocol, L7Protocol, L7ProtocolEnum, LogMessageType};
 use wasm::WasmLog;
 
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
         flow::L7PerfStats,
         l7_protocol_log::{L7ParseResult, L7ProtocolParser, L7ProtocolParserInterface, ParseParam},
     },
-    flow_generator::{protocol_logs::sql::ObfuscateCache, Result},
+    flow_generator::Result,
 };
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -38,7 +38,7 @@ pub mod wasm;
 cfg_if::cfg_if! {
 if #[cfg(feature = "enterprise")] {
         pub mod custom_protocol_policy;
-        pub use custom_protocol_policy::{get_policy_parser, CustomPolicyLog};
+        pub use custom_protocol_policy::CustomPolicyLog;
     }
 }
 
@@ -60,7 +60,7 @@ pub fn get_custom_log_parser(proto: CustomProtocol) -> L7ProtocolParser {
             #[cfg(target_os = "windows")]
             CustomProtocol::So(_, _) => unimplemented!(),
             #[cfg(feature = "enterprise")]
-            CustomProtocol::CustomPolicy(s) => CustomLog::CustomPolicyLog(get_policy_parser(s)),
+            CustomProtocol::CustomPolicy(s) => CustomLog::CustomPolicyLog(CustomPolicyLog::get(s)),
             #[cfg(not(feature = "enterprise"))]
             CustomProtocol::CustomPolicy(_) => unimplemented!(),
         }),

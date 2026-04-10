@@ -36,6 +36,7 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/common"
 	. "github.com/deepflowio/deepflow/server/controller/common"
 	mysql_model "github.com/deepflowio/deepflow/server/controller/db/metadb/model" // FIXME: To avoid ambiguity, name the package either mysql_model or db_model.
+	"github.com/deepflowio/deepflow/server/controller/grpc/statsd"
 	. "github.com/deepflowio/deepflow/server/controller/trisolaris/common"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/config"
 	"github.com/deepflowio/deepflow/server/controller/trisolaris/dbmgr"
@@ -56,11 +57,13 @@ type VTapInfo struct {
 	// key: ctrlIP
 	kvmVTapCaches *KvmVTapCacheMap
 
-	metaData                       *metadata.MetaData
-	config                         *config.Config
-	vTapPlatformData               *VTapPlatformData
-	groupData                      *GroupData
-	vTapPolicyData                 *VTapPolicyData
+	metaData            *metadata.MetaData
+	config              *config.Config
+	vTapPlatformData    *VTapPlatformData
+	groupData           *GroupData
+	vTapPolicyData      *VTapPolicyData
+	customAppConfigData *CustomAppConfigData
+
 	lcuuidToRegionID               map[string]int
 	azToDomain                     map[string]string
 	domainIdToLcuuid               map[int]string
@@ -68,8 +71,9 @@ type VTapInfo struct {
 	lcuuidToVPCID                  map[string]int
 	hostIDToVPCID                  map[int]int
 	hypervNetworkHostIds           mapset.Set
-	vtapGroupShortIDToLcuuid       map[string]string
+	vtapGroupNameOrShortIDToLcuuid map[string]string
 	vtapGroupLcuuidToShortID       map[string]string
+	vtapGroupLcuuidToID            map[string]int
 	vtapGroupLcuuidToConfiguration map[string]*VTapConfig
 	vtapGroupLcuuidToLocalConfig   map[string]string
 	noVTapTapPortsMac              mapset.Set
@@ -130,6 +134,7 @@ func NewVTapInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config, o
 		metaData:                       metaData,
 		groupData:                      newGroupData(metaData),
 		vTapPolicyData:                 newVTapPolicyData(metaData),
+		customAppConfigData:            newCustomAppConfigData(metaData),
 		lcuuidToRegionID:               make(map[string]int),
 		azToDomain:                     make(map[string]string),
 		domainIdToLcuuid:               make(map[int]string),
@@ -137,8 +142,9 @@ func NewVTapInfo(db *gorm.DB, metaData *metadata.MetaData, cfg *config.Config, o
 		lcuuidToVPCID:                  make(map[string]int),
 		hostIDToVPCID:                  make(map[int]int),
 		hypervNetworkHostIds:           mapset.NewSet(),
-		vtapGroupShortIDToLcuuid:       make(map[string]string),
+		vtapGroupNameOrShortIDToLcuuid: make(map[string]string),
 		vtapGroupLcuuidToShortID:       make(map[string]string),
+		vtapGroupLcuuidToID:            make(map[string]int),
 		vtapGroupLcuuidToConfiguration: make(map[string]*VTapConfig),
 		vtapGroupLcuuidToLocalConfig:   make(map[string]string),
 		noVTapTapPortsMac:              mapset.NewSet(),
@@ -179,6 +185,8 @@ func (v *VTapInfo) AddVTapCache(vtap *mysql_model.VTap) {
 
 	vTapCache.setAgentLocalSegments(v.GenerateAgentLocalSegments(vTapCache))
 	vTapCache.setAgentRemoteSegments(v.GetAgentRemoteSegment(vTapCache))
+
+	vTapCache.SetAutoGRPCBufferSizeInterval(v.config.AutoGRPCBufferSizeInterval)
 
 	v.vTapCaches.Add(vTapCache)
 	v.vtapIDCaches.Add(vTapCache)
@@ -252,15 +260,19 @@ func (v *VTapInfo) loadVTapGroup() {
 		return
 	}
 
-	vtapGroupShortIDToLcuuid := make(map[string]string)
+	vtapGroupNameOrShortIDToLcuuid := make(map[string]string)
 	vtapGroupLcuuidToShortID := make(map[string]string)
+	vtapGroupLcuuidToID := make(map[string]int)
 	for _, vtapGroup := range vtapGroups {
-		vtapGroupShortIDToLcuuid[vtapGroup.ShortUUID] = vtapGroup.Lcuuid
+		vtapGroupNameOrShortIDToLcuuid[vtapGroup.Name] = vtapGroup.Lcuuid
+		vtapGroupNameOrShortIDToLcuuid[vtapGroup.ShortUUID] = vtapGroup.Lcuuid
 		vtapGroupLcuuidToShortID[vtapGroup.Lcuuid] = vtapGroup.ShortUUID
+		vtapGroupLcuuidToID[vtapGroup.Lcuuid] = vtapGroup.ID
 	}
 
-	v.vtapGroupShortIDToLcuuid = vtapGroupShortIDToLcuuid
+	v.vtapGroupNameOrShortIDToLcuuid = vtapGroupNameOrShortIDToLcuuid
 	v.vtapGroupLcuuidToShortID = vtapGroupLcuuidToShortID
+	v.vtapGroupLcuuidToID = vtapGroupLcuuidToID
 }
 
 func vtapPortToStr(port int64) string {
@@ -504,13 +516,15 @@ func (v *VTapInfo) getAgentConfigs() {
 	v.vtapGroupLcuuidToConfiguration = vtapGroupLcuuidToConfiguration
 }
 
-func (v *VTapInfo) GetVTapConfigFromShortID(shortID string) *VTapConfig {
+func (v *VTapInfo) GetVTapConfigByNameOrShortUUID(nameOrShortUUID string) *VTapConfig {
 	if v == nil {
 		return nil
 	}
-	lcuuid, ok := v.vtapGroupShortIDToLcuuid[shortID]
-	if !ok {
-		return nil
+
+	lcuuid, ok := v.vtapGroupNameOrShortIDToLcuuid[nameOrShortUUID]
+	if !ok || lcuuid == "" {
+		log.Warning(v.Logf("not found vtap group (%s) config, use default config", nameOrShortUUID))
+		lcuuid = v.getDefaultVTapGroup()
 	}
 
 	return v.vtapGroupLcuuidToConfiguration[lcuuid]
@@ -527,7 +541,7 @@ func (v *VTapInfo) GetVTapLocalConfigByShortID(shortID string) string {
 	if v == nil {
 		return ""
 	}
-	lcuuid, ok := v.vtapGroupShortIDToLcuuid[shortID]
+	lcuuid, ok := v.vtapGroupNameOrShortIDToLcuuid[shortID]
 	if !ok {
 		return ""
 	}
@@ -636,13 +650,6 @@ func (v *VTapInfo) GetSelfUpdateUrl() string {
 	return v.config.SelfUpdateUrl
 }
 
-func (v *VTapInfo) GetTridentTypeForUnknowVTap() uint16 {
-	if v == nil {
-		return 0
-	}
-	return v.config.TridentTypeForUnknowVtap
-}
-
 func (v *VTapInfo) GetGroupData() []byte {
 	if v == nil {
 		return nil
@@ -697,6 +704,20 @@ func (v *VTapInfo) GetAgentPolicyVersion(vtapID int, functions mapset.Set) uint6
 		return 0
 	}
 	return v.vTapPolicyData.getAgentPolicyVersion(vtapID, functions)
+}
+
+func (v *VTapInfo) GetCustomAppConfigByte(teamID, agentGroupID int) []byte {
+	if v == nil {
+		return nil
+	}
+	return v.customAppConfigData.getCustomAppConfigByte(teamID, agentGroupID)
+}
+
+func (v *VTapInfo) GetCustomAppConfigVersion() uint64 {
+	if v == nil {
+		return 0
+	}
+	return v.customAppConfigData.getCustomAppConfigVersion()
 }
 
 func (v *VTapInfo) CheckClusterOwner(k8sClusterMD5 string) bool {
@@ -1075,6 +1096,7 @@ func (v *VTapInfo) updateCacheToDB() {
 	for _, vtap := range dbVTaps {
 		keytoDBVTap[GetKey(vtap)] = vtap
 	}
+	vtaps := []*mysql_model.VTap{}
 	cacheKeys := v.vTapCaches.List()
 	for _, cacheKey := range cacheKeys {
 		cacheVTap := v.GetVTapCache(cacheKey)
@@ -1127,6 +1149,7 @@ func (v *VTapInfo) updateCacheToDB() {
 			dbVTap.Revision = cacheVTap.GetRevision()
 			dbVTap.BootTime = cacheVTap.GetBootTime()
 			dbVTap.MemorySize = cacheVTap.GetMemorySize()
+			dbVTap.GRPCBufferSize = cacheVTap.GetGRPCBufferSize()
 			dbVTap.Arch = cacheVTap.GetArch()
 			dbVTap.Os = cacheVTap.GetOs()
 			dbVTap.KernelVersion = cacheVTap.GetKernelVersion()
@@ -1138,6 +1161,7 @@ func (v *VTapInfo) updateCacheToDB() {
 			tridentExceptions := uint64(VTAP_TRIDENT_EXCEPTIONS_MASK) & uint64(cacheExceptions)
 			controllerException := uint64(VTAP_CONTROLLER_EXCEPTIONS_MASK) & uint64(dbVTap.Exceptions)
 			dbVTap.Exceptions = int64(controllerException | tridentExceptions)
+			dbVTap.ExceptionDescription = cacheVTap.GetExceptionDescription()
 			cacheVTap.UpdateCurControllerIP(hostIP)
 			dbVTap.CurControllerIP = cacheVTap.GetCurControllerIP()
 			dbVTap.ExpectedRevision = cacheVTap.GetExpectedRevision()
@@ -1183,15 +1207,14 @@ func (v *VTapInfo) updateCacheToDB() {
 		if filterFlag {
 			updateVTaps = append(updateVTaps, dbVTap)
 		}
+		vtaps = append(vtaps, dbVTap)
 	}
 	vTapmgr := dbmgr.DBMgr[mysql_model.VTap](v.db)
 	if len(updateVTaps) > 0 {
 		log.Infof(v.Logf("update vtap count(%d)", len(updateVTaps)))
-		err = vTapmgr.AgentUpdateBulk(updateVTaps)
-		if err != nil {
-			log.Error(v.Logf("%s", err))
-		}
+		vTapmgr.AgentUpdateBulk(v.ORGID.GetORGID(), updateVTaps)
 	}
+	statsd.AddAgentAttrCounters(v.ORGID.GetORGID(), vtaps...)
 }
 
 func (v *VTapInfo) setVTapChangedForPD() {

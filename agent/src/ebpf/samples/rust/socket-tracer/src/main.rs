@@ -26,6 +26,22 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
+use log::info;
+
+// Reference trace-utils-interp when building the Enterprise edition.
+// The purpose is to ensure that Rust links against libtrace_utils_interp-xxxx.rlib
+// during the linking stage.
+//
+// interpreter_tracer.c calls is_php_process(),
+// and this function is defined in the trace-utils-interp crate.
+//
+// However, the Rust code in socket_tracer does not directly reference
+// trace-utils-interp. As a result, Cargo considers this dependency unused
+// and excludes it from the linking stage.
+//
+// Therefore, we explicitly reference trace-utils-interp here to force
+// Cargo to include it in the final link.
+//use trace_utils_interp as _;
 
 extern "C" {
     fn print_uprobe_http2_info(data: *mut c_char, len: c_uint);
@@ -200,7 +216,7 @@ extern "C" fn debug_callback(_data: *mut c_char, len: c_int) {
     }
 }
 
-extern "C" fn socket_trace_callback(_: *mut c_void, queue_id: c_int, sd: *mut SK_BPF_DATA) {
+extern "C" fn socket_trace_callback(_: *mut c_void, queue_id: c_int, sd: *mut SK_BPF_DATA) -> c_int {
     unsafe {
         let mut proto_tag = String::from("");
         if sk_proto_safe(sd) == SOCK_DATA_OTHER {
@@ -239,6 +255,8 @@ extern "C" fn socket_trace_callback(_: *mut c_void, queue_id: c_int, sd: *mut SK
             proto_tag.push_str("TARS");
         } else if sk_proto_safe(sd) == SOCK_DATA_SOME_IP {
             proto_tag.push_str("SomeIP");
+        } else if sk_proto_safe(sd) == SOCK_DATA_ISO8583 {
+            proto_tag.push_str("ISO8583");
         } else if sk_proto_safe(sd) == SOCK_DATA_MONGO {
             proto_tag.push_str("MONGO");
         } else if sk_proto_safe(sd) == SOCK_DATA_TLS {
@@ -251,6 +269,8 @@ extern "C" fn socket_trace_callback(_: *mut c_void, queue_id: c_int, sd: *mut SK
             proto_tag.push_str("ZMTP");
         } else if sk_proto_safe(sd) == SOCK_DATA_ROCKETMQ {
             proto_tag.push_str("ROCKETMQ");
+        } else if sk_proto_safe(sd) == SOCK_DATA_WEBSPHEREMQ {
+            proto_tag.push_str("WEBSPHEREMQ");
         } else {
             proto_tag.push_str("UNSPEC");
         }
@@ -330,6 +350,8 @@ extern "C" fn socket_trace_callback(_: *mut c_void, queue_id: c_int, sd: *mut SK
 
         println!("+ --------------------------------- +\n");
     }
+
+    0
 }
 
 #[allow(dead_code)]
@@ -399,6 +421,17 @@ fn main() {
 
     let log_file = CString::new("/var/log/deepflow-ebpf.log".as_bytes()).unwrap();
     let log_file_c = log_file.as_c_str();
+    match trace_utils::protect_cpu_affinity() {
+        Ok(()) => info!("CPU affinity protected successfully"),
+        Err(e) => {
+            // Distinguish between "numad not found" (normal) and other errors
+            if e.kind() == std::io::ErrorKind::NotFound {
+                println!("numad process not found, skipping CPU affinity protection (normal)");
+            } else {
+                println!("Failed to protect CPU affinity due to unexpected error: {}", e);
+            }
+        }
+    }
     unsafe {
         enable_ebpf_protocol(SOCK_DATA_HTTP1 as c_int);
         enable_ebpf_protocol(SOCK_DATA_HTTP2 as c_int);
@@ -408,6 +441,7 @@ fn main() {
         enable_ebpf_protocol(SOCK_DATA_BRPC as c_int);
         enable_ebpf_protocol(SOCK_DATA_TARS as c_int);
         enable_ebpf_protocol(SOCK_DATA_SOME_IP as c_int);
+        enable_ebpf_protocol(SOCK_DATA_ISO8583 as c_int);
         enable_ebpf_protocol(SOCK_DATA_MYSQL as c_int);
         enable_ebpf_protocol(SOCK_DATA_POSTGRESQL as c_int);
         enable_ebpf_protocol(SOCK_DATA_REDIS as c_int);
@@ -417,6 +451,7 @@ fn main() {
         enable_ebpf_protocol(SOCK_DATA_OPENWIRE as c_int);
         enable_ebpf_protocol(SOCK_DATA_ZMTP as c_int);
         enable_ebpf_protocol(SOCK_DATA_ROCKETMQ as c_int);
+        enable_ebpf_protocol(SOCK_DATA_WEBSPHEREMQ as c_int);
         enable_ebpf_protocol(SOCK_DATA_NATS as c_int);
         enable_ebpf_protocol(SOCK_DATA_PULSAR as c_int);
         enable_ebpf_protocol(SOCK_DATA_DNS as c_int);
@@ -613,13 +648,27 @@ fn main() {
                 .as_ptr(),
         );
         set_protocol_ports_bitmap(
+            SOCK_DATA_WEBSPHEREMQ as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
+        set_protocol_ports_bitmap(
             SOCK_DATA_TLS as c_int,
             CString::new("443".as_bytes()).unwrap().as_c_str().as_ptr(),
         );
-
+        set_protocol_ports_bitmap(
+            SOCK_DATA_ISO8583 as c_int,
+            CString::new("1-65535".as_bytes())
+                .unwrap()
+                .as_c_str()
+                .as_ptr(),
+        );
 	// dpdk enable
 	// set_dpdk_trace_enabled(true);
 	// disable_kprobe_feature();
+	// set_virtual_file_collect(true);
         if running_socket_tracer(
             socket_trace_callback, /* Callback interface rust -> C */
             1, /* Number of worker threads, indicating how many user-space threads participate in data processing */
@@ -659,8 +708,20 @@ fn main() {
         // test data limit max
         set_data_limit_max(10000);
 
-        //let empty_string = CString::new("").expect("CString::new failed");
-        //if datadump_set_config(0, empty_string.as_ptr(), 0, 60, debug_callback) != 0 {
+        /*
+         pub fn datadump_set_config(
+             pid: c_int,
+             comm: *const c_char,
+             proto: c_int,
+             ipaddr: *const c_char,
+             port:  c_int,
+             timeout: c_int,
+             callback: extern "C" fn(data: *mut c_char, len: c_int),
+         ) -> c_int;
+        */
+        //let comm = CString::new("").expect("CString::new failed");
+        //let ipaddr = CString::new("").expect("CString::new failed");
+        //if datadump_set_config(0, comm.as_ptr(), 0, ipaddr.as_ptr(), 0, 60, debug_callback) != 0 {
         //    println!("datadump_set_config() error");
         //    ::std::process::exit(1);
         //}
@@ -699,6 +760,31 @@ fn main() {
             print!("socket_tracer_start() error, sleep 1s retry.\n");
             std::thread::sleep(Duration::from_secs(1));
         }
+
+        // ------ Nic Optimization ----
+        //if set_nic_optimization(true) != 0 {
+        //    println!("set_nic_optimization() error.");
+        //    ::std::process::exit(1);
+        //}
+
+        //let nic_name = CString::new("p2p2").unwrap();
+        //let irq_cpu_list = CString::new("").unwrap();
+        //let xdp_cpu_list = CString::new("").unwrap();
+
+        //if nic_optimize_config(
+        //    nic_name.as_c_str().as_ptr(),
+        //    0, // rx_ring_size
+        //    0, // rss_channel_count
+        //    irq_cpu_list.as_c_str().as_ptr(),
+        //    true, // xdp_cpu_redirect
+        //    0,    // xdp_queue_size
+        //    xdp_cpu_list.as_c_str().as_ptr(),
+        //) != 0
+        //{
+        //    println!("nic_optimize_config() error.");
+        //    ::std::process::exit(1);
+        //}
+        // ------ Nic Optimization end ----
 
         //thread::sleep(Duration::from_secs(60));
         //stop_continuous_profiler();

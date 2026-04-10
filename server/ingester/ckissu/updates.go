@@ -20,14 +20,15 @@ import (
 	"github.com/deepflowio/deepflow/server/libs/ckdb"
 )
 
-var AllColumnAdds = [][]*ColumnAdds{ColumnAdd65, ColumnAdd66, ColumnAdd70}
-var AllIndexAdds = [][]*IndexAdd{getIndexAdds(IndexAdd65)}
+var AllColumnAdds = [][]*ColumnAdds{ColumnAdd65, ColumnAdd66, ColumnAdd70, ColumnAdd71}
+var AllIndexAdds = [][]*IndexAdd{getIndexAdds(IndexAdd65), getIndexAdds(IndexAdd71)}
 var AllColumnMods = [][]*ColumnMod{}
 var AllColumnRenames = [][]*ColumnRename{getColumnRenames(ColumnRename65)}
 var AllColumnDrops = [][]*ColumnDrop{getColumnDrops(nil)}
 var AllTableModTTLs = [][]*TableModTTL{}
 var AllTableRenames = []*TableRename{}
-var AllDatasourceAdds = [][]*ColumnDatasourceAdd{getColumnDatasourceAdds(ColumnDatasourceAdd65)}
+var AllDatasourceAdds = [][]*ColumnDatasourceAdd{}
+var AllTableRecreates = []*Tables{TableRecreates71}
 
 var ColumnAdd64 = []*ColumnAdds{
 	{
@@ -96,7 +97,7 @@ var ColumnAdd65 = []*ColumnAdds{
 	},
 	{
 		Dbs:         []string{"event"},
-		Tables:      []string{"perf_event", "perf_event_local", "event", "event_local"},
+		Tables:      []string{"event", "event_local"},
 		ColumnNames: []string{"process_kname"},
 		ColumnType:  ckdb.String,
 	},
@@ -133,7 +134,7 @@ var ColumnAdd65 = []*ColumnAdds{
 	},
 	{
 		Dbs:         []string{"event"},
-		Tables:      []string{"perf_event", "perf_event_local", "event", "event_local"},
+		Tables:      []string{"event", "event_local"},
 		ColumnNames: []string{"_id"},
 		ColumnType:  ckdb.UInt64,
 	},
@@ -160,7 +161,7 @@ var ColumnAdd65 = []*ColumnAdds{
 	},
 	{
 		Dbs:          []string{"event"},
-		Tables:       []string{"event_local", "event", "perf_event", "perf_event_local"},
+		Tables:       []string{"event_local", "event"},
 		ColumnNames:  []string{"team_id"},
 		ColumnType:   ckdb.UInt16,
 		DefaultValue: "1",
@@ -246,7 +247,7 @@ var ColumnRename65 = []*ColumnRenames{
 	},
 	{
 		Db:             "event",
-		Tables:         []string{"event", "event_local", "perf_event", "perf_event_local"},
+		Tables:         []string{"event", "event_local"},
 		OldColumnNames: []string{"vtap_id"},
 		NewColumnNames: []string{"agent_id"},
 		OldColumnTypes: []ckdb.ColumnType{ckdb.UInt16},
@@ -383,5 +384,105 @@ var ColumnAdd70 = []*ColumnAdds{
 		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
 		ColumnNames: []string{"aggregated_flow_ids"},
 		ColumnType:  ckdb.String,
+	},
+}
+
+var ColumnAdd71 = []*ColumnAdds{
+	{
+		Dbs:         []string{"flow_log"},
+		Tables:      []string{"l7_flow_log", "l7_flow_log_local", "trace_tree", "trace_tree_local", "span_with_trace_id", "span_with_trace_id_local"},
+		ColumnNames: []string{"_trace_id_2"},
+		ColumnType:  ckdb.String,
+	},
+	{
+		Dbs:         []string{"flow_log"},
+		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
+		ColumnNames: []string{"is_async", "is_reversed"},
+		ColumnType:  ckdb.UInt8,
+	},
+	{
+		Dbs:         []string{"flow_log"},
+		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
+		ColumnNames: []string{"biz_code", "biz_scenario", "biz_response_code"},
+		ColumnType:  ckdb.String,
+	},
+	{
+		Dbs:         []string{"flow_log"},
+		Tables:      []string{"l7_flow_log", "l7_flow_log_local"},
+		ColumnNames: []string{"biz_protocol"},
+		ColumnType:  ckdb.LowCardinalityString,
+	},
+	{
+		Dbs:         []string{"event"},
+		Tables:      []string{"alert_event", "alert_event_local"},
+		ColumnNames: []string{"trigger_threshold", "metric_unit", "metric_value_str"},
+		ColumnType:  ckdb.String,
+	},
+	{
+		Dbs:         []string{"event"},
+		Tables:      []string{"alert_event", "alert_event_local"},
+		ColumnNames: []string{"custom_tag_names"},
+		ColumnType:  ckdb.ArrayLowCardinalityString,
+	},
+	{
+		Dbs:         []string{"event"},
+		Tables:      []string{"alert_event", "alert_event_local"},
+		ColumnNames: []string{"custom_tag_values"},
+		ColumnType:  ckdb.ArrayString,
+	},
+	{
+		Dbs: []string{"flow_metrics"},
+		Tables: []string{
+			"network.1s_local", "network.1s",
+			"network.1m_local", "network.1m",
+			"network.1h", "network.1d",
+			"network_map.1s_local", "network_map.1s",
+			"network_map.1m_local", "network_map.1m",
+			"network_map.1h", "network_map.1d",
+		},
+		ColumnNames: []string{"ooo_tx", "ooo_rx"},
+		ColumnType:  ckdb.UInt64,
+	},
+	{
+		Dbs: []string{"flow_metrics"},
+		Tables: []string{
+			"network.1h_agg", "network.1d_agg",
+			"network_map.1h_agg", "network_map.1d_agg",
+		},
+		ColumnNames: []string{"ooo_tx", "ooo_rx"},
+		ColumnType:  ckdb.UInt64,
+		IsMetrics:   true,
+		AggrFunc:    "sum",
+	},
+	{
+		Dbs:         []string{"flow_log"},
+		Tables:      []string{"l4_flow_log", "l4_flow_log_local"},
+		ColumnNames: []string{"ooo_tx", "ooo_rx", "fin_count", "init_ipid"},
+		ColumnType:  ckdb.UInt32,
+	},
+}
+
+var TableRecreates71 = &Tables{
+	Db: "flow_metrics",
+	Tables: []string{
+		"network.1h_local", "network.1h_mv",
+		"network.1d_local", "network.1d_mv",
+		"network_map.1h_local", "network_map.1h_mv",
+		"network_map.1d_local", "network_map.1d_mv",
+	},
+}
+
+var IndexAdd71 = []*IndexAdds{
+	{
+		Dbs:         []string{"flow_log"},
+		Tables:      []string{"l7_flow_log_local", "trace_tree_local", "span_with_trace_id_local"},
+		ColumnNames: []string{"_trace_id_2"},
+		IndexType:   ckdb.IndexBloomfilter,
+	},
+	{
+		Dbs:         []string{"flow_log"},
+		Tables:      []string{"l7_flow_log_local"},
+		ColumnNames: []string{"biz_code", "biz_scenario", "biz_response_code", "biz_protocol"},
+		IndexType:   ckdb.IndexBloomfilter,
 	},
 }

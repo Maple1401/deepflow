@@ -46,6 +46,7 @@ k8s.annotation             , K8s Annotation                ,
 k8s.env                    , K8s Env                       ,
 cloud.tag                  , Cloud Tag                     ,
 os.app                     , OS APP                        ,
+biz_service.group          , Biz Service Group             ,
 
 ip                         , IP Address                    ,
 is_ipv4                    , IPv4 Flag                     ,
@@ -75,4 +76,5 @@ capture_nic_type           , Capture NIC Type              , Indicates the type 
 tap_side                   , TAP Side                      , Deprecated, please use observation_point.
 observation_point          , Observation Point             , The logical location of the collection location in the traffic path, such as Cient NIC, Client Node, Server Node, Server NIC, etc.
 signal_source              , Signal Source                 ,
+
 biz_type                   , Business Type                 ,

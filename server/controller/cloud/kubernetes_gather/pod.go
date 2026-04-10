@@ -41,8 +41,8 @@ func (k *KubernetesGather) getPods() (pods []model.Pod, err error) {
 		"OpenGaussCluster":      false,
 		"ReplicationController": false,
 	}
-	for _, p := range k.k8sInfo["*v1.Pod"] {
-		pData, pErr := simplejson.NewJson([]byte(p))
+	for _, p := range k.k8sEntries["*v1.Pod"] {
+		pData, pErr := simplejson.NewJson(p)
 		if pErr != nil {
 			err = pErr
 			log.Errorf("pod initialization simplejson error: (%s)", pErr.Error(), logger.NewORGPrefix(k.orgID))
@@ -116,9 +116,15 @@ func (k *KubernetesGather) getPods() (pods []model.Pod, err error) {
 		conditionStatus := []string{}
 		for i := range conditions.MustArray() {
 			cData := conditions.GetIndex(i).MustMap()
-			cType := cData["type"].(string)
+			cType, ok := cData["type"].(string)
+			if !ok {
+				continue
+			}
 			if cType == "Ready" {
-				cStatus := cData["status"].(string)
+				cStatus, ok := cData["status"].(string)
+				if !ok {
+					continue
+				}
 				conditionStatus = append(conditionStatus, cStatus)
 			}
 		}

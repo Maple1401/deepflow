@@ -52,7 +52,7 @@ const (
 	DefaultByconityService          = "deepflow-byconity-server"
 	DefaultCKDBServicePort          = 9000
 	DefaultListenPort               = 20033
-	DefaultGrpcBufferSize           = 41943040
+	DefaultGrpcBufferSize           = 104857600
 	DefaultServiceLabelerLruCap     = 1 << 22
 	DefaultCKDBEndpointTCPPortName  = "tcp-port"
 	DefaultStatsInterval            = 10      // s
@@ -527,7 +527,7 @@ func Load(path string) *Config {
 						0,
 					},
 				},
-				[]DatabaseTable{{"flow_log", ""}, {"flow_metrics", "1s_local"}, {"profile", ""}, {"application_log", ""}},
+				[]DatabaseTable{{"flow_log", ""}, {"flow_metrics", "1s_local"}, {"profile", ""}, {"application_log", ""}, {"event", "file_event_local"}},
 			},
 			ListenPort:               DefaultListenPort,
 			GrpcBufferSize:           DefaultGrpcBufferSize,

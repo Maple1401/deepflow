@@ -19,14 +19,17 @@
  * SPDX-License-Identifier: GPL-2.0
  */
 
+#include <arpa/inet.h>
 #include <linux/bpf_perf_event.h>
 #include "config.h"
 #include "bpf_base.h"
 #include "common.h"
+#include "include/perf_profiler.h"
 #include "kernel.h"
 #include "bpf_endian.h"
 #include "perf_profiler.h"
 #include "trace_utils.h"
+#include "lua_unwind_helper.h"
 
 #define KERN_STACKID_FLAGS (0)
 #define USER_STACKID_FLAGS (0 | BPF_F_USER_STACK)
@@ -87,15 +90,25 @@ typedef struct {
 #ifdef LINUX_VER_5_2_PLUS
 typedef __u64 __raw_stack[PERF_MAX_STACK_DEPTH];
 
+// Forward declare stack_t for map definition
+typedef struct {
+	__u8 len;
+	__u64 addrs[PERF_MAX_STACK_DEPTH];
+	__u8 frame_types[PERF_MAX_STACK_DEPTH];
+	__u64 extra_data_a[PERF_MAX_STACK_DEPTH];
+	__u64 extra_data_b[PERF_MAX_STACK_DEPTH];
+} stack_t;
+
 /*
- * Stack map for dwarf stacks.
+ * Stack map for interpreter stacks (Python, PHP, V8).
+ * Now uses stack_t to store frame_types and extra_data.
  * Due to the limitation of the number of eBPF instruction in kernel, this
  * feature is suitable for Linux5.2+
  *
  * Map sizes are configured in user space program
  */
-MAP_HASH(custom_stack_map_a, __u32, __raw_stack, 1, FEATURE_FLAG_DWARF_UNWINDING)
-MAP_HASH(custom_stack_map_b, __u32, __raw_stack, 1, FEATURE_FLAG_DWARF_UNWINDING)
+MAP_HASH(custom_stack_map_a, __u32, stack_t, 1, FEATURE_FLAG_DWARF_UNWINDING)
+MAP_HASH(custom_stack_map_b, __u32, stack_t, 1, FEATURE_FLAG_DWARF_UNWINDING)
 
 /*
  * The following maps are used for DWARF based unwinding
@@ -115,9 +128,7 @@ MAP_HASH(unwind_entry_shard_table, __u32, unwind_entry_shard_t, 1, FEATURE_FLAG_
  */
 MAP_ARRAY(unwind_sysinfo, __u32, unwind_sysinfo_t, 1, FEATURE_FLAG_DWARF_UNWINDING)
 
-MAP_HASH(python_tstate_addr_map, __u32, __u64, 65536, FEATURE_FLAG_PROFILE)
-MAP_HASH(python_unwind_info_map, __u32, python_unwind_info_t, 65536, FEATURE_FLAG_PROFILE)
-MAP_HASH(python_offsets_map, __u8, python_offsets_t, 1, FEATURE_FLAG_PROFILE)
+// Interpreter maps moved to interpreter_unwind.bpf.c
 
 struct bpf_map_def SEC("maps") __symbol_table = {
     .type = BPF_MAP_TYPE_LRU_HASH,
@@ -132,12 +143,12 @@ typedef struct {
 	__u64 ip;
 	__u64 sp;
 	__u64 bp;
+#if defined(__aarch64__)
+	__u64 lr;  // Link Register (X30) for ARM64 - holds return address
+#endif
 } regs_t;
 
-typedef struct {
-	__u8 len;
-	__u64 addrs[PERF_MAX_STACK_DEPTH];
-} stack_t;
+// Note: stack_t is defined earlier (line 91-96) for use in custom_stack_map
 
 typedef struct {
 	struct stack_trace_key_t key;
@@ -150,6 +161,25 @@ typedef struct {
 
 	void *py_frame_ptr;
 	__u8 py_offsets_id;
+	__u16 py_version;            // Python version encoded as 0xMMmm (e.g. 3.11 -> 0x030B)
+	__u64 py_none_struct_addr;   // _Py_NoneStruct address (0 if < 3.13)
+
+	void *lua_L_ptr;
+	__u8  lua_is_jit;       // 0: Lua 5.x, 1: LuaJIT
+	__u32 lua_offsets_id;
+	void *luajit_frame;
+	void *luajit_bot;
+	__s32 luajit_skip_depth;
+
+	void *php_execute_data_ptr;
+	__u8 php_offsets_id;
+	__u64 php_jit_return_address; // JIT return address for PHP 8+ mixed stacks
+	__u8 php_has_jit;
+	__u8 php_jit_retry_done;      // Flag to prevent infinite retry loop
+	__u8 _php_reserved_pad[6];
+
+	__u64 php_execute_ex_start;   // execute_ex start (abs addr)
+	__u64 php_execute_ex_end;     // execute_ex end (exclusive)
 } unwind_state_t;
 
 /*
@@ -158,18 +188,42 @@ typedef struct {
 static inline __attribute__ ((always_inline))
 void reset_unwind_state(unwind_state_t * state)
 {
+	// Use __builtin_memset for struct members to efficiently zero out data
 	__builtin_memset(&state->key, 0, sizeof(struct stack_trace_key_t));
 	state->runs = 0;
 	__builtin_memset(&state->regs, 0, sizeof(regs_t));
-	__builtin_memset(&state->stack, 0, sizeof(stack_t));
-	__builtin_memset(&state->intp_stack, 0, sizeof(stack_t));
+
+	// Clear stack_t arrays to prevent stale data from being processed
+	// Use memset for each member separately to avoid verifier issues with large structs
+	state->stack.len = 0;
+	__builtin_memset(state->stack.addrs, 0, sizeof(state->stack.addrs));
+	__builtin_memset(state->stack.frame_types, 0, sizeof(state->stack.frame_types));
+	__builtin_memset(state->stack.extra_data_a, 0, sizeof(state->stack.extra_data_a));
+	__builtin_memset(state->stack.extra_data_b, 0, sizeof(state->stack.extra_data_b));
+
+	state->intp_stack.len = 0;
+	__builtin_memset(state->intp_stack.addrs, 0, sizeof(state->intp_stack.addrs));
+	__builtin_memset(state->intp_stack.frame_types, 0, sizeof(state->intp_stack.frame_types));
+	__builtin_memset(state->intp_stack.extra_data_a, 0, sizeof(state->intp_stack.extra_data_a));
+	__builtin_memset(state->intp_stack.extra_data_b, 0, sizeof(state->intp_stack.extra_data_b));
+
+	state->py_frame_ptr = NULL;
+	state->py_offsets_id = 0;
+	state->py_version = 0;
+	state->py_none_struct_addr = 0;
+	state->luajit_frame = NULL;
+	state->luajit_bot = NULL;
+	state->luajit_skip_depth = 0;
+	state->php_execute_data_ptr = NULL;
+	state->php_offsets_id = 0;
+	state->php_jit_return_address = 0;
+	state->php_has_jit = 0;
+	state->php_jit_retry_done = 0;
+	state->php_execute_ex_start = 0;
+	state->php_execute_ex_end = 0;
 }
 
 MAP_PERARRAY(heap, __u32, unwind_state_t, 1, FEATURE_FLAG_PROFILE_ONCPU | FEATURE_FLAG_PROFILE_OFFCPU | FEATURE_FLAG_PROFILE_MEMORY | FEATURE_DWARF_UNWINDING)
-
-static inline __attribute__ ((always_inline))
-int pre_python_unwind(void *ctx, unwind_state_t * state,
-		 map_group_t *maps, int jmp_idx);
 
 #else
 
@@ -177,20 +231,35 @@ typedef void stack_t;		// placeholder
 
 #endif
 
+
 /*
  * Used for communication between user space and BPF to control the
  * switching between buffer a and buffer b.
  */
 MAP_ARRAY(profiler_state_map, __u32, __u64, PROFILER_CNT, FEATURE_FLAG_PROFILE_ONCPU)
 #ifdef LINUX_VER_5_2_PLUS
+// Add a frame to the stack with optional extra data
+// frame_type: FRAME_TYPE_NORMAL, FRAME_TYPE_V8, etc.
+// addr: primary address (or pointer_and_type for V8)
+// extra_a, extra_b: additional data (for V8: delta_or_marker, return_address)
 static inline __attribute__ ((always_inline))
-void add_frame(stack_t * stack, __u64 frame)
+void add_frame_ex(stack_t * stack, __u8 frame_type, __u64 addr, __u64 extra_a, __u64 extra_b)
 {
 	__u8 len = stack->len;
 	if (len >= 0 && len < PERF_MAX_STACK_DEPTH) {
-		stack->addrs[len] = frame;
+		stack->addrs[len] = addr;
+		stack->frame_types[len] = frame_type;
+		stack->extra_data_a[len] = extra_a;
+		stack->extra_data_b[len] = extra_b;
 		stack->len++;
 	}
+}
+
+// Legacy add_frame for Python/Dwarf compatibility (encodes data in single u64)
+static inline __attribute__ ((always_inline))
+void add_frame(stack_t * stack, __u64 frame)
+{
+	add_frame_ex(stack, FRAME_TYPE_NORMAL, frame, 0, 0);
 }
 
 static inline __u32 rol32(__u32 word, unsigned int shift)
@@ -252,6 +321,8 @@ static inline __attribute__ ((always_inline))
 __u32 hash_stack(stack_t * stack, __u32 initval)
 {
 	__u32 *k = (__u32 *) stack->addrs;
+	__u32 *ka = (__u32 *) stack->extra_data_a;
+	__u32 *kb = (__u32 *) stack->extra_data_b;
 	__u32 length = stack->len * sizeof(__u64) / sizeof(__u32);
 
 	__u32 a, b, c;
@@ -266,18 +337,30 @@ __u32 hash_stack(stack_t * stack, __u32 initval)
 			break;
 		}
 		a += k[offset];
+		a += ka[offset];
+		a += kb[offset];
 		b += k[offset + 1];
+		b += ka[offset + 1];
+		b += kb[offset + 1];
 		c += k[offset + 2];
+		c += ka[offset + 2];
+		c += kb[offset + 2];
 		__jhash_mix(a, b, c);
 	}
 
 	switch (length - offset) {
 	case 3:
 		c += k[offset + 2];
+		c += ka[offset + 2];
+		c += kb[offset + 2];
 	case 2:
 		b += k[offset + 1];
-	case 1:
-		a += k[offset + 0];
+		b += ka[offset + 1];
+		b += kb[offset + 1];
+		case 1:
+		a += k[offset];
+		a += ka[offset];
+		a += kb[offset];
 		__jhash_final(a, b, c);
 	case 0:		/* Nothing left to add */
 		break;
@@ -312,8 +395,9 @@ __u32 get_stackid(struct bpf_map_def *stack_map, stack_t * stack)
 	}
 
 	__u32 id = hash_stack(stack, 0) & (STACK_MAP_ENTRIES - 1);
+	// Store the complete stack_t structure (not just addrs) to preserve frame_types and extra_data
 	int ret =
-	    bpf_map_update_elem(stack_map, &id, stack->addrs, BPF_NOEXIST);
+	    bpf_map_update_elem(stack_map, &id, stack, BPF_NOEXIST);
 	if (ret == 0) {
 		return id;
 	}
@@ -321,20 +405,31 @@ __u32 get_stackid(struct bpf_map_def *stack_map, stack_t * stack)
 		return ret;
 	}
 
-	__u64 *addrs = bpf_map_lookup_elem(stack_map, &id);
-	if (!addrs) {
+	// On collision, check if the existing stack matches
+	stack_t *existing = bpf_map_lookup_elem(stack_map, &id);
+	if (!existing) {
 		return -EEXIST;
 	}
 
+	// Compare stacks properly (not just addrs array)
 	int i;
 #pragma unroll
 	for (i = 0; i < PERF_MAX_STACK_DEPTH && i < stack->len; i++) {
-		if (addrs[i] != stack->addrs[i]) {
+		if (existing->addrs[i] != stack->addrs[i]) {
+			return -EEXIST;
+		}
+		if (existing->frame_types[i] != stack->frame_types[i]) {
+			return -EEXIST;
+		}
+		if (existing->extra_data_a[i] != stack->extra_data_a[i]) {
+			return -EEXIST;
+		}
+		if (existing->extra_data_b[i] != stack->extra_data_b[i]) {
 			return -EEXIST;
 		}
 	}
 
-	if (i == PERF_MAX_STACK_DEPTH || addrs[i] == 0) {
+	if (i == PERF_MAX_STACK_DEPTH || existing->addrs[i] == 0) {
 		return id;
 	}
 	return -EEXIST;
@@ -370,11 +465,37 @@ int get_usermode_regs(struct pt_regs *regs, regs_t * dst)
 		dst->ip = PT_REGS_IP(regs);
 		dst->sp = PT_REGS_SP(regs);
 		dst->bp = PT_REGS_FP(regs);
+#if defined(__aarch64__)
+		// On ARM64, also capture the Link Register (X30) which holds return address
+		dst->lr = regs->regs[30];
+#endif
 		return 0;
 	}
 
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+#ifdef LINUX_VER_5_15_PLUS
+	// bpf_task_pt_regs requires a BTF-typed task_struct pointer.
+	struct task_struct *task_btf = bpf_get_current_task_btf();
+	struct pt_regs *pt_regs_addr = NULL;
+	if (task_btf) {
+		pt_regs_addr = bpf_task_pt_regs(task_btf);
+	}
+	if (pt_regs_addr) {
+		struct pt_regs user_regs;
+		int ret = bpf_probe_read_kernel(&user_regs, sizeof(user_regs),
+						(void *)pt_regs_addr);
+		if (!ret) {
+			dst->ip = PT_REGS_IP(&user_regs);
+			dst->sp = PT_REGS_SP(&user_regs);
+			dst->bp = PT_REGS_FP(&user_regs);
+#if defined(__aarch64__)
+			dst->lr = user_regs.regs[30];
+#endif
+			return 0;
+		}
+	}
+#endif
 
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	__u32 zero = 0;
 	unwind_sysinfo_t *sysinfo = unwind_sysinfo__lookup(&zero);
 	if (!sysinfo) {
@@ -404,6 +525,10 @@ int get_usermode_regs(struct pt_regs *regs, regs_t * dst)
 	dst->ip = PT_REGS_IP(&user_regs);
 	dst->sp = PT_REGS_SP(&user_regs);
 	dst->bp = PT_REGS_FP(&user_regs);
+#if defined(__aarch64__)
+	// On ARM64, capture LR from the saved user registers
+	dst->lr = user_regs.regs[30];
+#endif
 	return 0;
 }
 
@@ -461,10 +586,17 @@ int collect_stack_and_send_output(struct pt_regs *ctx,
 	}
 
 	if (key->flags & STACK_TRACE_FLAGS_DWARF && stack != NULL) {
-		key->userstack = get_stackid(stack_map, stack);
+		if (stack->len > 0) {
+			key->userstack = get_stackid(stack_map, stack);
+		} else {
+			// DWARF unwinding failed (likely JIT code with no debug info)
+			// Clear DWARF flag to allow fallback to FP-based unwinding via bpf_get_stackid()
+			key->flags &= ~STACK_TRACE_FLAGS_DWARF;
+		}
 	}
 
 	if (intp_stack != NULL && intp_stack->len > 0) {
+		// Reuse stack_map (custom_stack_map_a/b) for interpreter stack
 		key->intpstack = get_stackid(stack_map, intp_stack);
 	}
 #endif
@@ -547,6 +679,12 @@ static map_group_t oncpu_maps = {.state = &NAME(profiler_state_map),
 	.progs_jmp = &NAME(cp_progs_jmp_pe_map),
 };
 
+#ifdef LINUX_VER_5_2_PLUS
+#define STACK_FRAMES_PER_RUN 16
+#define UNWIND_PROG_MAX_RUN 8
+#include "interpreter_unwind.h"
+#endif
+
 PERF_EVENT_PROG(oncpu_profile) (struct bpf_perf_event_data * ctx) {
 	__u32 count_idx = ENABLE_IDX;
 	__u64 *enable_ptr = profiler_state_map__lookup(&count_idx);
@@ -561,8 +699,9 @@ PERF_EVENT_PROG(oncpu_profile) (struct bpf_perf_event_data * ctx) {
 		return 0;
 	}
 
-	if (unlikely(*enable_ptr == 0))
+	if (unlikely(*enable_ptr == 0)) {
 		return 0;
+	}
 
 #ifdef LINUX_VER_5_2_PLUS
 	__u32 zero = 0;
@@ -593,13 +732,7 @@ PERF_EVENT_PROG(oncpu_profile) (struct bpf_perf_event_data * ctx) {
 	key->timestamp = bpf_ktime_get_ns();
 
 #ifdef LINUX_VER_5_2_PLUS
-	python_unwind_info_t *py_unwind_info =
-	    python_unwind_info_map__lookup(&state->key.tgid);
-	if (py_unwind_info != NULL) {
-		pre_python_unwind(ctx, state, &oncpu_maps, PROG_PYTHON_UNWIND_PE_IDX);
-	}
-
-	// TODO: 如果 tgid（PID）在 lua 的 map 中，调用 lua 剖析的程序（可以参考 pre_python_unwind 的实现）
+	extended_interpreter_unwind(ctx, state, &oncpu_maps);
 
 	process_shard_list_t *shard_list =
 	    process_shard_list_table__lookup(&key->tgid);
@@ -608,10 +741,10 @@ PERF_EVENT_PROG(oncpu_profile) (struct bpf_perf_event_data * ctx) {
 
 		int ret =
 		    get_usermode_regs((struct pt_regs *)&ctx->regs,
-				      &state->regs);
+		                      &state->regs);
 		if (ret == 0) {
 			bpf_tail_call(ctx, &NAME(cp_progs_jmp_pe_map),
-				      PROG_DWARF_UNWIND_PE_IDX);
+			              PROG_DWARF_UNWIND_PE_IDX);
 		}
 		__sync_fetch_and_add(error_count_ptr, 1);
 		return 0;
@@ -624,7 +757,7 @@ PERF_EVENT_PROG(oncpu_profile) (struct bpf_perf_event_data * ctx) {
 
 #ifdef LINUX_VER_5_2_PLUS
 
-#define SHARD_BSEARCH_LOOPS 9	// 2^9 = 512 > UNWIND_SHARDS_PER_PROCESS
+#define SHARD_BSEARCH_LOOPS 10	// 2^10 = 1024 >= UNWIND_SHARDS_PER_PROCESS
 #define ENTRY_BSEARCH_LOOPS 17	// 2^17 = 131072 > UNWIND_ENTRIES_PER_SHARD
 
 #define LOOP_EXHAUSTED 0xFFFFFFFF
@@ -683,9 +816,6 @@ __u32 find_unwind_entry(unwind_entry_t * list, __u16 left, __u16 right,
 	return LOOP_EXHAUSTED;
 }
 
-#define STACK_FRAMES_PER_RUN 16
-#define UNWIND_PROG_MAX_RUN 8
-
 static inline __attribute__ ((always_inline))
 int dwarf_unwind(void *ctx, unwind_state_t * state,
 		 map_group_t *maps, int jmp_idx)
@@ -733,6 +863,15 @@ int dwarf_unwind(void *ctx, unwind_state_t * state,
 			shard_info = shard_list->entries + shard_index;
 			shard =
 			    unwind_entry_shard_table__lookup(&shard_info->id);
+			// Validate that IP is actually within the shard's valid range
+			// If IP < offset+pc_min or IP >= offset+pc_max, this shard doesn't cover our IP
+			// This can happen when IP is in special regions like [uprobes] that have no DWARF info
+			if (regs->ip < shard_info->offset + shard_info->pc_min ||
+			    regs->ip >= shard_info->offset + shard_info->pc_max) {
+				// bpf_debug("[DWARF] frame#%d: ip=%lx not in shard range, stopping",
+				//         state->stack.len, regs->ip);
+				goto finish;
+			}
 		}
 		// bpf_debug("frame#%d", state->stack.len);
 		// bpf_debug("ip=%lx bp=%lx sp=%lx", regs->ip, regs->bp, regs->sp);
@@ -781,11 +920,52 @@ int dwarf_unwind(void *ctx, unwind_state_t * state,
 			__sync_fetch_and_add(error_count_ptr, 1);
 			goto finish;
 		}
+		// Recover Return Address (IP for next frame)
+		// On x86_64: RA is always at CFA-8 (fixed convention)
+		// On ARM64: RA may be in LR register or saved on stack at variable offset
+#if defined(__aarch64__)
+		// ARM64: Use ra_type to determine how to recover return address
+		switch (ue->ra_type) {
+		case RA_TYPE_LR_REGISTER:
+			// RA is in the Link Register (leaf function or not yet saved)
+			// Safety check: LR should only be valid for the first (leaf) frame.
+			// If LR is 0, it means it was already used or is invalid.
+			if (regs->lr == 0) {
+				// LR was already consumed or is invalid, cannot continue
+				goto finish;
+			}
+			regs->ip = regs->lr;
+			break;
+		case RA_TYPE_CFA_OFFSET:
+			// RA is saved on stack at CFA + ra_offset
+			{
+				__u64 ra_addr = cfa;
+				if (ue->ra_offset < 0) {
+					ra_addr -= ((-ue->ra_offset) << 3);
+				} else {
+					ra_addr += (ue->ra_offset << 3);
+				}
+				if (bpf_probe_read_user(&regs->ip, sizeof(__u64), (void *)ra_addr) != 0) {
+					__sync_fetch_and_add(error_count_ptr, 1);
+					goto finish;
+				}
+			}
+			break;
+		default:
+			// RA_TYPE_UNSUPPORTED - cannot unwind
+			__sync_fetch_and_add(error_count_ptr, 1);
+			goto finish;
+		}
+#else
+		// x86_64: RA is always at CFA-8
 		if (bpf_probe_read_user
 		    (&regs->ip, sizeof(__u64), (void *)(cfa - 8)) != 0) {
 			__sync_fetch_and_add(error_count_ptr, 1);
 			goto finish;
 		}
+#endif
+
+		// Recover Frame Pointer (BP/FP for next frame)
 		__u64 rbp_addr = cfa;
 		switch (ue->rbp_type) {
 		case REG_TYPE_UNDEFINED:
@@ -808,6 +988,19 @@ int dwarf_unwind(void *ctx, unwind_state_t * state,
 			__sync_fetch_and_add(error_count_ptr, 1);
 			goto finish;
 		}
+#if defined(__aarch64__)
+		// ARM64: After using LR for RA recovery, ALWAYS invalidate it.
+		// Reason: LR register can only be valid for the FIRST (leaf) frame.
+		// After that, each caller's return address is in ITS OWN saved LR on stack,
+		// which will be read via CFA_OFFSET in the next iteration.
+		// If we don't invalidate LR, and the next frame's DWARF info incorrectly
+		// says LR_REGISTER, we would reuse the same LR value causing duplicate frames.
+		if (ue->ra_type == RA_TYPE_LR_REGISTER) {
+			// We just used LR for this frame. Invalidate it for next frame.
+			regs->lr = 0;
+		}
+		// If ra_type was CFA_OFFSET, we already read RA from stack, LR was already 0 or unused.
+#endif
 		regs->sp = cfa;
 	}
 
@@ -828,234 +1021,12 @@ PROGPE(dwarf_unwind) (struct bpf_perf_event_data * ctx) {
 
 	dwarf_unwind(ctx, state, &oncpu_maps, PROG_DWARF_UNWIND_PE_IDX);
 
+	// After DWARF unwinding, check via enterprise hook (PHP/V8)
+	extended_dwarf_after_unwind(ctx, state, &oncpu_maps);
+
+	// Not an interpreter process or tail call failed, go to output
 	bpf_tail_call(ctx, &NAME(cp_progs_jmp_pe_map),
 		      PROG_ONCPU_OUTPUT_PE_IDX);
-	return 0;
-}
-
-static inline __attribute__ ((always_inline))
-__u32 read_symbol(python_offsets_t * py_offsets, void *frame_ptr,
-		  void *code_ptr, symbol_t * symbol)
-{
-	void *ptr;
-	bpf_probe_read_user(&ptr, sizeof(ptr),
-			    code_ptr + py_offsets->code_object.co_varnames);
-	bpf_probe_read_user(&ptr, sizeof(ptr),
-			    ptr + py_offsets->tuple_object.ob_item);
-	bpf_probe_read_user_str(&symbol->method_name,
-				sizeof(symbol->method_name),
-				ptr + py_offsets->string.data);
-
-	char self_str[4] = "self";
-	char cls_str[4] = "cls";
-	bool first_self = *(__s32 *) symbol->method_name == *(__s32 *) self_str;
-	bool first_cls = *(__s32 *) symbol->method_name == *(__s32 *) cls_str;
-
-	if (first_self || first_cls) {
-		bpf_probe_read_user(&ptr, sizeof(ptr),
-				    frame_ptr +
-				    py_offsets->frame_object.f_localsplus);
-		if (first_self) {
-			bpf_probe_read_user(&ptr, sizeof(ptr),
-					    ptr + py_offsets->object.ob_type);
-		}
-		bpf_probe_read_user(&ptr, sizeof(ptr),
-				    ptr + py_offsets->type_object.tp_name);
-		bpf_probe_read_user_str(&symbol->class_name,
-					sizeof(symbol->class_name), ptr);
-	}
-	// bpf_probe_read_user(&ptr, sizeof(ptr), code_ptr + py_offsets->code_object.co_filename);
-	// bpf_probe_read_user_str(&symbol->path, sizeof(symbol->path), ptr + py_offsets->string.data);
-
-	bpf_probe_read_user(&ptr, sizeof(ptr),
-			    code_ptr + py_offsets->code_object.co_name);
-	bpf_probe_read_user_str(&symbol->method_name,
-				sizeof(symbol->method_name),
-				ptr + py_offsets->string.data);
-
-	__u32 lineno;
-	bpf_probe_read_user(&lineno, sizeof(lineno),
-			    code_ptr + py_offsets->code_object.co_firstlineno);
-
-	return lineno;
-}
-
-#define MAX_CPUS 200
-
-static inline __attribute__ ((always_inline))
-__u32 get_symbol_id(symbol_t * symbol)
-{
-	__u32 *found_id = bpf_map_lookup_elem(&__symbol_table, symbol);
-	if (found_id) {
-		return *found_id;
-	}
-
-	__u32 zero = 0;
-	__u32 *sym_idx = symbol_index_storage__lookup(&zero);
-	if (sym_idx == NULL) {
-		return 0;
-	}
-
-	__u32 id = *sym_idx * MAX_CPUS + bpf_get_smp_processor_id();
-	*sym_idx += 1;
-
-	int err = bpf_map_update_elem(&__symbol_table, symbol, &id, BPF_ANY);
-	if (err) {
-		return 0;
-	}
-	return id;
-}
-
-static inline __attribute__ ((always_inline))
-int pre_python_unwind(void *ctx, unwind_state_t * state,
-		 map_group_t *maps, int jmp_idx) {
-	python_unwind_info_t *py_unwind_info =
-	    python_unwind_info_map__lookup(&state->key.tgid);
-	if (py_unwind_info == NULL) {
-        return 0;
-	}
-	state->py_offsets_id = py_unwind_info->offsets_id;
-
-	python_offsets_t *py_offsets =
-	    python_offsets_map__lookup(&state->py_offsets_id);
-	if (py_offsets == NULL) {
-        return 0;
-	}
-
-	void *thread_state;
-	if (bpf_probe_read_user
-	    (&thread_state, sizeof(thread_state),
-	     (void *)py_unwind_info->thread_state_address) != 0) {
-        return 0;
-	}
-
-	if (thread_state == NULL) {
-        __u64 *addr = python_tstate_addr_map__lookup(&state->key.tgid);
-        if (addr && *addr != 0) {
-            thread_state = (void *)*addr;
-        } else {
-            return 0;
-		}
-	}
-
-	if (bpf_probe_read_user
-	    (&state->py_frame_ptr, sizeof(state->py_frame_ptr),
-	     thread_state + py_offsets->thread_state.frame) != 0) {
-        return 0;
-	}
-
-	bpf_tail_call(ctx, maps->progs_jmp, jmp_idx);
-	return 0;
-}
-
-static inline __attribute__ ((always_inline))
-int python_unwind(void *ctx, unwind_state_t * state,
-		 map_group_t *maps, int jmp_idx) {
-	if (state->py_frame_ptr == NULL) {
-		goto output;
-	}
-
-	python_offsets_t *py_offsets =
-	    python_offsets_map__lookup(&state->py_offsets_id);
-	if (py_offsets == NULL) {
-		goto output;
-	}
-
-	symbol_t symbol;
-
-#pragma unroll
-	for (int i = 0; i < STACK_FRAMES_PER_RUN; i++) {
-		void *code_ptr = 0;
-		if (bpf_probe_read_user
-		    (&code_ptr, sizeof(code_ptr),
-		     state->py_frame_ptr + py_offsets->frame_object.f_code) !=
-		    0) {
-			goto output;
-		}
-		if (code_ptr == NULL) {
-			goto output;
-		}
-
-		__builtin_memset(&symbol, 0, sizeof(symbol));
-		__u64 lineno =
-		    read_symbol(py_offsets, state->py_frame_ptr, code_ptr,
-				&symbol);
-		if (lineno == 0) {
-			goto output;
-		}
-		__u64 symbol_id = get_symbol_id(&symbol);
-		add_frame(&state->intp_stack, (lineno << 32) | symbol_id);
-
-		if (bpf_probe_read_user(&state->py_frame_ptr, sizeof(void *),
-					state->py_frame_ptr +
-					py_offsets->frame_object.f_back) != 0) {
-			goto output;
-		}
-		if (!state->py_frame_ptr) {
-			goto output;
-		}
-	}
-
-	if (++state->runs < UNWIND_PROG_MAX_RUN) {
-		bpf_tail_call(ctx, maps->progs_jmp, jmp_idx);
-	}
-
-output:
-	return 0;
-}
-
-PROGPE(python_unwind) (struct bpf_perf_event_data * ctx) {
-	__u32 count_idx;
-
-	count_idx = ERROR_IDX;
-	__u64 *error_count_ptr = profiler_state_map__lookup(&count_idx);
-
-	if (error_count_ptr == NULL) {
-		count_idx = ERROR_IDX;
-		__u64 err_val = 1;
-		profiler_state_map__update(&count_idx, &err_val);
-		return -1;
-	}
-
-	__u32 zero = 0;
-	unwind_state_t *state = heap__lookup(&zero);
-	if (state == NULL) {
-		return 0;
-	}
-
-	python_unwind(ctx, state, &oncpu_maps, PROG_PYTHON_UNWIND_PE_IDX);
-
-	process_shard_list_t *shard_list =
-	    process_shard_list_table__lookup(&state->key.tgid);
-	if (shard_list != NULL) {
-		state->key.flags |= STACK_TRACE_FLAGS_DWARF;
-
-		int ret =
-		    get_usermode_regs((struct pt_regs *)&ctx->regs,
-				      &state->regs);
-		if (ret == 0) {
-			bpf_tail_call(ctx, &NAME(cp_progs_jmp_pe_map),
-				      PROG_DWARF_UNWIND_PE_IDX);
-		}
-		__sync_fetch_and_add(error_count_ptr, 1);
-		return 0;
-	}
-
-	bpf_tail_call(ctx, &NAME(cp_progs_jmp_pe_map),
-		      PROG_ONCPU_OUTPUT_PE_IDX);
-	return 0;
-}
-
-URETPROG(python_save_tstate_addr) (struct pt_regs * ctx) {
-	__u64 ret = PT_REGS_RC(ctx);
-	__u32 tgid = bpf_get_current_pid_tgid() >> 32;
-
-	__u64 *addr = python_tstate_addr_map__lookup(&tgid);
-	if (addr) {
-		*addr = ret;
-	} else {
-		python_tstate_addr_map__update(&tgid, &ret);
-	}
 	return 0;
 }
 
@@ -1069,5 +1040,6 @@ PROGPE(oncpu_output) (struct bpf_perf_event_data * ctx) {
 					     &state->stack, &state->intp_stack,
 					     &oncpu_maps, false);
 }
+
 
 #endif

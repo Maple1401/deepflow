@@ -21,9 +21,54 @@
 
 // Default value set when file read/write latency timestamp rollback occurs.
 #define TIME_ROLLBACK_DEFAULT_LATENCY_NS 50000
- 
-static __inline bool is_regular_file(int fd,
-				     struct member_fields_offset *off_ptr)
+#define FILE_TYPE_ERROR    (-1)  /* Error or invalid file */
+#define FILE_TYPE_REGULAR   0    /* Regular VFS-backed file */
+#define FILE_TYPE_VIRTUAL   1    /* Non-VFS / virtual / special file */
+
+static __inline int check_file_type(void *file, struct member_fields_offset *offset)
+{
+	if (!file || !offset)
+		return FILE_TYPE_ERROR;
+
+	/*
+	 * Determine whether a file belongs to a regular VFS filesystem
+	 * based on the existence of file->f_op->read_iter.
+	 *
+	 * file->f_op->read_iter != NULL:
+	 *   Regular VFS-backed files, including:
+	 *     - ext4 / xfs / btrfs
+	 *     - NFS / CIFS / CephFS
+	 *     - tmpfs / ramfs
+	 *     - overlayfs
+	 *     - fuse
+	 *
+	 * file->f_op->read_iter == NULL:
+	 *   Non-VFS or special kernel objects, including:
+	 *     - IPC objects (pipe / fifo)
+	 *     - socket-related objects
+	 *     - anon_inode derived objects
+	 *     - some procfs / sysfs entries
+	 *     - certain character devices or special driver files
+	 *     - kernel objects without regular VFS file semantics
+	 */
+	void *f_op, *read_iter;
+	bpf_probe_read_kernel(&f_op, sizeof(f_op),
+			      file + offset->struct_file_f_op_offset);
+	if (f_op == NULL)
+		return FILE_TYPE_ERROR;
+
+	bpf_probe_read_kernel(&read_iter, sizeof(read_iter),
+			      f_op +
+			      offset->struct_file_operations_read_iter_offset);
+	if (read_iter == NULL)
+		return FILE_TYPE_VIRTUAL;
+
+	return FILE_TYPE_REGULAR;
+}
+
+static __inline bool is_readable_file(int fd,
+				      bool disable_vfile_collect,
+				      struct member_fields_offset *off_ptr)
 {
 	struct member_fields_offset *offset = off_ptr;
 	if (offset == NULL) {
@@ -31,8 +76,160 @@ static __inline bool is_regular_file(int fd,
 		offset = members_offset__lookup(&k0);
 	}
 	void *file = fd_to_file(fd, offset);
+	if (file == NULL)
+		return false;
+
+	if (disable_vfile_collect &&
+	    check_file_type(file, offset) != FILE_TYPE_REGULAR)
+			return false;
+
+	/*
+	 * Further ensure that it is a regular inode file, exclude
+	 * socket / pipe / anon_inode / directories / symbolic links.
+	 */
 	__u32 i_mode = file_to_i_mode(file, offset);
 	return S_ISREG(i_mode);
+}
+
+static __inline void *get_mount_ptr(void *file,
+				    struct member_fields_offset *off_ptr)
+{
+	void *vfsmount = NULL;
+
+	/*
+	 * struct_file_f_path_offset: Starting from Linux 6.5, this offset has
+	 * undergone significant changes and automatic inference is not supported.
+	 */
+
+	// file -> path -> vfsmount
+	bpf_probe_read_kernel(&vfsmount, sizeof(vfsmount),
+			      file + off_ptr->struct_file_f_path_offset +
+			      off_ptr->struct_path_mnt_offset);
+	if (vfsmount == NULL)
+		return NULL;
+
+	// `vfsmount` is embedded in `struct mount`
+	return (vfsmount - off_ptr->struct_mount_mnt_offset);
+}
+
+static __inline void get_mount_ids(void *file,
+				   struct __io_event_buffer *buffer,
+				   struct member_fields_offset *off_ptr)
+{
+	void *mount, *mnt_ns = NULL;
+	buffer->mntns_id = 0;
+	buffer->mnt_id = -1;
+	mount = get_mount_ptr(file, off_ptr);
+	if (mount == NULL)
+		return;
+
+	//bpf_debug("mount_mnt_id_offset 0x%x\n", off_ptr->struct_mount_mnt_id_offset);
+	if (off_ptr->struct_mount_mnt_id_offset != INVALID_OFFSET) {
+		bpf_probe_read_kernel(&buffer->mnt_id, sizeof(buffer->mnt_id),
+				      mount +
+				      off_ptr->struct_mount_mnt_id_offset);
+	}
+
+	if (off_ptr->struct_mount_mnt_ns_offset == INVALID_OFFSET)
+		return;
+
+	bpf_probe_read_kernel(&mnt_ns, sizeof(mnt_ns),
+			      mount + off_ptr->struct_mount_mnt_ns_offset);
+	if (mnt_ns == NULL)
+		return;
+
+	// mnt_namespace -> ns_common -> inum
+	bpf_probe_read_kernel(&buffer->mntns_id, sizeof(buffer->mntns_id),
+			      mnt_ns + off_ptr->struct_mnt_namespace_ns_offset +
+			      off_ptr->struct_ns_common_inum_offset);
+}
+
+static __inline int infer_mount_offset(int fd,
+				       struct member_fields_offset *off_ptr)
+{
+	// The inference has been completed.
+	if (off_ptr->files_infer_done)
+		return 0;
+
+	__u32 k0 = 0;
+	struct adapt_kern_data *adapt_data;
+	adapt_data = adapt_kern_data_map__lookup(&k0);
+	if (!adapt_data)
+		goto error;
+
+	// The inference is limited to the threads we have designated.
+	if (adapt_data->id != bpf_get_current_pid_tgid())
+		return -1;
+
+	void *file = fd_to_file(fd, off_ptr);
+	if (file == NULL)
+		goto error;
+
+	void *mount = get_mount_ptr(file, off_ptr);
+	if (mount == NULL)
+		goto error;
+
+	int i, mnt_id = 0;
+	bool found = false;
+	__u16 mnt_id_offsets[] = { 0x10c, 0x114, 0x11c, 0x124 };
+#pragma unroll
+	for (i = 0; i < ARRAY_SIZE(mnt_id_offsets); i++) {
+		bpf_probe_read_kernel(&mnt_id, sizeof(mnt_id),
+				      mount + mnt_id_offsets[i]);
+		if (mnt_id == adapt_data->mnt_id) {
+			found = true;
+			break;
+		}
+	}
+
+	if (found) {
+		off_ptr->struct_mount_mnt_id_offset = mnt_id_offsets[i];
+	} else {
+		off_ptr->struct_mount_mnt_id_offset = INVALID_OFFSET;
+	}
+
+	__u32 mntns_id = 0;
+	void *mnt_ns = NULL;
+	__u16 mnt_ns_offset[] = { 0xe0, 0xe8 };
+	off_ptr->struct_mount_mnt_ns_offset = INVALID_OFFSET;
+	off_ptr->struct_mnt_namespace_ns_offset = INVALID_OFFSET;
+#pragma unroll
+	for (i = 0; i < ARRAY_SIZE(mnt_ns_offset); i++) {
+		bpf_probe_read_kernel(&mnt_ns, sizeof(mnt_ns),
+				      mount + mnt_ns_offset[i]);
+		if (mnt_ns == NULL)
+			continue;
+		// mnt_namespace -> ns_common -> inum
+		bpf_probe_read_kernel(&mntns_id, sizeof(mntns_id),
+				      mnt_ns +
+				      off_ptr->struct_ns_common_inum_offset);
+		if (mntns_id == adapt_data->mntns_id) {
+			found = true;
+			off_ptr->struct_mount_mnt_ns_offset = mnt_ns_offset[i];
+			off_ptr->struct_mnt_namespace_ns_offset = 0;
+			off_ptr->files_infer_done = 1;
+			return 0;
+		}
+		bpf_probe_read_kernel(&mntns_id, sizeof(mntns_id),
+				      mnt_ns + 0x8 +
+				      off_ptr->struct_ns_common_inum_offset);
+		if (mntns_id == adapt_data->mntns_id) {
+			off_ptr->struct_mount_mnt_ns_offset = mnt_ns_offset[i];
+			off_ptr->struct_mnt_namespace_ns_offset = 0x8;
+			off_ptr->files_infer_done = 1;
+			return 0;
+		}
+	}
+
+	off_ptr->files_infer_done = 1;
+	return -1;
+
+error:
+	off_ptr->struct_mount_mnt_id_offset = INVALID_OFFSET;
+	off_ptr->struct_mount_mnt_ns_offset = INVALID_OFFSET;
+	off_ptr->struct_mnt_namespace_ns_offset = INVALID_OFFSET;
+	off_ptr->files_infer_done = 1;
+	return -1;
 }
 
 static __inline void set_file_metric_data(struct __io_event_buffer *buffer,
@@ -40,7 +237,7 @@ static __inline void set_file_metric_data(struct __io_event_buffer *buffer,
 					  int fd,
 					  struct member_fields_offset *off_ptr)
 {
-#define MAX_DIRECTORY_DEPTH 19
+#define MAX_DIRECTORY_DEPTH 18
 
 	struct member_fields_offset *offset = off_ptr;
 	if (offset == NULL) {
@@ -90,6 +287,8 @@ static __inline void set_file_metric_data(struct __io_event_buffer *buffer,
 	void *dentry = NULL, *parent;
 	bpf_probe_read_kernel(&dentry, sizeof(dentry),
 			      file + offset->struct_file_dentry_offset);
+	get_mount_ids(file, buffer, offset);
+	//bpf_debug("buffer->mnt_id %d\n", buffer->mnt_id);
 	buffer->len = 0;
 #pragma unroll
 	for (int i = 0; i < MAX_DIRECTORY_DEPTH; i++) {
@@ -152,7 +351,9 @@ static __inline int trace_io_event_common(void *ctx,
 
 	int data_max_sz = tracer_ctx->data_limit_max;
 
-	if (!is_regular_file(data_args->fd, offset)) {
+	if (!is_readable_file(data_args->fd,
+			      !tracer_ctx->virtual_file_collect_enabled,
+			      offset)) {
 		return -1;
 	}
 
@@ -202,6 +403,7 @@ static __inline int trace_io_event_common(void *ctx,
 	v->pid = (__u32) pid_tgid;
 	v->coroutine_id = trace_key.goid;
 	v->timestamp = data_args->enter_ts;
+	v->cap_timestamp = bpf_ktime_get_ns();
 	v->syscall_len = sizeof(*buffer);
 	v->source = DATA_SOURCE_IO_EVENT;
 	v->thread_trace_id = trace_id;
@@ -239,6 +441,9 @@ static __inline int do_sys_enter_pread(int fd, enum syscall_src_func fn)
 	if (!offset)
 		return 0;
 
+	// Attempt to infer file-related structure offsets.
+	infer_mount_offset(fd, offset);
+
 	__u64 id = bpf_get_current_pid_tgid();
 	// Stash arguments.
 	struct data_args_t read_args = {};
@@ -252,7 +457,7 @@ static __inline int do_sys_enter_pread(int fd, enum syscall_src_func fn)
 #ifdef SUPPORTS_KPROBE_ONLY
 //ssize_t ksys_pread64(unsigned int fd, char __user *buf, size_t count,
 //                     loff_t pos)
-KPROG(ksys_pread64) (struct pt_regs *ctx) {
+KPROG(ksys_pread64) (struct pt_regs * ctx) {
 	int fd = (unsigned int)PT_REGS_PARM1(ctx);
 	return do_sys_enter_pread(fd, SYSCALL_FUNC_PREAD64);
 }
@@ -262,25 +467,25 @@ KPROG(ksys_pread64) (struct pt_regs *ctx) {
  * static ssize_t do_preadv(unsigned long fd, const struct iovec __user *vec,
  *			    unsigned long vlen, loff_t pos, rwf_t flags);
  */
-KPROG(do_preadv) (struct pt_regs *ctx) {
+KPROG(do_preadv) (struct pt_regs * ctx) {
 	int fd = (unsigned int)PT_REGS_PARM1(ctx);
 	return do_sys_enter_pread(fd, SYSCALL_FUNC_PREADV);
 }
 #else
 // /sys/kernel/debug/tracing/events/syscalls/sys_enter_pread64/format
-TP_SYSCALL_PROG(enter_pread64) (struct syscall_comm_enter_ctx *ctx) {
+TP_SYSCALL_PROG(enter_pread64) (struct syscall_comm_enter_ctx * ctx) {
 	int fd = ctx->fd;
 	return do_sys_enter_pread(fd, SYSCALL_FUNC_PREAD64);
 }
 
 // /sys/kernel/debug/tracing/events/syscalls/sys_enter_preadv/format
-TP_SYSCALL_PROG(enter_preadv) (struct syscall_comm_enter_ctx *ctx) {
+TP_SYSCALL_PROG(enter_preadv) (struct syscall_comm_enter_ctx * ctx) {
 	int fd = ctx->fd;
 	return do_sys_enter_pread(fd, SYSCALL_FUNC_PREADV);
 }
 
 // /sys/kernel/debug/tracing/events/syscalls/sys_enter_preadv2/format
-TP_SYSCALL_PROG(enter_preadv2) (struct syscall_comm_enter_ctx *ctx) {
+TP_SYSCALL_PROG(enter_preadv2) (struct syscall_comm_enter_ctx * ctx) {
 	int fd = ctx->fd;
 	return do_sys_enter_pread(fd, SYSCALL_FUNC_PREADV2);
 }
@@ -306,28 +511,28 @@ static __inline int do_sys_exit_pread(void *ctx, ssize_t bytes_count)
 }
 
 #ifdef SUPPORTS_KPROBE_ONLY
-KRETPROG(ksys_pread64) (struct pt_regs *ctx) {
+KRETPROG(ksys_pread64) (struct pt_regs * ctx) {
 	ssize_t bytes_count = PT_REGS_RC(ctx);
 	return do_sys_exit_pread((void *)ctx, bytes_count);
 }
 
-KRETPROG(do_preadv) (struct pt_regs *ctx) {
+KRETPROG(do_preadv) (struct pt_regs * ctx) {
 	ssize_t bytes_count = PT_REGS_RC(ctx);
 	return do_sys_exit_pread((void *)ctx, bytes_count);
 }
 #else
 // /sys/kernel/debug/tracing/events/syscalls/sys_exit_pwrite64/format
-TP_SYSCALL_PROG(exit_pread64) (struct syscall_comm_exit_ctx *ctx) {
+TP_SYSCALL_PROG(exit_pread64) (struct syscall_comm_exit_ctx * ctx) {
 	return do_sys_exit_pread((void *)ctx, (ssize_t) ctx->ret);
 }
 
 // /sys/kernel/debug/tracing/events/syscalls/sys_exit_pwritev/format
-TP_SYSCALL_PROG(exit_preadv) (struct syscall_comm_exit_ctx *ctx) {
+TP_SYSCALL_PROG(exit_preadv) (struct syscall_comm_exit_ctx * ctx) {
 	return do_sys_exit_pread((void *)ctx, (ssize_t) ctx->ret);
 }
 
 // /sys/kernel/debug/tracing/events/syscalls/sys_exit_pwritev2/format
-TP_SYSCALL_PROG(exit_preadv2) (struct syscall_comm_exit_ctx *ctx) {
+TP_SYSCALL_PROG(exit_preadv2) (struct syscall_comm_exit_ctx * ctx) {
 	return do_sys_exit_pread((void *)ctx, (ssize_t) ctx->ret);
 }
 #endif /* SUPPORTS_KPROBE_ONLY */
@@ -352,7 +557,7 @@ static __inline int do_sys_enter_pwrite(int fd, enum syscall_src_func fn)
 //ssize_t ksys_pwrite64(unsigned int fd, const char __user *buf,
 //                      size_t count, loff_t pos);
 #ifdef SUPPORTS_KPROBE_ONLY
-KPROG(ksys_pwrite64) (struct pt_regs *ctx) {
+KPROG(ksys_pwrite64) (struct pt_regs * ctx) {
 	int fd = (int)PT_REGS_PARM1(ctx);
 	return do_sys_enter_pwrite(fd, SYSCALL_FUNC_PWRITE64);
 }
@@ -362,25 +567,25 @@ KPROG(ksys_pwrite64) (struct pt_regs *ctx) {
  * static ssize_t do_pwritev(unsigned long fd, const struct iovec __user *vec,
  *                           unsigned long vlen, loff_t pos, rwf_t flags);
  */
-KPROG(do_pwritev) (struct pt_regs *ctx) {
+KPROG(do_pwritev) (struct pt_regs * ctx) {
 	int fd = (int)PT_REGS_PARM1(ctx);
 	return do_sys_enter_pwrite(fd, SYSCALL_FUNC_PWRITEV);
 }
 #else
 // /sys/kernel/debug/tracing/events/syscalls/sys_enter_pwrite64/format
-TP_SYSCALL_PROG(enter_pwrite64) (struct syscall_comm_enter_ctx *ctx) {
+TP_SYSCALL_PROG(enter_pwrite64) (struct syscall_comm_enter_ctx * ctx) {
 	int fd = ctx->fd;
 	return do_sys_enter_pwrite(fd, SYSCALL_FUNC_PWRITE64);
 }
 
 // /sys/kernel/debug/tracing/events/syscalls/sys_enter_pwritev/format
-TP_SYSCALL_PROG(enter_pwritev) (struct syscall_comm_enter_ctx *ctx) {
+TP_SYSCALL_PROG(enter_pwritev) (struct syscall_comm_enter_ctx * ctx) {
 	int fd = ctx->fd;
 	return do_sys_enter_pwrite(fd, SYSCALL_FUNC_PWRITEV);
 }
 
 // /sys/kernel/debug/tracing/events/syscalls/sys_enter_pwritev2/format
-TP_SYSCALL_PROG(enter_pwritev2) (struct syscall_comm_enter_ctx *ctx) {
+TP_SYSCALL_PROG(enter_pwritev2) (struct syscall_comm_enter_ctx * ctx) {
 	int fd = ctx->fd;
 	return do_sys_enter_pwrite(fd, SYSCALL_FUNC_PWRITEV2);
 }
@@ -407,28 +612,28 @@ static __inline int do_sys_exit_pwrite(void *ctx, ssize_t bytes_count)
 }
 
 #ifdef SUPPORTS_KPROBE_ONLY
-KRETPROG(ksys_pwrite64) (struct pt_regs *ctx) {
+KRETPROG(ksys_pwrite64) (struct pt_regs * ctx) {
 	ssize_t bytes_count = PT_REGS_RC(ctx);
 	return do_sys_exit_pwrite((void *)ctx, bytes_count);
 }
 
-KRETPROG(do_pwritev) (struct pt_regs *ctx) {
+KRETPROG(do_pwritev) (struct pt_regs * ctx) {
 	ssize_t bytes_count = PT_REGS_RC(ctx);
 	return do_sys_exit_pwrite((void *)ctx, bytes_count);
 }
 #else
 // /sys/kernel/debug/tracing/events/syscalls/sys_exit_pwrite64/format
-TP_SYSCALL_PROG(exit_pwrite64) (struct syscall_comm_exit_ctx *ctx) {
+TP_SYSCALL_PROG(exit_pwrite64) (struct syscall_comm_exit_ctx * ctx) {
 	return do_sys_exit_pwrite((void *)ctx, (ssize_t) ctx->ret);
 }
 
 // /sys/kernel/debug/tracing/events/syscalls/sys_exit_pwritev/format
-TP_SYSCALL_PROG(exit_pwritev) (struct syscall_comm_exit_ctx *ctx) {
+TP_SYSCALL_PROG(exit_pwritev) (struct syscall_comm_exit_ctx * ctx) {
 	return do_sys_exit_pwrite((void *)ctx, (ssize_t) ctx->ret);
 }
 
 // /sys/kernel/debug/tracing/events/syscalls/sys_exit_pwritev2/format
-TP_SYSCALL_PROG(exit_pwritev2) (struct syscall_comm_exit_ctx *ctx) {
+TP_SYSCALL_PROG(exit_pwritev2) (struct syscall_comm_exit_ctx * ctx) {
 	return do_sys_exit_pwrite((void *)ctx, (ssize_t) ctx->ret);
 }
 #endif /* SUPPORTS_KPROBE_ONLY */

@@ -123,14 +123,17 @@ func (s *Server) appendRegistrant() []registrant.Registrant {
 		router.NewPlugin(),
 		router.NewMail(),
 		router.NewDatabase(s.controllerConfig),
-		router.NewAgentGroupConfig(s.controllerConfig),
 
 		// icon
 		router.NewIcon(s.controllerConfig),
+		// ck version
+		router.NewCKVersion(),
 
 		// resource
 		resource.NewDomain(s.controllerConfig),
 
+		agent.NewAgentGroupConfig(s.controllerConfig),
+		agent.NewAgentGroupConfigChangelog(s.controllerConfig),
 		agent.NewAgentCMD(s.controllerConfig),
 		vtap.NewAgentCMD(s.controllerConfig), // TODO remove
 	}

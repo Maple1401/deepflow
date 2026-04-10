@@ -203,7 +203,7 @@ func (u *UniversalTagsManager) QueryUniversalTags(
 ) *UniversalTags {
 	tagMaps := u.universalTagMaps[orgId]
 	if tagMaps == nil {
-		return nil
+		return &UniversalTags{}
 	}
 	tags := &UniversalTags{
 		Region:       tagMaps.regionMap[regionID],
@@ -260,10 +260,16 @@ func (u *UniversalTagsManager) getAuto(orgId uint16, autoType DeviceType, autoID
 			return ip6.String()
 		}
 	}
+	if u.universalTagMaps[orgId] == nil {
+		return ""
+	}
 	return u.universalTagMaps[orgId].deviceMap[uint64(autoType)<<32|uint64(autoID)]
 }
 
 func (u *UniversalTagsManager) QueryCustomK8sLabels(orgId uint16, podID uint32) Labels {
+	if u.universalTagMaps[orgId] == nil {
+		return nil
+	}
 	return u.universalTagMaps[orgId].podK8SLabelMap[podID]
 }
 

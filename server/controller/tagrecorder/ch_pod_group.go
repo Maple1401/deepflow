@@ -77,7 +77,7 @@ func (c *ChPodGroup) sourceToTarget(md *message.Metadata, source *metadbmodel.Po
 		ChIDBase:     metadbmodel.ChIDBase{ID: source.ID},
 		Name:         sourceName,
 		IconID:       iconID,
-		PodGroupType: RESOURCE_POD_GROUP_TYPE_MAP[source.Type],
+		PodGroupType: common.RESOURCE_POD_GROUP_TYPE_MAP[source.Type],
 		PodClusterID: source.PodClusterID,
 		PodNsID:      source.PodNamespaceID,
 		TeamID:       md.GetTeamID(),
@@ -89,25 +89,6 @@ func (c *ChPodGroup) sourceToTarget(md *message.Metadata, source *metadbmodel.Po
 
 // onResourceUpdated implements SubscriberDataGenerator
 func (c *ChPodGroup) onResourceUpdated(md *message.Metadata, updateMessage *message.UpdatedPodGroup) {
-	db := md.GetDB()
-	fieldsUpdate := updateMessage.GetFields().(*message.UpdatedPodGroupFields)
-	newSource := updateMessage.GetNewMetadbItem().(*metadbmodel.PodGroup)
-	sourceID := newSource.ID
-	updateInfo := make(map[string]interface{})
-
-	if fieldsUpdate.Name.IsDifferent() {
-		updateInfo["name"] = fieldsUpdate.Name.GetNew()
-	}
-	if fieldsUpdate.Type.IsDifferent() {
-		updateInfo["pod_group_type"] = RESOURCE_POD_GROUP_TYPE_MAP[fieldsUpdate.Type.GetNew()]
-	}
-	if fieldsUpdate.PodClusterID.IsDifferent() {
-		updateInfo["pod_cluster_id"] = fieldsUpdate.PodClusterID.GetNew()
-	}
-	if fieldsUpdate.PodNamespaceID.IsDifferent() {
-		updateInfo["pod_ns_id"] = fieldsUpdate.PodNamespaceID.GetNew()
-	}
-	c.updateOrSync(db, IDKey{ID: sourceID}, updateInfo)
 }
 
 // softDeletedTargetsUpdated implements SubscriberDataGenerator

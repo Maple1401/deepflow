@@ -39,6 +39,7 @@ k8s.label                  , K8s Label                  ,
 k8s.annotation             , K8s Annotation             ,
 k8s.env                    , K8s Env                    ,
 cloud.tag                  , Cloud Tag                  ,
+biz_service.group          , 服务组                     ,
 
 ip                         , IP 地址                    ,
 is_ipv4                    , IPv4 标志                  ,
@@ -53,7 +54,7 @@ span_name                  , Span名称                    ,
 vtap                       , 采集器                      , 已废弃，请使用 agent。
 agent                      , 采集器                      ,
 
-profile_value_unit         , 单位                        ,
+profile_value_unit         , 指标单位                    ,
 profile_event_type         , 剖析类型                    ,
 profile_create_timestamp   , 聚合时间                    ,
 profile_in_timestamp       , 写入时间                    ,

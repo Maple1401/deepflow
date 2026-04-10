@@ -24,7 +24,27 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/recorder/cache/diffbase"
 	"github.com/deepflowio/deepflow/server/controller/recorder/db"
 	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message"
+	"github.com/deepflowio/deepflow/server/controller/recorder/pubsub/message/types"
 )
+
+// PodClusterMessageFactory PodCluster资源的消息工厂
+type PodClusterMessageFactory struct{}
+
+func (f *PodClusterMessageFactory) CreateAddedMessage() types.Added {
+	return &message.AddedPodClusters{}
+}
+
+func (f *PodClusterMessageFactory) CreateUpdatedMessage() types.Updated {
+	return &message.UpdatedPodCluster{}
+}
+
+func (f *PodClusterMessageFactory) CreateDeletedMessage() types.Deleted {
+	return &message.DeletedPodClusters{}
+}
+
+func (f *PodClusterMessageFactory) CreateUpdatedFields() types.UpdatedFields {
+	return &message.UpdatedPodClusterFields{}
+}
 
 type PodCluster struct {
 	UpdaterBase[
@@ -32,36 +52,12 @@ type PodCluster struct {
 		*diffbase.PodCluster,
 		*metadbmodel.PodCluster,
 		metadbmodel.PodCluster,
-		*message.AddedPodClusters,
-		message.AddedPodClusters,
-		message.AddNoneAddition,
-		*message.UpdatedPodCluster,
-		message.UpdatedPodCluster,
-		*message.UpdatedPodClusterFields,
-		message.UpdatedPodClusterFields,
-		*message.DeletedPodClusters,
-		message.DeletedPodClusters,
-		message.DeleteNoneAddition]
+	]
 }
 
 func NewPodCluster(wholeCache *cache.Cache, cloudData []cloudmodel.PodCluster) *PodCluster {
 	updater := &PodCluster{
-		newUpdaterBase[
-			cloudmodel.PodCluster,
-			*diffbase.PodCluster,
-			*metadbmodel.PodCluster,
-			metadbmodel.PodCluster,
-			*message.AddedPodClusters,
-			message.AddedPodClusters,
-			message.AddNoneAddition,
-			*message.UpdatedPodCluster,
-			message.UpdatedPodCluster,
-			*message.UpdatedPodClusterFields,
-			message.UpdatedPodClusterFields,
-			*message.DeletedPodClusters,
-			message.DeletedPodClusters,
-			message.DeleteNoneAddition,
-		](
+		UpdaterBase: newUpdaterBase(
 			ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN,
 			wholeCache,
 			db.NewPodCluster().SetMetadata(wholeCache.GetMetadata()),
@@ -69,13 +65,13 @@ func NewPodCluster(wholeCache *cache.Cache, cloudData []cloudmodel.PodCluster) *
 			cloudData,
 		),
 	}
-	updater.dataGenerator = updater
-	return updater
-}
+	updater.setDataGenerator(updater)
 
-func (c *PodCluster) getDiffBaseByCloudItem(cloudItem *cloudmodel.PodCluster) (diffBase *diffbase.PodCluster, exists bool) {
-	diffBase, exists = c.diffBaseData[cloudItem.Lcuuid]
-	return
+	if !hasMessageFactory(updater.resourceType) {
+		RegisterMessageFactory(updater.resourceType, &PodClusterMessageFactory{})
+	}
+
+	return updater
 }
 
 func (c *PodCluster) generateDBItemToAdd(cloudItem *cloudmodel.PodCluster) (*metadbmodel.PodCluster, bool) {
@@ -87,6 +83,7 @@ func (c *PodCluster) generateDBItemToAdd(cloudItem *cloudmodel.PodCluster) (*met
 		), c.metadata.LogPrefixes)
 		return nil, false
 	}
+
 	dbItem := &metadbmodel.PodCluster{
 		Name:        cloudItem.Name,
 		Version:     cloudItem.Version,
@@ -96,12 +93,13 @@ func (c *PodCluster) generateDBItemToAdd(cloudItem *cloudmodel.PodCluster) (*met
 		Region:      cloudItem.RegionLcuuid,
 		AZ:          cloudItem.AZLcuuid,
 		VPCID:       vpcID,
+		UID:         ctrlrcommon.GenerateResourceShortUUID(ctrlrcommon.RESOURCE_TYPE_POD_CLUSTER_EN),
 	}
 	dbItem.Lcuuid = cloudItem.Lcuuid
 	return dbItem, true
 }
 
-func (c *PodCluster) generateUpdateInfo(diffBase *diffbase.PodCluster, cloudItem *cloudmodel.PodCluster) (*message.UpdatedPodClusterFields, map[string]interface{}, bool) {
+func (c *PodCluster) generateUpdateInfo(diffBase *diffbase.PodCluster, cloudItem *cloudmodel.PodCluster) (types.UpdatedFields, map[string]interface{}, bool) {
 	structInfo := new(message.UpdatedPodClusterFields)
 	mapInfo := make(map[string]interface{})
 	if diffBase.Name != cloudItem.Name {
@@ -116,10 +114,6 @@ func (c *PodCluster) generateUpdateInfo(diffBase *diffbase.PodCluster, cloudItem
 		mapInfo["region"] = cloudItem.RegionLcuuid
 		structInfo.RegionLcuuid.Set(diffBase.RegionLcuuid, cloudItem.RegionLcuuid)
 	}
-	// if diffBase.AZLcuuid != cloudItem.AZLcuuid {
-	// 	mapInfo["az"] = cloudItem.AZLcuuid
-	// 	structInfo.AZLcuuid.Set(diffBase.AZLcuuid, cloudItem.AZLcuuid)
-	// }
 
 	return structInfo, mapInfo, len(mapInfo) > 0
 }

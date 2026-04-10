@@ -22,7 +22,12 @@ import (
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+
+	"github.com/deepflowio/deepflow/server/controller/db/metadb/model"
+	"github.com/deepflowio/deepflow/server/libs/logger"
 )
+
+var log = logger.MustGetLogger("trisolaris.dbmgr")
 
 type _DBMgr[M any] struct {
 	*_BaseMgr
@@ -42,6 +47,13 @@ func DBMgr[M any](db *gorm.DB) *_DBMgr[M] {
 // Gets 获取批量结果
 func (obj *_DBMgr[M]) Gets() (results []*M, err error) {
 	err = obj.DB.WithContext(obj.ctx).Model(obj.m).Find(&results).Error
+
+	return
+}
+
+// OrderIDGets 按照 id 升序获取批量结果
+func (obj *_DBMgr[M]) OrderIDGets() (results []*M, err error) {
+	err = obj.DB.WithContext(obj.ctx).Model(obj.m).Order("id asc").Find(&results).Error
 
 	return
 }
@@ -117,8 +129,10 @@ func (obj *_DBMgr[M]) GetBatchFromName(name string) (result []*M, err error) {
 // InsertiIgnore
 func (obj *_DBMgr[M]) InsertIgnore(data *M) (err error) {
 	db := obj.DB.WithContext(obj.ctx)
-	err = db.Clauses(clause.OnConflict{DoNothing: true}).Create(data).Error
-
+	err = db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "cluster_id"}},
+		DoNothing: true,
+	}).Create(data).Error
 	return
 }
 
@@ -216,22 +230,33 @@ func (obj *_DBMgr[M]) InsertBulk(data []*M) (err error) {
 	return
 }
 
-func (obj *_DBMgr[M]) AgentUpdateBulk(data []*M) (err error) {
+func (obj *_DBMgr[M]) AgentUpdateBulk(orgID int, data []*model.VTap) {
 	for _, d := range data {
-		err = obj.DB.WithContext(obj.ctx).Model(&d).Omit("id", "enable", "name",
+		err := obj.DB.WithContext(obj.ctx).Model(&d).Omit("id", "enable", "name",
 			"analyzer_ip", "controller_ip", "launch_server", "launch_server_id",
 			"az", "region", "vtap_group_lcuuid", "license_type", "license_functions",
-			"enable_features", "disable_features", "follow_group_features").Select("*").Updates(d).Error
+			"enable_features", "disable_features", "follow_group_features",
+			"synced_controller_at").Select("*").Updates(d).Error
+		if err != nil {
+			log.Error(err.Error(), logger.NewORGPrefix(orgID))
+		}
+		err = obj.DB.WithContext(obj.ctx).Model(&d).Where(
+			"id = ? AND synced_controller_at < ?", d.GetID(), d.SyncedControllerAt).Update(
+			"synced_controller_at", d.SyncedControllerAt).Error
+		if err != nil {
+			log.Error(err.Error(), logger.NewORGPrefix(orgID))
+		}
 	}
-	return
 }
 
-func (obj *_DBMgr[M]) AnalyzerUpdateBulk(data []*M) (err error) {
+func (obj *_DBMgr[M]) AnalyzerUpdateBulk(orgID int, data []*M) {
 	for _, d := range data {
-		err = obj.DB.WithContext(obj.ctx).Model(&d).Omit("id", "state", "nat_ip",
-			"vtap_max").Select("*").Updates(d).Error
+		err := obj.DB.WithContext(obj.ctx).Model(&d).Omit("id", "state", "nat_ip", "vtap_max").Select("*").Updates(d).Error
+		if err != nil {
+			log.Error(err.Error(), logger.NewORGPrefix(orgID))
+		}
 	}
-	return
+
 }
 
 func (obj *_DBMgr[M]) Updates(data *M, values map[string]interface{}) (err error) {

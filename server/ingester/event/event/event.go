@@ -39,11 +39,12 @@ import (
 )
 
 type Event struct {
-	Config          *config.Config
-	ResourceEventor *Eventor
-	PerfEventor     *Eventor
-	AlertEventor    *Eventor
-	K8sEventor      *Eventor
+	Config             *config.Config
+	ResourceEventor    *Eventor
+	FileEventor        *Eventor
+	AlertEventor       *Eventor
+	K8sEventor         *Eventor
+	AlertRecordEventor *Eventor
 }
 
 type Eventor struct {
@@ -59,7 +60,7 @@ func NewEvent(config *config.Config, resourceEventQueue *queue.OverwriteQueue, r
 		return nil, err
 	}
 
-	perfEventor, err := NewEventor(common.PERF_EVENT, config, recv, manager, platformDataManager, exporters)
+	fileEventor, err := NewEventor(common.FILE_EVENT, config, recv, manager, platformDataManager, exporters)
 	if err != nil {
 		return nil, err
 	}
@@ -74,12 +75,18 @@ func NewEvent(config *config.Config, resourceEventQueue *queue.OverwriteQueue, r
 		return nil, err
 	}
 
+	alertRecordEventor, err := NewAlertRecordEventor(config, recv, manager, platformDataManager.GetMasterPlatformInfoTable())
+	if err != nil {
+		return nil, err
+	}
+
 	return &Event{
-		Config:          config,
-		ResourceEventor: resourceEventor,
-		PerfEventor:     perfEventor,
-		AlertEventor:    alertEventor,
-		K8sEventor:      k8sEventor,
+		Config:             config,
+		ResourceEventor:    resourceEventor,
+		FileEventor:        fileEventor,
+		AlertEventor:       alertEventor,
+		K8sEventor:         k8sEventor,
+		AlertRecordEventor: alertRecordEventor,
 	}, nil
 }
 
@@ -133,14 +140,44 @@ func NewAlertEventor(config *config.Config, recv *receiver.Receiver, manager *dr
 	}, nil
 }
 
+func NewAlertRecordEventor(config *config.Config, recv *receiver.Receiver, manager *dropletqueue.Manager, platformTable *grpc.PlatformInfoTable) (*Eventor, error) {
+	eventMsg := datatype.MESSAGE_TYPE_ALERT_RECORD
+	decodeQueues := manager.NewQueues(
+		"1-receive-to-decode-"+eventMsg.String(),
+		2<<17, // 128k, default alert record queue-size
+		1,     // default alert record queue-count
+		1,
+		libqueue.OptionFlushIndicator(3*time.Second),
+		libqueue.OptionRelease(func(p interface{}) { receiver.ReleaseRecvBuffer(p.(*receiver.RecvBuffer)) }))
+	recv.RegistHandler(eventMsg, decodeQueues, 1)
+
+	eventWriter, err := dbwriter.NewAlertRecordWriter(config)
+	if err != nil {
+		return nil, err
+	}
+	d := decoder.NewDecoder(
+		0,
+		common.ALERT_RECORD,
+		queue.QueueReader(decodeQueues.FixedMultiQueue[0]),
+		eventWriter,
+		platformTable,
+		nil,
+		config,
+	)
+	return &Eventor{
+		Config:   config,
+		Decoders: []*decoder.Decoder{d},
+	}, nil
+}
+
 func NewEventor(eventType common.EventType, config *config.Config, recv *receiver.Receiver, manager *dropletqueue.Manager, platformDataManager *grpc.PlatformDataManager, exporters *exporters.Exporters) (*Eventor, error) {
 	var queueCount, queueSize int
 	var msgType datatype.MessageType
 
 	switch eventType {
-	case common.PERF_EVENT:
-		queueCount = config.PerfDecoderQueueCount
-		queueSize = config.PerfDecoderQueueSize
+	case common.FILE_EVENT:
+		queueCount = config.FileEventDecoderQueueCount
+		queueSize = config.FileEventDecoderQueueSize
 		msgType = datatype.MESSAGE_TYPE_PROC_EVENT
 	case common.K8S_EVENT:
 		queueCount = config.K8sDecoderQueueCount
@@ -207,15 +244,17 @@ func (e *Eventor) Close() {
 
 func (e *Event) Start() {
 	e.ResourceEventor.Start()
-	e.PerfEventor.Start()
+	e.FileEventor.Start()
 	e.AlertEventor.Start()
 	e.K8sEventor.Start()
+	e.AlertRecordEventor.Start()
 }
 
 func (e *Event) Close() error {
 	e.ResourceEventor.Close()
-	e.PerfEventor.Close()
+	e.FileEventor.Close()
 	e.AlertEventor.Close()
 	e.K8sEventor.Close()
+	e.AlertRecordEventor.Close()
 	return nil
 }

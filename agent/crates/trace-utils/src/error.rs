@@ -31,6 +31,22 @@ pub enum Error {
     BadInterpreterType(u32, &'static str),
     #[error("Process#{0} {1} v{2} not supported")]
     BadInterpreterVersion(u32, &'static str, Version),
+    #[error("Process#{0} not found or not accessible")]
+    ProcessNotFound(u32),
+    #[error("Invalid pointer address: 0x{0:x}")]
+    InvalidPointer(u64),
+    #[error("Invalid or corrupted data")]
+    InvalidData,
+    #[error("Kernel symbol not found: {0}")]
+    KernelSymbolNotFound(String),
+    #[error("BTF parsing failed: {0}")]
+    BtfParseError(String),
+    #[error("Architecture not supported: {0}")]
+    UnsupportedArch(String),
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("{0}")]
+    Msg(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

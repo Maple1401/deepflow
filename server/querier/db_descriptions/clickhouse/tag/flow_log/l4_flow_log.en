@@ -48,6 +48,7 @@ k8s.annotation        , K8s Annotation                    ,
 k8s.env               , K8s Env                           ,
 cloud.tag             , Cloud Tag                         ,
 os.app                , OS APP                            ,
+biz_service.group     , Biz Service Group                 ,
 
 eth_type              , Ether Type                        ,
 vlan                  , VLAN TAG                          ,
@@ -94,6 +95,7 @@ end_time              , End Time                          , Unit: microseconds. 
 close_type            , Flow Close Type                   ,
 status                , Status                            , Determined by the close_type and protocol: Normal/ForceReport/Non-TCP timeout/Disconnected* = Normal, Client* = Client Error, Server*/TCP Timeout = Server Error, others = Unknown.
 is_new_flow           , New Flow Flag                     ,
+init_ipid             , Initial IPID                      ,
 
 signal_source         , Signal Source                     ,
 tap                   , Traffic Access Point              , Deprecated，please use capture_network_type.

@@ -1,0 +1,8 @@
+# Field              , DisplayName             , Unit , Description
+count                , Event Count             ,      ,
+bytes                , Bytes                   , Byte ,
+
+duration             , Total Duration          , us   ,
+max_duration         , Max Duration            , us   ,
+avg_duration         , Avg Duration            , us   ,
+row                  , Row Count               ,      ,

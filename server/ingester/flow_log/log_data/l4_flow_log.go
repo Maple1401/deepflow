@@ -279,6 +279,7 @@ type FlowInfo struct {
 	FlowID       uint64 `json:"flow_id" category:"$tag" sub:"flow_info"`
 
 	AggregatedFlowIDs string
+	InitIpid          uint32 `json:"init_ipid" category:"$tag" sub:"flow_info"`
 
 	TapType     uint8  `json:"capture_network_type_id" category:"$tag" sub:"capture_info"`
 	NatSource   uint8  `json:"nat_source" category:"$tag" sub:"capture_info" enumfile:"nat_source"`
@@ -315,6 +316,7 @@ var FlowInfoColumns = []*ckdb.Column{
 	ckdb.NewColumn("signal_source", ckdb.UInt16),
 	ckdb.NewColumn("flow_id", ckdb.UInt64).SetIndex(ckdb.IndexMinmax),
 	ckdb.NewColumn("aggregated_flow_ids", ckdb.String).SetIndex(ckdb.IndexTokenbf),
+	ckdb.NewColumn("init_ipid", ckdb.UInt32).SetIndex(ckdb.IndexMinmax),
 	ckdb.NewColumn("capture_network_type_id", ckdb.UInt8),
 	ckdb.NewColumn("nat_source", ckdb.UInt8),
 	ckdb.NewColumn("capture_nic_type", ckdb.UInt8),
@@ -390,6 +392,10 @@ type Metrics struct {
 	L7ServerError   uint32 `json:"l7_server_error" category:"$metrics" sub:"application"`
 	L7ServerTimeout uint32 `json:"l7_server_timeout" category:"$metrics" sub:"application"`
 	L7Error         uint32 `json:"l7_error" category:"$metrics" sub:"application"`
+
+	OooTx    uint32 `json:"ooo_tx" category:"$metrics" sub:"tcp_slow"`
+	OooRx    uint32 `json:"ooo_rx" category:"$metrics" sub:"tcp_slow"`
+	FinCount uint32 `json:"fin_count" category:"$metrics" sub:"l4_throughput"`
 }
 
 var MetricsColumns = []*ckdb.Column{
@@ -442,6 +448,10 @@ var MetricsColumns = []*ckdb.Column{
 	ckdb.NewColumn("l7_server_error", ckdb.UInt32),
 	ckdb.NewColumn("l7_server_timeout", ckdb.UInt32),
 	ckdb.NewColumn("l7_error", ckdb.UInt32),
+
+	ckdb.NewColumn("ooo_tx", ckdb.UInt32),
+	ckdb.NewColumn("ooo_rx", ckdb.UInt32),
+	ckdb.NewColumn("fin_count", ckdb.UInt32),
 }
 
 func parseUint32EpcID(v uint32) int32 {
@@ -523,14 +533,6 @@ func (i *Internet) Fill(f *pb.Flow) {
 	i.Province1 = geo.QueryProvince(f.FlowKey.IpDst)
 }
 
-func isLocalIP(isIPv6 bool, ip4 uint32, ip6 net.IP) bool {
-	ip := ip6
-	if !isIPv6 {
-		ip = utils.IpFromUint32(ip4)
-	}
-	return !ip.IsGlobalUnicast()
-}
-
 func (k *KnowledgeGraph) fill(
 	platformData *grpc.PlatformInfoTable,
 	isIPv6, isVipInterface0, isVipInterface1 bool,
@@ -549,17 +551,32 @@ func (k *KnowledgeGraph) fill(
 	// 对于VIP的流量，需要使用MAC来匹配
 	lookupByMac0, lookupByMac1 := isVipInterface0, isVipInterface1
 	lookupByAgent0, lookupByAgent1 := false, false
+
+	// if the local end is a loopback address, use peer Pod for matching.
+	if utils.IsLoopback(isIPv6, ip40, ip60) {
+		if podId0 == 0 && podId1 != 0 {
+			k.TagSource0 |= uint8(flow_metrics.Peer)
+			podId0 = podId1
+		}
+	}
+	if utils.IsLoopback(isIPv6, ip41, ip61) {
+		if podId1 == 0 && podId0 != 0 {
+			k.TagSource1 |= uint8(flow_metrics.Peer)
+			podId1 = podId0
+		}
+	}
+
 	// 对于本地的流量，也需要使用MAC来匹配
 	if tapSide == uint32(flow_metrics.Local) {
 		// for local non-unicast IPs, MAC matching is preferred.
-		if isLocalIP(isIPv6, ip40, ip60) {
+		if utils.IsLocalIP(isIPv6, ip40, ip60) {
 			if mac0 != 0 {
 				lookupByMac0 = true
 			} else {
 				lookupByAgent0 = true
 			}
 		}
-		if isLocalIP(isIPv6, ip41, ip61) {
+		if utils.IsLocalIP(isIPv6, ip41, ip61) {
 			if mac1 != 0 {
 				lookupByMac1 = true
 			} else {
@@ -570,12 +587,12 @@ func (k *KnowledgeGraph) fill(
 		// For ebpf traffic, if MAC is valid, MAC lookup is preferred
 		if mac0 != 0 {
 			lookupByMac0 = true
-		} else if isLocalIP(isIPv6, ip40, ip60) {
+		} else if utils.IsLocalIP(isIPv6, ip40, ip60) {
 			lookupByAgent0 = true
 		}
 		if mac1 != 0 {
 			lookupByMac1 = true
-		} else if isLocalIP(isIPv6, ip41, ip61) {
+		} else if utils.IsLocalIP(isIPv6, ip41, ip61) {
 			lookupByAgent1 = true
 		}
 	}
@@ -610,7 +627,9 @@ func (k *KnowledgeGraph) fill(
 		if lookupByMac0 {
 			k.TagSource0 |= uint8(flow_metrics.Mac)
 			info0 = platformData.QueryMacInfo(k.OrgId, l3EpcMac0)
-		} else if lookupByAgent0 {
+		}
+
+		if info0 == nil && lookupByAgent0 {
 			k.TagSource0 |= uint8(flow_metrics.Agent)
 			if info := platformData.QueryVtapInfo(k.OrgId, vtapId); info != nil {
 				agentInfo = common.RegetInfoFromIP(k.OrgId, !info.IsIPv4, info.IP6, info.IP4, info.EpcId, platformData)
@@ -627,7 +646,9 @@ func (k *KnowledgeGraph) fill(
 		if lookupByMac1 {
 			k.TagSource1 |= uint8(flow_metrics.Mac)
 			info1 = platformData.QueryMacInfo(k.OrgId, l3EpcMac1)
-		} else if lookupByAgent1 {
+		}
+
+		if info1 == nil && lookupByAgent1 {
 			k.TagSource1 |= uint8(flow_metrics.Agent)
 			if lookupByAgent0 && agentInfo != nil {
 				info1 = agentInfo
@@ -637,6 +658,7 @@ func (k *KnowledgeGraph) fill(
 				}
 			}
 		}
+
 		if info1 == nil {
 			k.TagSource1 |= uint8(flow_metrics.EpcIP)
 			info1 = common.RegetInfoFromIP(k.OrgId, isIPv6, ip61, ip41, l3EpcID1, platformData)
@@ -697,11 +719,11 @@ func (k *KnowledgeGraph) fill(
 	}
 
 	k.AutoInstanceID0, k.AutoInstanceType0 = common.GetAutoInstance(k.PodID0, gpID0, k.PodNodeID0, k.L3DeviceID0, uint32(k.SubnetID0), k.L3DeviceType0, k.L3EpcID0)
-	customServiceID0 := platformData.QueryCustomService(k.OrgId, l3EpcID0, isIPv6, ip40, ip60, 0)
+	customServiceID0 := platformData.QueryCustomService(k.OrgId, l3EpcID0, isIPv6, ip40, ip60, 0, k.PodClusterID0, k.ServiceID0, k.PodGroupID0, k.L3DeviceID0, k.PodID0, k.L3DeviceType0, protocol)
 	k.AutoServiceID0, k.AutoServiceType0 = common.GetAutoService(customServiceID0, k.ServiceID0, k.PodGroupID0, gpID0, uint32(k.PodClusterID0), k.L3DeviceID0, uint32(k.SubnetID0), k.L3DeviceType0, k.PodGroupType0, k.L3EpcID0)
 
 	k.AutoInstanceID1, k.AutoInstanceType1 = common.GetAutoInstance(k.PodID1, gpID1, k.PodNodeID1, k.L3DeviceID1, uint32(k.SubnetID1), k.L3DeviceType1, k.L3EpcID1)
-	customServiceID1 := platformData.QueryCustomService(k.OrgId, l3EpcID1, isIPv6, ip41, ip61, port)
+	customServiceID1 := platformData.QueryCustomService(k.OrgId, l3EpcID1, isIPv6, ip41, ip61, port, k.PodClusterID1, k.ServiceID1, k.PodGroupID1, k.L3DeviceID1, k.PodID1, k.L3DeviceType1, protocol)
 	k.AutoServiceID1, k.AutoServiceType1 = common.GetAutoService(customServiceID1, k.ServiceID1, k.PodGroupID1, gpID1, uint32(k.PodClusterID1), k.L3DeviceID1, uint32(k.SubnetID1), k.L3DeviceType1, k.PodGroupType1, k.L3EpcID1)
 }
 
@@ -759,6 +781,7 @@ func (i *FlowInfo) Fill(f *pb.Flow) {
 	i.SignalSource = uint16(f.SignalSource)
 	i.FlowID = f.FlowId
 	i.AggregatedFlowIDs = Uint64SliceToString(f.AggregatedFlowIds)
+	i.InitIpid = f.InitIpid
 	i.TapType = uint8(f.FlowKey.TapType)
 	var natSource datatype.NATSource
 	i.TapPort, i.TapPortType, natSource, _ = datatype.TapPort(f.FlowKey.TapPort).SplitToPortTypeTunnel()
@@ -841,13 +864,16 @@ func (m *Metrics) Fill(f *pb.Flow) {
 		if p.Tcp.CountsPeerTx != nil {
 			m.RetransTx = p.Tcp.CountsPeerTx.RetransCount
 			m.ZeroWinTx = p.Tcp.CountsPeerTx.ZeroWinCount
+			m.OooTx = p.Tcp.CountsPeerTx.OooCount
 		}
 		if p.Tcp.CountsPeerRx != nil {
 			m.RetransRx = p.Tcp.CountsPeerRx.RetransCount
 			m.ZeroWinRx = p.Tcp.CountsPeerRx.ZeroWinCount
+			m.OooRx = p.Tcp.CountsPeerRx.OooCount
 		}
 		m.SynCount = p.Tcp.SynCount
 		m.SynackCount = p.Tcp.SynackCount
+		m.FinCount = p.Tcp.FinCount
 		if m.SynCount > 0 {
 			m.RetransSyn = m.SynCount - 1
 		}

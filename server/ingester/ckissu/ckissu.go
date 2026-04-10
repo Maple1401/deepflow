@@ -56,6 +56,7 @@ type Issu struct {
 	columnAdds         []*ColumnAdd
 	indexAdds          []*IndexAdd
 	columnDrops        []*ColumnDrop
+	tableRecreates     []*Tables
 	modTTLs            []*TableModTTL
 	datasourceInfo     map[string]*DatasourceInfo
 	Connections        common.DBs
@@ -125,6 +126,8 @@ type ColumnAdds struct {
 	ColumnNames  []string
 	ColumnType   ckdb.ColumnType
 	DefaultValue string
+	IsMetrics    bool
+	AggrFunc     string
 }
 
 type ColumnDrop struct {
@@ -171,6 +174,11 @@ type ColumnDatasourceAdd struct {
 	DefaultValue                                 string
 	IsMetrics                                    bool
 	IsSummable                                   bool
+}
+
+type Tables struct {
+	Db     string
+	Tables []string
 }
 
 func getTables(connect *sql.DB, db, tablePrefix string) ([]string, error) {
@@ -439,6 +447,8 @@ func NewCKIssu(cfg *config.Config) (*Issu, error) {
 		}
 	}
 
+	i.tableRecreates = AllTableRecreates
+
 	for _, v := range AllIndexAdds {
 		i.indexAdds = append(i.indexAdds, v...)
 	}
@@ -505,6 +515,80 @@ func (i *Issu) updateTablesForByConity() {
 		}
 	}
 	i.columnRenames = byconityRenames
+}
+
+// RunDropAlertEventTableIfNotReplacingMergeTree checks whether the alert_event
+// local table uses the ReplacingMergeTree engine. If not, it drops both the local
+// and global tables so they are recreated on startup with the correct engine.
+// This handles the migration from the old MergeTree-based alert_event table to
+// the new ReplacingMergeTree(update_time) table.
+func (i *Issu) RunDropAlertEventTableIfNotReplacingMergeTree(connect *sql.DB, orgPrefix string) {
+	db := orgPrefix + "event"
+	const localTable = "alert_event_local"
+	const globalTable = "alert_event"
+
+	sql := fmt.Sprintf(
+		"SELECT engine FROM system.tables WHERE database='%s' AND name='%s'",
+		db, localTable)
+	rows, err := Query(connect, sql)
+	if err != nil {
+		log.Warningf("query alert_event engine failed: %s", err)
+		return
+	}
+	var engine string
+	for rows.Next() {
+		if e := rows.Scan(&engine); e != nil {
+			log.Warningf("scan alert_event engine failed: %s", e)
+		}
+	}
+	if engine == "" {
+		// table does not exist yet – nothing to drop
+		return
+	}
+	if strings.Contains(engine, "ReplacingMergeTree") {
+		log.Infof("alert_event table already uses ReplacingMergeTree, skipping drop")
+		return
+	}
+	log.Infof("alert_event table engine is %q (not ReplacingMergeTree), dropping tables to trigger recreation", engine)
+	for _, tbl := range []string{localTable, globalTable} {
+		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s.`%s`", db, tbl)
+		log.Info(dropSQL)
+		if _, e := Exec(connect, dropSQL); e != nil {
+			log.Warningf("drop alert_event table %s failed: %s", tbl, e)
+		}
+	}
+}
+
+// called in server/ingester/ingester/ingester.go, executed before Start()
+func (i *Issu) RunRecreateTables() error {
+	for _, tables := range i.tableRecreates {
+		db := tables.Db
+		for _, table := range tables.Tables {
+			i.DropTable(db, table)
+		}
+	}
+	return nil
+}
+
+func (i *Issu) DropTable(db, table string) {
+	for idx, connect := range i.Connections {
+		oldVersion, _ := i.getTableVersion(idx, "flow_metrics", "network_map.1m_local")
+		if strings.Compare(oldVersion, "v7.1.4.0") >= 0 || oldVersion == "" {
+			continue
+		}
+
+		sql := fmt.Sprintf("DROP TABLE IF EXISTS %s.\"%s\"", db, table)
+		log.Info("drop table: ", sql)
+		_, err := Exec(connect, sql)
+		if err != nil {
+			if strings.Contains(err.Error(), "doesn't exist") {
+				log.Infof("drop table: %s.%s error: %s", db, table, err)
+				continue
+			}
+			log.Error(err)
+			return
+		}
+	}
 }
 
 // called in server/ingester/ingester/ingester.go, executed before Start()
@@ -1079,6 +1163,8 @@ func getColumnAdds(columnAdds *ColumnAdds) []*ColumnAdd {
 					ColumnName:   clmn,
 					ColumnType:   columnAdds.ColumnType,
 					DefaultValue: columnAdds.DefaultValue,
+					IsMetrics:    columnAdds.IsMetrics,
+					AggrFunc:     columnAdds.AggrFunc,
 				})
 			}
 		}
@@ -1142,24 +1228,6 @@ func (i *Issu) addColumns(index int, orgIDPrefix string, connect *sql.DB) ([]*Co
 			return dones, err
 		}
 		dones = append(dones, add)
-	}
-
-	for _, tableName := range []string{
-		flow_metrics.NETWORK_1M.TableName(), flow_metrics.NETWORK_MAP_1M.TableName(),
-		flow_metrics.APPLICATION_1M.TableName(), flow_metrics.APPLICATION_MAP_1M.TableName()} {
-		datasourceInfos, err := i.getUserDefinedDatasourceInfos(connect, getOrgDatabase(ckdb.METRICS_DB, orgIDPrefix), strings.Split(tableName, ".")[0])
-		if err != nil {
-			log.Warning(err)
-			continue
-		}
-		for _, dsInfo := range datasourceInfos {
-			adds, err := i.addColumnDatasource(index, dsInfo, strings.Contains(tableName, "_map"), strings.Contains(tableName, "application"), strings.Contains(tableName, "network"))
-			if err != nil {
-				log.Warningf("add column datasource failed: %s", err)
-				return nil, nil
-			}
-			dones = append(dones, adds...)
-		}
 	}
 
 	return dones, nil
@@ -1358,6 +1426,11 @@ func (i *Issu) Start() error {
 		orgIDPrefixs[index], err = i.getOrgIDPrefixsWithoutDefault(connect)
 		if err != nil {
 			return fmt.Errorf("get orgIDs failed, err: %s", err)
+		}
+
+		i.RunDropAlertEventTableIfNotReplacingMergeTree(connect, "")
+		for _, prefix := range orgIDPrefixs[index] {
+			i.RunDropAlertEventTableIfNotReplacingMergeTree(connect, prefix)
 		}
 	}
 

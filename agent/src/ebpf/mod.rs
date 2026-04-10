@@ -67,6 +67,8 @@ pub const SOCK_DATA_TARS: u16 = 46;
 #[allow(dead_code)]
 pub const SOCK_DATA_SOME_IP: u16 = 47;
 #[allow(dead_code)]
+pub const SOCK_DATA_ISO8583: u16 = 48;
+#[allow(dead_code)]
 pub const SOCK_DATA_MYSQL: u16 = 60;
 #[allow(dead_code)]
 pub const SOCK_DATA_POSTGRESQL: u16 = 61;
@@ -95,6 +97,8 @@ pub const SOCK_DATA_ZMTP: u16 = 106;
 #[allow(dead_code)]
 pub const SOCK_DATA_ROCKETMQ: u16 = 107;
 #[allow(dead_code)]
+pub const SOCK_DATA_WEBSPHEREMQ: u16 = 108;
+#[allow(dead_code)]
 pub const SOCK_DATA_DNS: u16 = 120;
 #[allow(dead_code)]
 pub const SOCK_DATA_TLS: u16 = 121;
@@ -118,6 +122,12 @@ pub const FEATURE_PROFILE_MEMORY: c_int = 6;
 pub const FEATURE_SOCKET_TRACER: c_int = 7;
 #[allow(dead_code)]
 pub const FEATURE_DWARF_UNWINDING: c_int = 8;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_PYTHON: c_int = 9;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_PHP: c_int = 10;
+#[allow(dead_code)]
+pub const FEATURE_PROFILE_V8: c_int = 11;
 
 //追踪器当前状态
 #[allow(dead_code)]
@@ -148,8 +158,6 @@ pub const DATA_SOURCE_OPENSSL_UPROBE: u8 = 3;
 pub const DATA_SOURCE_IO_EVENT: u8 = 4;
 #[allow(dead_code)]
 pub const DATA_SOURCE_GO_HTTP2_DATAFRAME_UPROBE: u8 = 5;
-#[allow(dead_code)]
-pub const DATA_SOURCE_CLOSE: u8 = 6;
 #[allow(dead_code)]
 pub const DATA_SOURCE_UNIX_SOCKET: u8 = 8;
 cfg_if::cfg_if! {
@@ -186,6 +194,18 @@ pub const MSG_REASM_SEG: u8 = 6;
 // set to 'MSG_COMMON'.
 #[allow(dead_code)]
 pub const MSG_COMMON: u8 = 7;
+// Explanation of the case where the same socket has two sources:
+// Typical example:
+// TLS handshake and uprobe TLS encrypted data essentially share the same socket.
+// Initially, the handshake is traced via kprobe.
+// After a successful handshake, encrypted data is traced via uprobe.
+// Finally, a close event occurs.
+//
+// There is only one close event because there is only one socket communication.
+// The system sends only one close syscall, and at that time,
+// the close event's SOURCE is identified as uprobe.
+#[allow(dead_code)]
+pub const MSG_CLOSE: u8 = 10;
 
 //Register event types
 #[allow(dead_code)]
@@ -210,6 +230,14 @@ cfg_if::cfg_if! {
 #[cfg(feature = "extended_observability")]
 pub const PROFILER_CTX_MEMORY_IDX: usize = 2;
 pub const PROFILER_CTX_NUM: usize = 3;
+
+// Stack trace flags
+#[cfg(feature = "extended_observability")]
+#[allow(dead_code)]
+pub const STACK_TRACE_FLAGS_CUDA_MEMORY: u8 = 0x4;
+
+// set this flag to notify caller not to free the data
+pub const TRACER_CALLBACK_FLAG_KEEP_DATA: u8 = 0x1;
 
 //Process exec/exit events
 #[repr(C)]
@@ -285,8 +313,48 @@ pub struct SK_BPF_DATA {
     pub syscall_trace_id_call: u64,
 
     /* data info */
-    pub timestamp: u64, // cap_data获取的时间戳（从1970.1.1开始到数据捕获时的时间间隔，精度为纳秒）
-    pub direction: u8,  // 数据的收发方向，值是 SOCK_DIR_SND/SOCK_DIR_RCV
+
+    /*
+     * Semantic timestamp of the data (Event / Logical Time).
+     *
+     * Represents the time point to which this event logically belongs,
+     * which is not necessarily the time when the data was actually captured.
+     *
+     * Timestamp selection rules by system call type:
+     *   - Socket send–type system calls:
+     *     Uses the system call entry time to ensure that the send event
+     *     is ordered before the corresponding packets captured later via
+     *     af_packet.
+     *   - File I/O system calls:
+     *     Uses the system call entry time, representing when the I/O
+     *     operation started. The operation duration is expressed separately.
+     *   - Socket recv–type system calls:
+     *     Uses the system call exit time, indicating when received data
+     *     becomes visible to user space.
+     *
+     * Note:
+     * Data is always captured at system call exit, but this field may
+     * refer to the entry time, which can cause timestamp rollback.
+     */
+    pub timestamp: u64, /* ns since Unix epoch */
+
+    /*
+     * Capture timestamp of the data (Capture / Processing Time).
+     *
+     * Indicates the actual time when this data was captured and reported
+     * by the eBPF tracer. This timestamp always corresponds to the
+     * system call exit time.
+     *
+     * This field reflects the true observation order and is typically
+     * monotonically increasing within a single CPU or trace stream.
+     *
+     * This timestamp should be preferred for:
+     *   - Time windowing and aggregation
+     *   - Event ordering and deduplication
+     *   - Latency and performance analysis
+     */
+    pub cap_timestamp: u64, /* ns since Unix epoch */
+    pub direction: u8,      // 数据的收发方向，值是 SOCK_DIR_SND/SOCK_DIR_RCV
 
     /*
      * 说明：
@@ -297,6 +365,7 @@ pub struct SK_BPF_DATA {
     pub cap_len: u32,          // 返回的cap_data长度
     pub cap_seq: u64, // cap_data在Socket中的相对顺序号，在所在socket下从0开始自增，用于数据乱序排序
     pub socket_role: u8, // this message is created by: 0:unkonwn 1:client(connect) 2:server(accept)
+    pub fd: u32,      // File descriptor for an open file or socket.
     pub cap_data: *mut c_char, // 内核送到用户空间的数据地址
 }
 
@@ -440,8 +509,9 @@ pub struct SK_TRACE_STATS {
 #[derive(Debug, Copy, Clone)]
 pub struct stack_profile_data {
     pub profiler_type: u8, // Profiler type, such as 1(PROFILER_TYPE_ONCPU).
-    pub timestamp: u64,    // Timestamp of the stack trace data(unit: nanoseconds).
-    pub pid: u32,          // User-space process-ID.
+    pub flags: u8,
+    pub timestamp: u64, // Timestamp of the stack trace data(unit: nanoseconds).
+    pub pid: u32,       // User-space process-ID.
     /*
      * Identified within the eBPF program in kernel space.
      * If the current is a process and not a thread this field(tid) is filled
@@ -463,7 +533,7 @@ pub struct stack_profile_data {
      * data by querying with the quadruple
      * "<pid + stime + u_stack_id + k_stack_id + tid + cpu>" as the key.
      * In microseconds as the unit of time.
-     * If profiler_type is PROFILER_TYPE_MEMORY, this is allocated byte count value, or 0 for frees
+     * If profiler_type is PROFILER_TYPE_MEMORY, this is allocated byte count value, or negative for frees
      */
     pub count: u64,
     /*
@@ -578,17 +648,19 @@ extern "C" {
     //            false Define a map without preallocated memory
     pub fn set_bpf_map_prealloc(enabled: bool) -> c_void;
 
-    // 参数说明：
-    // callback: 回调接口 rust -> C
-    // thread_nr: 工作线程数，是指用户态有多少线程参与数据处理。
-    // perf_pages_cnt: 和内核共享内存占用的页框数量, 值为2的次幂。
-    // ring_size: 环形缓存队列大小，值为2的次幂。
-    // max_socket_entries: 设置用于socket追踪的hash表项最大值，取决于实际场景中并发请求数量。
-    // max_trace_entries: 设置用于线程/协程追踪会话的hash表项最大值。
-    // socket_map_max_reclaim: socket map表项进行清理的最大阈值，当前map的表项数量超过这个值进行map清理操作。
-    // 返回值：成功返回0，否则返回非0
+    pub fn set_kick_kern_nice(nice: c_int) -> c_int;
+
+    // Parameter descriptions:
+    // callback: Callback interface from Rust to C; return values refer to definitions of TRACER_CALLBACK_FLAG_*.
+    // thread_nr: Number of worker threads, indicating how many user-space threads participate in data processing.
+    // perf_pages_cnt: Number of page frames occupied by shared memory with the kernel; value is a power of 2, with page frame size of 4 KB.
+    // ring_size: Size of the ring buffer queue; value is a power of 2.
+    // max_socket_entries: Maximum number of hash table entries for socket tracking, depending on the concurrency in the actual scenario.
+    // max_trace_entries: Maximum number of hash table entries for thread/coroutine tracking sessions.
+    // socket_map_max_reclaim: Maximum threshold for cleaning entries in the socket map; when the current number of entries exceeds this value, the map cleanup is triggered.
+    // Return value: Returns 0 on success, non-zero otherwise.
     pub fn running_socket_tracer(
-        callback: extern "C" fn(_: *mut c_void, queue_id: c_int, sd: *mut SK_BPF_DATA),
+        callback: extern "C" fn(_: *mut c_void, queue_id: c_int, sd: *mut SK_BPF_DATA) -> c_int,
         thread_nr: c_int,
         perf_pages_cnt: c_uint,
         ring_size: c_uint,
@@ -615,7 +687,7 @@ extern "C" {
      *   more symbol information, we delay symbol retrieval when encountering unknown
      *   symbols. The unit of measurement used is seconds.
      *   The recommended range for values is [5, 3600], default valuse is 60.
-     * @callback Profile data processing callback interface
+     * @callback Profile data processing callback interface, refer to definition of TRACER_CALLBACK_FLAG_* for return value
      * @callback_ctx Contexts to pass into callback function from different profiler readers.
      *               Accesses to each context is single threaded.
      * @returns 0 on success, < 0 on error
@@ -623,7 +695,11 @@ extern "C" {
     pub fn start_continuous_profiler(
         freq: c_int,
         java_syms_update_delay: c_int,
-        callback: extern "C" fn(ctx: *mut c_void, queue_id: c_int, _data: *mut stack_profile_data),
+        callback: extern "C" fn(
+            ctx: *mut c_void,
+            queue_id: c_int,
+            _data: *mut stack_profile_data,
+        ) -> c_int,
         callback_ctx: *const [*mut c_void; PROFILER_CTX_NUM],
     ) -> c_int;
 
@@ -659,6 +735,11 @@ extern "C" {
     pub fn set_profiler_cpu_aggregation(flag: c_int) -> c_int;
 
     /*
+     * profile data release
+     */
+    pub fn clib_mem_free(ptr: *mut c_void);
+
+    /*
      * test flame graph
      */
     pub fn process_stack_trace_data_for_flame_graph(_data: *mut stack_profile_data);
@@ -676,6 +757,10 @@ extern "C" {
      * @proto
      *   Specifying the L7 protocol number. If set to '0', it indicates all
      *   L7 protocols.
+     * @ipaddr
+     *   Specifying ip address
+     * @port
+     *   Specifying port
      * @timeout
      *   Specifying the timeout duration. If the elapsed time exceeds this
      *   duration, datadump will stop. The unit is in seconds.
@@ -688,6 +773,8 @@ extern "C" {
         pid: c_int,
         comm: *const c_char,
         proto: c_int,
+        ipaddr: *const c_char,
+        port: c_int,
         timeout: c_int,
         callback: extern "C" fn(data: *mut c_char, len: c_int),
     ) -> c_int;
@@ -747,6 +834,9 @@ extern "C" {
     pub fn disable_unix_socket_feature();
     // Enables Unix socket tracing.
     pub fn enable_unix_socket_feature();
+    pub fn disable_fentry();
+    pub fn enable_fentry();
+    pub fn set_virtual_file_collect(enabled: bool) -> c_int;
 
     cfg_if::cfg_if! {
         if #[cfg(feature = "extended_observability")] {
@@ -838,6 +928,72 @@ extern "C" {
                * @return 0 on success, -1 on failure.
                */
                pub fn set_socket_fanout_ebpf(socket: c_int, group_id: c_int) -> c_int;
+               pub fn envoy_trace_start() -> c_int;
+
+               /**
+                * @brief Enable or disable the TCP option tracing feature.
+                *
+                * When enabled, the tcp_option_tracing eBPF program is loaded and attached
+                * to the root cgroup to insert custom TCP options while processing
+                * sockops callbacks. Disabling this feature detaches the program and
+                * releases associated resources.
+                *
+                * @param enabled Set to `true` to enable the feature or `false` to disable.
+                * @return 0 on success, non-zero on error.
+                */
+                pub fn set_tcp_option_tracing_enabled(enabled: bool) -> c_int;
+                pub fn set_tcp_option_tracing_sample_window(bytes: c_uint) -> c_int;
+
+                /**
+                 * @brief Enable or disable NIC optimization.
+                 *
+                 * This function sets the NIC optimization feature on or off. When enabled,
+                 * the system may adjust RX ring sizes, RSS channels, and CPU affinities
+                 * to improve packet processing performance.
+                 *
+                 * @param enabled Set to 1 to enable, or 0 to disable. On the Rust side,
+                 *                this can be converted from a bool.
+                 *
+                 * @return 0 on success, non-zero on failure.
+                 *
+                 * @note Corresponding C function: `int set_nic_optimization(bool enabled)`
+                 */
+                pub fn set_nic_optimization(enabled: bool) -> c_int;
+
+                /**
+                 * @brief Configure optimization parameters for a single NIC.
+                 *
+                 * This function applies NIC-specific optimization settings, including
+                 * RX ring size, RSS channel count, IRQ CPU binding, and XDP CPU redirection.
+                 * It allows fine-grained performance tuning for each network interface.
+                 *
+                 * @param nic_name The name of the network interface (C string).
+                 * @param rx_ring_size The size of the RX ring buffer.
+                 * @param rss_channel_count Number of RSS channels to use.
+                 * @param irq_cpu_list Comma-separated list of CPU IDs for IRQ binding.
+                 * @param xdp_cpu_redirect Set to 1 to enable XDP CPU redirect, 0 to disable.
+                 * @param xdp_queue_size The size of the XDP queue.
+                 * @param xdp_cpu_list Comma-separated list of CPU IDs for XDP processing.
+                 *
+                 * @return 0 on success, non-zero on failure.
+                 *
+                 * @note Corresponding C function:
+                 * ```c
+                 * int nic_optimize_config(const char* nic_name, int rx_ring_size,
+                 *                         int rss_channel_count, const char* irq_cpu_list,
+                 *                         bool xdp_cpu_redirect, int xdp_queue_size,
+                 *                         const char* xdp_cpu_list);
+                 * ```
+                 */
+                pub fn nic_optimize_config(
+                    nic_name: *const c_char,
+                    rx_ring_size: c_int,
+                    rss_channel_count: c_int,
+                    irq_cpu_list: *const c_char,
+                    xdp_cpu_redirect: bool,
+                    xdp_queue_size: c_int,
+                    xdp_cpu_list: *const c_char,
+                ) -> c_int;
         }
     }
 }

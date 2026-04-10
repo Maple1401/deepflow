@@ -21,19 +21,20 @@ pub mod common;
 pub mod config;
 pub mod debug;
 pub mod dispatcher;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(unix, feature = "libtrace"))]
 pub mod ebpf;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(unix, feature = "libtrace"))]
 mod ebpf_dispatcher;
 mod error;
 pub mod exception;
 pub mod flow_generator;
 mod handler;
 mod integration_collector;
+mod liveness;
 mod metric;
 mod monitor;
 mod platform;
-mod plugin;
+pub mod plugin;
 mod policy;
 pub mod rpc;
 mod sender;
@@ -72,7 +73,6 @@ pub use {
         },
         FlowPerfCounter as _FlowPerfCounter, L7FlowPerf as _L7FlowPerf,
     },
-    flow_generator::protocol_logs::LogMessageType as _LogMessageType,
     flow_generator::HttpLog,
     npb_pcap_policy::{
         DirectionType as _DirectionType, NpbAction as _NpbAction, NpbTunnelType as _NpbTunnelType,

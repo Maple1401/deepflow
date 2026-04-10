@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +53,6 @@ type VTapConfig struct {
 	ConvertedL7LogIgnoreTapSides []uint32
 	ConvertedL7LogStoreTapTypes  []uint32
 	ConvertedDecapType           []uint32
-	ConvertedDomains             []string
 	ConvertedWasmPlugins         []string
 	ConvertedSoPlugins           []string
 	PluginNewUpdateTime          uint32
@@ -109,10 +107,6 @@ func (f *VTapConfig) convertData() {
 			log.Error(err)
 		}
 	}
-	if f.Domains != nil && len(*f.Domains) != 0 {
-		f.ConvertedDomains = strings.Split(*f.Domains, ",")
-	}
-	sort.Strings(f.ConvertedDomains)
 
 	if f.WasmPlugins != nil && len(*f.WasmPlugins) != 0 {
 		f.ConvertedWasmPlugins = strings.Split(*f.WasmPlugins, ",")
@@ -152,20 +146,19 @@ func (f *VTapConfig) modifyUserConfig(c *VTapCache) {
 	if !f.UserConfig.Exists(CONFIG_KEY_INGESTER_IP) {
 		f.UserConfig.Set(CONFIG_KEY_INGESTER_IP, c.GetTSDBIP())
 	}
-	domainFilters := f.UserConfig.Strings(CONFIG_KEY_DOMAIN_FILTER)
-	if len(domainFilters) > 0 {
-		sort.Strings(domainFilters)
-	} else {
-		domainFilters = []string{"0"}
-	}
-	f.UserConfig.Set(CONFIG_KEY_DOMAIN_FILTER, domainFilters)
 }
 
 func (f *VTapConfig) getDomainFilters() []string {
 	if f.UserConfig == nil {
-		return nil
+		return ALL_DOMAINS
 	}
-	return f.UserConfig.Strings(CONFIG_KEY_DOMAIN_FILTER)
+
+	domains := f.UserConfig.Strings(CONFIG_KEY_DOMAIN_FILTER)
+	if len(domains) == 0 {
+		return ALL_DOMAINS
+	}
+
+	return domains
 }
 
 func (f *VTapConfig) getPodClusterInternalIP() bool {
@@ -189,45 +182,47 @@ func NewVTapConfig(agentConfigYaml string) *VTapConfig {
 }
 
 type VTapCache struct {
-	id                 int
-	name               *string
-	rawHostname        *string
-	state              int
-	enable             int
-	vTapType           int
-	owner              *string
-	ctrlIP             *string
-	ctrlMac            *string
-	tapMac             *string
-	tsdbIP             *string
-	curTSDBIP          *string
-	controllerIP       *string
-	curControllerIP    *string
-	launchServer       *string
-	launchServerID     int
-	az                 *string
-	revision           *string
-	syncedControllerAt *time.Time
-	syncedTSDBAt       *time.Time
-	bootTime           int
-	exceptions         int64
-	vTapLcuuid         *string
-	vTapGroupLcuuid    *string
-	vTapGroupShortID   *string
-	cpuNum             int
-	memorySize         int64
-	arch               *string
-	os                 *string
-	kernelVersion      *string
-	processName        *string
-	currentK8sImage    *string
-	licenseType        int
-	tapMode            int
-	teamID             int
-	organizeID         int
-	lcuuid             *string
-	licenseFunctions   *string
-	licenseFunctionSet mapset.Set
+	id                   int
+	name                 *string
+	rawHostname          *string
+	state                int
+	enable               int
+	vTapType             int
+	owner                *string
+	ctrlIP               *string
+	ctrlMac              *string
+	tapMac               *string
+	tsdbIP               *string
+	curTSDBIP            *string
+	controllerIP         *string
+	curControllerIP      *string
+	launchServer         *string
+	launchServerID       int
+	az                   *string
+	revision             *string
+	syncedControllerAt   *time.Time
+	syncedTSDBAt         *time.Time
+	bootTime             int
+	exceptions           int64
+	exceptionDescription *string
+	vTapLcuuid           *string
+	vTapGroupID          int
+	vTapGroupLcuuid      *string
+	vTapGroupShortID     *string
+	cpuNum               int
+	memorySize           int64
+	arch                 *string
+	os                   *string
+	kernelVersion        *string
+	processName          *string
+	currentK8sImage      *string
+	licenseType          int
+	tapMode              int
+	teamID               int
+	organizeID           int
+	lcuuid               *string
+	licenseFunctions     *string
+	licenseFunctionSet   mapset.Set
 	//above db Data
 
 	enabledNetNpb       atomicbool.Bool
@@ -271,9 +266,20 @@ type VTapCache struct {
 	agentRemoteSegments []*agent.Segment
 
 	// vtap version
-	pushVersionPlatformData uint64
-	pushVersionPolicy       uint64
-	pushVersionGroups       uint64
+	pushVersionPlatformData    uint64
+	pushVersionPolicy          uint64
+	pushVersionGroups          uint64
+	pushVersionCustomAppConfig uint64
+
+	// grpc buffer size
+	grpcBufferSize    uint64
+	lastSyncBytes     uint64
+	lastPushBytes     uint64
+	lastGPIDSyncBytes uint64
+
+	// auto grpc buffer size interval
+	autoGRPCBufferSizeInterval   float64
+	autoGRPCBufferSizeLastChange atomic.Value // time.Time
 
 	controllerSyncFlag atomicbool.Bool // bool
 	tsdbSyncFlag       atomicbool.Bool // bool
@@ -291,57 +297,63 @@ type VTapCache struct {
 
 func (c *VTapCache) String() ([]byte, error) {
 	ret := map[string]interface{}{
-		"id":                      c.GetVTapID(),
-		"name":                    c.GetVTapHost(),
-		"rawHostname":             c.GetVTapRawHostname(),
-		"state":                   c.GetVTapState(),
-		"enable":                  c.GetVTapEnabled(),
-		"vTapType":                c.GetVTapType(),
-		"ctrlIP":                  c.GetCtrlIP(),
-		"ctrlMac":                 c.GetCtrlMac(),
-		"tsdbIP":                  c.GetTSDBIP(),
-		"curTSDBIP":               c.GetCurTSDBIP(),
-		"controllerIP":            c.GetControllerIP(),
-		"curControllerIP":         c.GetCurControllerIP(),
-		"launchServer":            c.GetLaunchServer(),
-		"launchServerID":          c.GetLaunchServerID(),
-		"syncedControllerAt":      c.GetSyncedControllerAt(),
-		"syncedTSDBAt":            c.GetSyncedTSDBAt(),
-		"bootTime":                c.GetBootTime(),
-		"exceptions":              c.GetExceptions(),
-		"vTapGroupLcuuid":         c.GetVTapGroupLcuuid(),
-		"vTapGroupShortID":        c.GetVTapGroupShortID(),
-		"licenseType":             c.GetLicenseType(),
-		"tapMode":                 c.GetTapMode(),
-		"teamID":                  c.GetTeamID(),
-		"organizeID":              c.GetOrganizeID(),
-		"licenseFunctionSet":      c.GetFunctions().ToSlice(),
-		"enabledNetNpb":           c.EnabledNetNpb(),
-		"enabledNetNpmd":          c.EnabledNetNpmd(),
-		"enabledNetDpdk":          c.EnabledNetDpdk(),
-		"enabledTraceNet":         c.EnabledTraceNet(),
-		"enabledTraceSys":         c.EnabledTraceSys(),
-		"enabledTraceApp":         c.EnabledTraceApp(),
-		"enabledTraceIo":          c.EnabledTraceIo(),
-		"enabledTraceBiz":         c.EnabledTraceBiz(),
-		"enabledProfileCpu":       c.EnabledProfileCpu(),
-		"enabledProfileRam":       c.EnabledProfileRam(),
-		"enabledProfileInt":       c.EnabledProfileInt(),
-		"enabledLegacyMetric":     c.EnabledLegacyMetric(),
-		"enabledLegacyLog":        c.EnabledLegacyLog(),
-		"enabledLegacyProbe":      c.EnabledLegacyProbe(),
-		"enabledDevNetNpb":        c.EnabledDevNetNpb(),
-		"enabledDevNetNpmd":       c.EnabledDevNetNpmd(),
-		"enabledDevTraceNet":      c.EnabledDevTraceNet(),
-		"enabledDevTraceBiz":      c.EnabledDevTraceBiz(),
-		"podDomains":              c.getPodDomains(),
-		"pushVersionPlatformData": c.GetPushVersionPlatformData(),
-		"pushVersionPolicy":       c.GetPushVersionPolicy(),
-		"pushVersionGroups":       c.GetPushVersionGroups(),
-		"expectedRevision":        c.GetExpectedRevision(),
-		"upgradePackage":          c.GetUpgradePackage(),
-		"podClusterID":            c.GetPodClusterID(),
-		"vpcID":                   c.GetVPCID(),
+		"id":                               c.GetVTapID(),
+		"name":                             c.GetVTapHost(),
+		"rawHostname":                      c.GetVTapRawHostname(),
+		"state":                            c.GetVTapState(),
+		"enable":                           c.GetVTapEnabled(),
+		"vTapType":                         c.GetVTapType(),
+		"ctrlIP":                           c.GetCtrlIP(),
+		"ctrlMac":                          c.GetCtrlMac(),
+		"tsdbIP":                           c.GetTSDBIP(),
+		"curTSDBIP":                        c.GetCurTSDBIP(),
+		"controllerIP":                     c.GetControllerIP(),
+		"curControllerIP":                  c.GetCurControllerIP(),
+		"launchServer":                     c.GetLaunchServer(),
+		"launchServerID":                   c.GetLaunchServerID(),
+		"syncedControllerAt":               c.GetSyncedControllerAt(),
+		"syncedTSDBAt":                     c.GetSyncedTSDBAt(),
+		"bootTime":                         c.GetBootTime(),
+		"grpcBufferSize":                   c.GetGRPCBufferSize(),
+		"exceptions":                       c.GetExceptions(),
+		"exceptionDescriptions":            c.GetExceptionDescription(),
+		"vTapGroupID":                      c.GetVTapGroupID(),
+		"vTapGroupLcuuid":                  c.GetVTapGroupLcuuid(),
+		"vTapGroupShortID":                 c.GetVTapGroupShortID(),
+		"autoGRPCBufferSizeInterval":       c.GetAutoGRPCBufferSizeInterval(),
+		"autoGRPCBufferSizeLastChangeTime": c.FormatLastChangeTime(),
+		"licenseType":                      c.GetLicenseType(),
+		"tapMode":                          c.GetTapMode(),
+		"teamID":                           c.GetTeamID(),
+		"organizeID":                       c.GetOrganizeID(),
+		"licenseFunctionSet":               c.GetFunctions().ToSlice(),
+		"enabledNetNpb":                    c.EnabledNetNpb(),
+		"enabledNetNpmd":                   c.EnabledNetNpmd(),
+		"enabledNetDpdk":                   c.EnabledNetDpdk(),
+		"enabledTraceNet":                  c.EnabledTraceNet(),
+		"enabledTraceSys":                  c.EnabledTraceSys(),
+		"enabledTraceApp":                  c.EnabledTraceApp(),
+		"enabledTraceIo":                   c.EnabledTraceIo(),
+		"enabledTraceBiz":                  c.EnabledTraceBiz(),
+		"enabledProfileCpu":                c.EnabledProfileCpu(),
+		"enabledProfileRam":                c.EnabledProfileRam(),
+		"enabledProfileInt":                c.EnabledProfileInt(),
+		"enabledLegacyMetric":              c.EnabledLegacyMetric(),
+		"enabledLegacyLog":                 c.EnabledLegacyLog(),
+		"enabledLegacyProbe":               c.EnabledLegacyProbe(),
+		"enabledDevNetNpb":                 c.EnabledDevNetNpb(),
+		"enabledDevNetNpmd":                c.EnabledDevNetNpmd(),
+		"enabledDevTraceNet":               c.EnabledDevTraceNet(),
+		"enabledDevTraceBiz":               c.EnabledDevTraceBiz(),
+		"podDomains":                       c.getPodDomains(),
+		"pushVersionPlatformData":          c.GetPushVersionPlatformData(),
+		"pushVersionPolicy":                c.GetPushVersionPolicy(),
+		"pushVersionGroups":                c.GetPushVersionGroups(),
+		"pushVersionCustomAppConfig":       c.GetPushVersionCustomAppConfig(),
+		"expectedRevision":                 c.GetExpectedRevision(),
+		"upgradePackage":                   c.GetUpgradePackage(),
+		"podClusterID":                     c.GetPodClusterID(),
+		"vpcID":                            c.GetVPCID(),
 	}
 	return json.Marshal(ret)
 }
@@ -373,11 +385,14 @@ func NewVTapCache(vtap *metadbmodel.VTap, vTapInfo *VTapInfo) *VTapCache {
 	vTapCache.syncedTSDBAt = &syncedTSDBAt
 	vTapCache.bootTime = vtap.BootTime
 	vTapCache.exceptions = vtap.Exceptions
+	vTapCache.exceptionDescription = &vtap.ExceptionDescription
 	vTapCache.vTapLcuuid = proto.String(vtap.VTapLcuuid)
+	vTapCache.vTapGroupID = vTapInfo.vtapGroupLcuuidToID[vtap.VtapGroupLcuuid]
 	vTapCache.vTapGroupLcuuid = proto.String(vtap.VtapGroupLcuuid)
 	vTapCache.vTapGroupShortID = proto.String(vTapInfo.vtapGroupLcuuidToShortID[vtap.VtapGroupLcuuid])
 	vTapCache.cpuNum = vtap.CPUNum
 	vTapCache.memorySize = vtap.MemorySize
+	vTapCache.grpcBufferSize = vtap.GRPCBufferSize
 	vTapCache.arch = proto.String(vtap.Arch)
 	vTapCache.os = proto.String(vtap.Os)
 	vTapCache.kernelVersion = proto.String(vtap.KernelVersion)
@@ -409,6 +424,8 @@ func NewVTapCache(vtap *metadbmodel.VTap, vTapInfo *VTapInfo) *VTapCache {
 	vTapCache.enabledDevTraceNet = atomicbool.NewBool(false)
 	vTapCache.enabledDevTraceBiz = atomicbool.NewBool(false)
 
+	vTapCache.autoGRPCBufferSizeLastChange.Store(&time.Time{})
+
 	vTapCache.cachedAt = time.Now()
 	vTapCache.config = &atomic.Value{}
 	vTapCache.podDomains = []string{}
@@ -421,6 +438,7 @@ func NewVTapCache(vtap *metadbmodel.VTap, vTapInfo *VTapInfo) *VTapCache {
 	vTapCache.pushVersionPlatformData = 0
 	vTapCache.pushVersionPolicy = 0
 	vTapCache.pushVersionGroups = 0
+	vTapCache.pushVersionCustomAppConfig = 0
 	vTapCache.controllerSyncFlag = atomicbool.NewBool(false)
 	vTapCache.tsdbSyncFlag = atomicbool.NewBool(false)
 	vTapCache.podClusterID = 0
@@ -828,6 +846,14 @@ func (c *VTapCache) GetPushVersionGroups() uint64 {
 	return c.pushVersionGroups
 }
 
+func (c *VTapCache) UpdatePushVersionCustomAppConfig(version uint64) {
+	c.pushVersionCustomAppConfig = version
+}
+
+func (c *VTapCache) GetPushVersionCustomAppConfig() uint64 {
+	return c.pushVersionCustomAppConfig
+}
+
 func (c *VTapCache) GetSimplePlatformDataVersion() uint64 {
 	platformData := c.GetVTapPlatformData()
 	if platformData == nil {
@@ -970,6 +996,10 @@ func (c *VTapCache) GetLcuuid() string {
 	return ""
 }
 
+func (c *VTapCache) GetVTapGroupID() int {
+	return c.vTapGroupID
+}
+
 func (c *VTapCache) GetVTapGroupLcuuid() string {
 	if c.vTapGroupLcuuid != nil {
 		return *c.vTapGroupLcuuid
@@ -982,6 +1012,10 @@ func (c *VTapCache) GetVTapGroupShortID() string {
 		return *c.vTapGroupShortID
 	}
 	return ""
+}
+
+func (c *VTapCache) updateVTapGroupID(id int) {
+	c.vTapGroupID = id
 }
 
 func (c *VTapCache) updateVTapGroupLcuuid(lcuuid string) {
@@ -1306,6 +1340,13 @@ func (c *VTapCache) GetExceptions() int64 {
 	return atomic.LoadInt64(&c.exceptions)
 }
 
+func (c *VTapCache) GetExceptionDescription() string {
+	if c.exceptionDescription != nil {
+		return *c.exceptionDescription
+	}
+	return ""
+}
+
 // 只更新采集器返回的异常，控制器异常不用更新，由控制器处理其异常
 func (c *VTapCache) UpdateExceptions(exceptions int64) {
 	v := c.vTapInfo
@@ -1313,6 +1354,17 @@ func (c *VTapCache) UpdateExceptions(exceptions int64) {
 		"modify vtap(%s) exception %d to %d",
 		c.GetVTapHost(), c.GetExceptions(), exceptions))
 	atomic.StoreInt64(&c.exceptions, int64(exceptions))
+}
+
+func (c *VTapCache) UpdateExceptionDescription(exceptionDescription string) {
+	if c.GetExceptionDescription() == exceptionDescription {
+		return
+	}
+	v := c.vTapInfo
+	log.Infof(v.Logf(
+		"modify vtap(%s) exception description to %s",
+		c.GetVTapHost(), exceptionDescription))
+	c.exceptionDescription = &exceptionDescription
 }
 
 func (c *VTapCache) UpdateSystemInfoFromGrpc(cpuNum int, memorySize int64, arch, os, kernelVersion, processName, currentK8sImage string) {
@@ -1520,6 +1572,7 @@ func (c *VTapCache) updateVTapCacheFromDB(vtap *metadbmodel.VTap) {
 	c.modifyVTapCache()
 	// 采集器组变化 重新生成平台数据
 	if c.GetVTapGroupLcuuid() != vtap.VtapGroupLcuuid {
+		c.updateVTapGroupID(v.vtapGroupLcuuidToID[vtap.VtapGroupLcuuid])
 		c.updateVTapGroupLcuuid(vtap.VtapGroupLcuuid)
 		c.updateVTapGroupShortID(v.vtapGroupLcuuidToShortID[vtap.VtapGroupLcuuid])
 		v.setVTapChangedForPD()
@@ -1528,7 +1581,7 @@ func (c *VTapCache) updateVTapCacheFromDB(vtap *metadbmodel.VTap) {
 	newPodDomains := v.getVTapPodDomains(c)
 	oldPodDomains := c.getPodDomains()
 	// podDomain 发生变化重新生成平台数据
-	if !SliceEqual[string](newPodDomains, oldPodDomains) {
+	if !slices.Equal(newPodDomains, oldPodDomains) {
 		c.updatePodDomains(newPodDomains)
 		v.setVTapChangedForPD()
 	}
@@ -1640,6 +1693,60 @@ func (c *VTapCache) setAgentRemoteSegments(segments []*agent.Segment) {
 
 func (c *VTapCache) GetAgentRemoteSegments() []*agent.Segment {
 	return c.agentRemoteSegments
+}
+
+func (c *VTapCache) maxGRPCBytes() uint64 {
+	return max(c.lastSyncBytes, c.lastPushBytes, c.lastGPIDSyncBytes)
+}
+
+func (c *VTapCache) GetGRPCBufferFromLastSync(bytes uint64) uint64 {
+	c.lastSyncBytes = bytes
+	c.grpcBufferSize = c.maxGRPCBytes()
+	log.Infof(c.vTapInfo.Logf("agent (%s-%s) update last sync size: %d, current max buffer: %d", c.GetCtrlIP(), c.GetCtrlMac(), bytes, c.grpcBufferSize))
+	return c.calculateGRPCBytes()
+}
+
+func (c *VTapCache) GetGRPCBufferFromLastPush(bytes uint64) uint64 {
+	c.lastPushBytes = bytes
+	c.grpcBufferSize = c.maxGRPCBytes()
+	log.Infof(c.vTapInfo.Logf("agent (%s-%s) update last push size: %d, current max buffer: %d", c.GetCtrlIP(), c.GetCtrlMac(), bytes, c.grpcBufferSize))
+	return c.calculateGRPCBytes()
+}
+
+func (c *VTapCache) GetGRPCBufferFromLastGPIDSync(bytes uint64) uint64 {
+	c.lastGPIDSyncBytes = bytes
+	c.grpcBufferSize = c.maxGRPCBytes()
+	log.Infof(c.vTapInfo.Logf("agent (%s-%s) update last gpid sync size: %d, current max buffer: %d", c.GetCtrlIP(), c.GetCtrlMac(), bytes, c.grpcBufferSize))
+	return c.calculateGRPCBytes()
+}
+
+func (c *VTapCache) calculateGRPCBytes() uint64 {
+	return CalculateBufferSize(c.grpcBufferSize)
+}
+
+func (c *VTapCache) GetGRPCBufferSize() uint64 {
+	return c.grpcBufferSize
+}
+
+func (c *VTapCache) SetAutoGRPCBufferSizeInterval(interval float64) {
+	c.autoGRPCBufferSizeInterval = interval
+}
+
+func (c *VTapCache) GetAutoGRPCBufferSizeInterval() float64 {
+	return c.autoGRPCBufferSizeInterval
+}
+
+func (c *VTapCache) FormatLastChangeTime() string {
+	return c.autoGRPCBufferSizeLastChange.Load().(*time.Time).Format(GO_BIRTHDAY)
+}
+
+func (c *VTapCache) UpdateLastChangeTime(t time.Time) {
+	c.autoGRPCBufferSizeLastChange.Store(&t)
+}
+
+func (c *VTapCache) AllowMessageToReduce() bool {
+	lastChange := c.autoGRPCBufferSizeLastChange.Load().(*time.Time)
+	return time.Now().Sub(*lastChange).Seconds() > c.autoGRPCBufferSizeInterval
 }
 
 type VTapCacheMap struct {

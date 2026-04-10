@@ -151,6 +151,7 @@ func (h *L7FlowLog) fillAttributes(spanAttributes, resAttributes []*v11.KeyValue
 	metricsNames, metricsValues := []string{}, []float64{}
 	isHttp := false
 	httpURL := ""
+	hasPeerAddress := false
 	for i, attr := range append(spanAttributes, resAttributes...) {
 		key := attr.GetKey()
 		value := attr.GetValue()
@@ -210,11 +211,19 @@ func (h *L7FlowLog) fillAttributes(spanAttributes, resAttributes []*v11.KeyValue
 					h.Protocol = uint8(layers.IPProtocolUDP)
 				}
 			// https://github.com/open-telemetry/opentelemetry-go/blob/db7fd1bb51ce6ed1171cac15eeecb6871dbbb80a/semconv/internal/http.go#L79
-			case "net.peer.ip":
+			case "net.peer.ip", "network.peer.address":
+				if hasPeerAddress {
+					continue
+				}
 				ip := net.ParseIP(value.GetStringValue())
 				if ip == nil {
 					continue
 				}
+
+				if key == "network.peer.address" {
+					hasPeerAddress = true
+				}
+
 				if ip4 := ip.To4(); ip4 != nil {
 					if h.TapSide == "c-app" {
 						h.IP41 = utils.IpToUint32(ip4)
@@ -230,7 +239,7 @@ func (h *L7FlowLog) fillAttributes(spanAttributes, resAttributes []*v11.KeyValue
 					}
 				}
 			case "http.scheme", "db.system", "rpc.system", "messaging.system", "messaging.protocol":
-				h.L7ProtocolStr = value.GetStringValue()
+				h.BizProtocol = value.GetStringValue()
 			case "http.flavor":
 				h.Version = value.GetStringValue()
 			case "http.status_code":
@@ -266,7 +275,8 @@ func (h *L7FlowLog) fillAttributes(spanAttributes, resAttributes []*v11.KeyValue
 				h.sqlAffectedRows = uint64(value.GetIntValue())
 				h.SqlAffectedRows = &h.sqlAffectedRows
 				isMetrics = true
-			case "message.uncompressed_size", "messaging.message_payload_size_bytes", "messaging.message_payload_compressed_size_bytes":
+			case "message.uncompressed_size", "messaging.message_payload_size_bytes", "messaging.message_payload_compressed_size_bytes",
+				"web.vitals.LCP.value", "web.vitals.TTFB.value", "web.vitals.FCP.value", "web.vitals.INP.value", "web.vitals.CLS.value":
 				isMetrics = true
 			default:
 				// nothing
@@ -293,8 +303,8 @@ func (h *L7FlowLog) fillAttributes(spanAttributes, resAttributes []*v11.KeyValue
 		}
 	}
 
-	if isHttp && len(h.L7ProtocolStr) == 0 {
-		h.L7ProtocolStr = datatype.L7_PROTOCOL_HTTP_1.String(false)
+	if isHttp && len(h.BizProtocol) == 0 {
+		h.BizProtocol = datatype.L7_PROTOCOL_HTTP_1.String(false)
 	}
 
 	// If http.target exists, read it for RequestResource. If not exist, read the part after the domain name from http.url.
@@ -308,7 +318,7 @@ func (h *L7FlowLog) fillAttributes(spanAttributes, resAttributes []*v11.KeyValue
 		}
 	}
 
-	h.L7Protocol, h.IsTLS = ParseL7Protocol(h.L7ProtocolStr, h.Version)
+	h.L7Protocol, h.IsTLS = ParseL7Protocol(h.BizProtocol, h.Version)
 	h.AttributeNames = attributeNames
 	h.AttributeValues = attributeValues
 	h.MetricsNames = metricsNames

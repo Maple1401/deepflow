@@ -19,6 +19,7 @@ package tool
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	mapset "github.com/deckarep/golang-set/v2"
@@ -130,13 +131,6 @@ type DataSet struct {
 	processIdentifierToGID       map[ProcessIdentifier]uint32
 	processGIDToTotalCount       map[uint32]uint
 	processGIDToSoftDeletedCount map[uint32]uint
-}
-
-type ProcessIdentifier struct {
-	Name        string
-	PodGroupID  int
-	VTapID      uint32
-	CommandLine string
 }
 
 func NewDataSet(md *rcommon.Metadata) *DataSet {
@@ -1115,12 +1109,15 @@ func (t *DataSet) DeleteProcess(dbItem *metadbmodel.Process) {
 }
 
 func (t *DataSet) GetProcessIdentifierByDBProcess(p *metadbmodel.Process) ProcessIdentifier {
-	return t.GetProcessIdentifier(p.Name, p.PodGroupID, p.VTapID, p.CommandLine)
+	return t.GetProcessIdentifier(p.Name, p.ProcessName, p.PodGroupID, p.VTapID, p.CommandLine)
 }
 
-func (t *DataSet) GetProcessIdentifier(name string, podGroupID int, vtapID uint32, commandLine string) ProcessIdentifier {
+func (t *DataSet) GetProcessIdentifier(name, processName string, podGroupID int, vtapID uint32, commandLine string) ProcessIdentifier {
 	var identifier ProcessIdentifier
 	if podGroupID == 0 {
+		if slices.Contains([]string{"java", "python", "python3", "node"}, processName) {
+			commandLine = extractExecFileFromCmd(commandLine)
+		}
 		identifier = ProcessIdentifier{
 			Name:        name,
 			VTapID:      vtapID,
@@ -1451,6 +1448,9 @@ func (t *DataSet) GetMacByVInterfaceLcuuid(vifLcuuid string) (string, bool) {
 }
 
 func (t *DataSet) GetNetworkLcuuidByID(id int) (string, bool) {
+	if id == 0 {
+		return "", true
+	}
 	if id == t.publicNetworkID {
 		return rcommon.PUBLIC_NETWORK_LCUUID, true
 	}
@@ -1761,7 +1761,7 @@ func (t *DataSet) GetDeviceNameByDeviceID(deviceType, deviceID int) (string, err
 	} else if deviceType == ctrlrcommon.VIF_DEVICE_TYPE_POD {
 		return t.GetPodNameByID(deviceID)
 	} else {
-		return "", fmt.Errorf("device type %d not supported", deviceType, t.metadata.LogPrefixes)
+		return "", fmt.Errorf("device type %d not supported", deviceType)
 	}
 }
 
@@ -1973,6 +1973,10 @@ func (t *DataSet) GetPodNodeLcuuidByID(id int) (string, bool) {
 }
 
 func (t *DataSet) GetPodNamespaceIDByLcuuid(lcuuid string) (int, bool) {
+	if lcuuid == ctrlrcommon.DEFAULT_POD_NAMESPACE {
+		return 0, true
+	}
+
 	id, exists := t.podNamespaceLcuuidToID[lcuuid]
 	if exists {
 		return id, true

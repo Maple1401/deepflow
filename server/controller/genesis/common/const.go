@@ -16,8 +16,23 @@
 
 package common
 
+var IGNORE_VINTERFACE_NAME = []string{
+	"lo",
+	"kube-ipvs0",
+}
+
+var VALID_SCOPE_NAME = []string{
+	"host",
+	"global",
+}
+
 const (
-	SYNC_TYPE_FORMAT = "%v-%v-%v-%v" // region-orgID-type-vtapID
+	SYNC_TYPE_FORMAT = "%d-%s-%s" // orgID-type-vtapKey
+)
+
+const (
+	CONFIG_DB_MYSQL = "mysql"
+	CONFIG_DB_REDIS = "redis"
 )
 
 const (
@@ -33,8 +48,4 @@ const (
 	DEVICE_TYPE_DOCKER_CONTAINER = "docker-container"
 	DEVICE_TYPE_PUBLIC_CLOUD     = "public-cloud"
 	DEVICE_TYPE_PHYSICAL_MACHINE = "physical-machine"
-)
-
-const (
-	CONFIG_KEY_WORKLOAD_RESOURCE_ENABLED = "inputs.resources.workload_resource_sync_enabled"
 )

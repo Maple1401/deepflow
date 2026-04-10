@@ -40,6 +40,7 @@ k8s.annotation             , K8s Annotation             ,
 k8s.env                    , K8s Env                    ,
 cloud.tag                  , Cloud Tag                  ,
 os.app                     , OS APP                     ,
+biz_service.group          , 服务组                      ,
 
 ip                         , IP 地址                    ,
 is_ipv4                    , IPv4 标志                  ,
@@ -58,4 +59,5 @@ vtap                       , 采集器                     , 已废弃，请使�
 agent                      , 采集器                     ,
 signal_source              , 信号源                     ,
 role                       , 角色                       ,
+
 biz_type                   , 业务类型                   ,

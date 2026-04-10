@@ -110,6 +110,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct EbpfCounter {
     rx: AtomicU64,
+    time_backtrack_max: AtomicU64,
     get_token_failed: AtomicU64,
 }
 
@@ -121,6 +122,7 @@ impl OwnedCountable for SyncEbpfCounter {
     fn get_counters(&self) -> Vec<Counter> {
         let rx = self.counter.rx.swap(0, Ordering::Relaxed);
         let get_token_failed = self.counter.get_token_failed.swap(0, Ordering::Relaxed);
+        let time_backtrack_max = self.counter.time_backtrack_max.swap(0, Ordering::Relaxed);
         let ebpf_counter = unsafe { ebpf::socket_tracer_stats() };
 
         vec![
@@ -133,6 +135,11 @@ impl OwnedCountable for SyncEbpfCounter {
                 "get_token_failed",
                 CounterType::Counted,
                 CounterValue::Unsigned(get_token_failed),
+            ),
+            (
+                "time_backtrack_max",
+                CounterType::Counted,
+                CounterValue::Unsigned(time_backtrack_max),
             ),
             (
                 "perf_pages_count",
@@ -411,6 +418,11 @@ impl EbpfDispatcher {
                 .socket
                 .preprocess
                 .out_of_order_reassembly_cache_size,
+            ebpf_config
+                .ebpf
+                .socket
+                .preprocess
+                .out_of_order_reassembly_timeout,
         );
         let mut flow_map = FlowMap::new(
             self.dispatcher_id as u32,
@@ -432,6 +444,7 @@ impl EbpfDispatcher {
         let mut log_parser_config = self.log_parser_config.load().clone();
         let mut collector_config = self.collector_config.load().clone();
         let mut ebpf_config = self.config.load().clone();
+        let mut last_packet_timestamp = 0;
 
         while unsafe { SWITCH } {
             if need_reload_config.swap(false, Ordering::Relaxed) {
@@ -467,9 +480,17 @@ impl EbpfDispatcher {
             }
 
             for mut packet in batch.drain(..) {
+                if packet.lookup_key.timestamp.as_nanos() < last_packet_timestamp {
+                    counter.time_backtrack_max.fetch_max(
+                        last_packet_timestamp - packet.lookup_key.timestamp.as_nanos(),
+                        Ordering::Relaxed,
+                    );
+                }
+                last_packet_timestamp = packet.lookup_key.timestamp.as_nanos();
+
                 if !leaky_bucket.acquire(1) {
                     counter.get_token_failed.fetch_add(1, Ordering::Relaxed);
-                    exception_handler.set(Exception::RxPpsThresholdExceeded);
+                    exception_handler.set(Exception::RxPpsThresholdExceeded, None);
                     continue;
                 }
 
@@ -509,10 +530,7 @@ impl FlowAclListener for SyncEbpfDispatcher {
 }
 
 #[derive(Default)]
-struct ConfigHandle {
-    #[cfg(feature = "extended_observability")]
-    memory_profile_settings: Option<memory_profile::MemoryContextSettings>,
-}
+struct ConfigHandle;
 
 pub struct EbpfCollector {
     thread_dispatcher: EbpfDispatcher,
@@ -526,6 +544,9 @@ pub struct EbpfCollector {
 
     exception_handler: ExceptionHandler,
     process_listener: Arc<ProcessListener>,
+
+    #[cfg(feature = "extended_observability")]
+    memory_profiler: memory_profile::MemoryProfiler,
 }
 
 const BATCH_SIZE: usize = 64;
@@ -562,11 +583,11 @@ impl EbpfCollector {
         _: *mut c_void,
         #[allow(unused)] queue_id: c_int,
         sd: *mut ebpf::SK_BPF_DATA,
-    ) {
+    ) -> c_int {
         #[allow(static_mut_refs)]
         unsafe {
             if !SWITCH || SENDER.is_none() {
-                return;
+                return 0;
             }
 
             let sd = &mut sd.read_unaligned();
@@ -606,12 +627,8 @@ impl EbpfCollector {
                         _ => {}
                     }
                 }
-                return;
+                return 0;
             }
-
-            // The timestamp provided by eBPF is in nanoseconds, and here it is
-            // converted to microseconds.
-            sd.timestamp = sd.timestamp / 1000;
 
             let container_id =
                 CStr::from_ptr(sd.container_id.as_ptr() as *const libc::c_char).to_string_lossy();
@@ -621,7 +638,7 @@ impl EbpfCollector {
                 let event = ProcEvent::from_ebpf(sd, event_type);
                 if event.is_err() {
                     warn!("proc event parse from ebpf error: {}", event.unwrap_err());
-                    return;
+                    return 0;
                 }
                 let mut event = event.unwrap();
                 if let Some(policy) = POLICY_GETTER.as_ref() {
@@ -630,12 +647,12 @@ impl EbpfCollector {
                 if let Err(e) = PROC_EVENT_SENDER.as_mut().unwrap().send(event) {
                     warn!("event send ebpf error: {:?}", e);
                 }
-                return;
+                return 0;
             }
             let packet = MetaPacket::from_ebpf(sd);
             if packet.is_err() {
                 warn!("meta packet parse from ebpf error: {}", packet.unwrap_err());
-                return;
+                return 0;
             }
             let mut packet = packet.unwrap();
             if let Some(policy) = POLICY_GETTER.as_ref() {
@@ -645,53 +662,44 @@ impl EbpfCollector {
                 warn!("meta packet send ebpf error: {:?}", e);
             }
         }
+
+        0
     }
 
     extern "C" fn ebpf_profiler_callback(
         #[allow(unused)] ctx: *mut c_void,
-        #[allow(unused)] queue_id: c_int,
+        _queue_id: c_int,
         data: *mut ebpf::stack_profile_data,
-    ) {
+    ) -> c_int {
         #[allow(static_mut_refs)]
         unsafe {
             if !SWITCH || EBPF_PROFILE_SENDER.is_none() {
-                return;
+                return 0;
             }
-            let data = &mut *data;
+
+            let time_diff = TIME_DIFF
+                .as_ref()
+                .map(|t| t.load(Ordering::Relaxed))
+                .unwrap_or(0);
 
             #[cfg(feature = "extended_observability")]
-            if data.profiler_type == ebpf::PROFILER_TYPE_MEMORY {
-                let mut ts_nanos = data.timestamp;
-                if let Some(time_diff) = TIME_DIFF.as_ref() {
-                    let diff = time_diff.load(Ordering::Relaxed);
-                    if diff > 0 {
-                        ts_nanos += diff as u64;
-                    } else {
-                        ts_nanos -= (-diff) as u64;
-                    }
-                }
+            if (*data).profiler_type == ebpf::PROFILER_TYPE_MEMORY {
                 let Some(m_ctx) = (ctx as *mut memory_profile::MemoryContext).as_mut() else {
-                    return;
+                    return 0;
                 };
                 m_ctx.update(data);
-                m_ctx.report(
-                    Duration::from_nanos(ts_nanos),
-                    EBPF_PROFILE_SENDER.as_mut().unwrap(),
-                );
-                return;
+                return ebpf::TRACER_CALLBACK_FLAG_KEEP_DATA as c_int;
             }
+
+            let data = &mut *data;
 
             let mut profile = metric::Profile::default();
             profile.sample_rate = ON_CPU_PROFILE_FREQUENCY;
-            profile.timestamp = data.timestamp;
-            if let Some(time_diff) = TIME_DIFF.as_ref() {
-                let diff = time_diff.load(Ordering::Relaxed);
-                if diff > 0 {
-                    profile.timestamp += diff as u64;
-                } else {
-                    profile.timestamp -= (-diff) as u64;
-                }
-            }
+            profile.timestamp = if time_diff > 0 {
+                data.timestamp + time_diff as u64
+            } else {
+                data.timestamp - time_diff.abs() as u64
+            };
             profile.event_type = match data.profiler_type {
                 #[cfg(feature = "extended_observability")]
                 ebpf::PROFILER_TYPE_OFFCPU => metric::ProfileEventType::EbpfOffCpu.into(),
@@ -732,6 +740,8 @@ impl EbpfCollector {
                 warn!("ebpf profile send error: {:?}", e);
             }
         }
+
+        0
     }
 
     fn ebpf_init(
@@ -744,12 +754,19 @@ impl EbpfCollector {
         time_diff: Arc<AtomicI64>,
         stats_collector: &stats::Collector,
         process_listener: &ProcessListener,
+        #[cfg(feature = "extended_observability")] memory_context: memory_profile::MemoryContext,
     ) -> Result<ConfigHandle> {
         // ebpf和ebpf collector通信配置初始化
         #[allow(static_mut_refs)]
         unsafe {
             let dpdk_sender_count = dpdk_senders.len();
-            let handle = Self::ebpf_core_init(process_listener, config, stats_collector);
+            let handle = Self::ebpf_core_init(
+                process_listener,
+                #[cfg(feature = "extended_observability")]
+                memory_context,
+                config,
+                stats_collector,
+            );
             // initialize communication between core and ebpf collector
             SWITCH = false;
             SENDER = Some(sender);
@@ -771,13 +788,17 @@ impl EbpfCollector {
     #[allow(unused)]
     unsafe fn ebpf_core_init(
         process_listener: &ProcessListener,
+        #[cfg(feature = "extended_observability")] memory_context: memory_profile::MemoryContext,
         config: &EbpfConfig,
         stats_collector: &stats::Collector,
     ) -> Result<ConfigHandle> {
         // ebpf core modules init
         let mut handle = ConfigHandle::default();
-        ebpf::set_uprobe_golang_enabled(config.ebpf.socket.uprobe.golang.enabled);
-        if config.ebpf.socket.uprobe.golang.enabled {
+        let is_uprobe_meltdown = crate::utils::guard::is_kernel_ebpf_uprobe_meltdown();
+        ebpf::set_uprobe_golang_enabled(
+            !is_uprobe_meltdown && config.ebpf.socket.uprobe.golang.enabled,
+        );
+        if !is_uprobe_meltdown && config.ebpf.socket.uprobe.golang.enabled {
             let feature = "ebpf.socket.uprobe.golang";
             process_listener.register(feature, set_feature_uprobe_golang);
 
@@ -804,8 +825,10 @@ impl EbpfCollector {
             info!("ebpf golang uprobe proc regexp is empty, skip set")
         }
 
-        ebpf::set_uprobe_openssl_enabled(config.ebpf.socket.uprobe.tls.enabled);
-        if config.ebpf.socket.uprobe.tls.enabled {
+        ebpf::set_uprobe_openssl_enabled(
+            !is_uprobe_meltdown && config.ebpf.socket.uprobe.tls.enabled,
+        );
+        if !is_uprobe_meltdown && config.ebpf.socket.uprobe.tls.enabled {
             let feature = "ebpf.socket.uprobe.tls";
             process_listener.register(feature, set_feature_uprobe_tls);
 
@@ -941,6 +964,15 @@ impl EbpfCollector {
             return Err(Error::EbpfInitError);
         }
 
+        if ebpf::set_virtual_file_collect(config.ebpf.file.io_event.enable_virtual_file_collect)
+            != 0
+        {
+            info!(
+                "ebpf set_virtual_file_collect error: {}",
+                config.ebpf.file.io_event.enable_virtual_file_collect
+            );
+        }
+
         if ebpf::set_io_event_minimal_duration(
             config.ebpf.file.io_event.minimal_duration.as_nanos() as c_ulonglong,
         ) != 0
@@ -987,9 +1019,61 @@ impl EbpfCollector {
 
         ebpf::set_bpf_map_prealloc(!config.ebpf.socket.tunning.map_prealloc_disabled);
 
+        if let Err(e) = config.ebpf.tunning.validate() {
+            warn!(
+                "skip setting kick thread nice value to {}: {}",
+                config.ebpf.tunning.kick_kern_nice, e
+            );
+        } else if ebpf::set_kick_kern_nice(config.ebpf.tunning.kick_kern_nice) != 0 {
+            warn!(
+                "failed to set kick thread nice value to {}",
+                config.ebpf.tunning.kick_kern_nice
+            );
+        }
+
+        if config.ebpf.socket.tunning.fentry_enabled {
+            ebpf::enable_fentry();
+        } else {
+            ebpf::disable_fentry();
+        }
+
         // set ebpf dpdk enabled
         #[cfg(feature = "extended_observability")]
         ebpf::set_dpdk_trace_enabled(config.dpdk_enabled);
+
+        #[cfg(feature = "extended_observability")]
+        {
+            let tcp_option_trace = &config.ebpf.socket.sock_ops.tcp_option_trace;
+
+            if ebpf::set_tcp_option_tracing_sample_window(
+                tcp_option_trace.sampling_window_bytes as u32,
+            ) != 0
+            {
+                warn!(
+                    "failed to set tcp option tracing sampling window to {}",
+                    tcp_option_trace.sampling_window_bytes
+                );
+            }
+
+            if ebpf::set_tcp_option_tracing_enabled(tcp_option_trace.enabled) != 0 {
+                warn!(
+                    "tcp option tracing enable failed (set enabled = {})",
+                    tcp_option_trace.enabled
+                );
+            }
+
+            // NicOptimize
+            if ebpf::set_nic_optimization(config.ebpf.network.nic_opt_enabled) != 0 {
+                warn!(
+                    "Failed to apply NIC optimization setting (enabled: {})",
+                    config.ebpf.network.nic_opt_enabled
+                );
+            }
+
+            for nic in &config.ebpf.network.nic_optimize {
+                nic.apply();
+            }
+        }
 
         if ebpf::running_socket_tracer(
             Self::ebpf_l7_callback,                              /* 回调接口 rust -> C */
@@ -1011,16 +1095,18 @@ impl EbpfCollector {
         let off_cpu = &ebpf_conf.profile.off_cpu;
         let memory = &ebpf_conf.profile.memory;
 
-        let profiler_enabled = !on_cpu.disabled
+        let profiler_enabled = (!is_uprobe_meltdown && !on_cpu.disabled)
             || (cfg!(feature = "extended_observability")
-                && (!off_cpu.disabled || !memory.disabled));
+                && (!off_cpu.disabled || (!is_uprobe_meltdown && !memory.disabled)));
         if profiler_enabled {
-            if !on_cpu.disabled {
+            if !is_uprobe_meltdown && !on_cpu.disabled {
                 ebpf::enable_oncpu_profiler();
             } else {
                 ebpf::disable_oncpu_profiler();
             }
-            ebpf::set_dwarf_enabled(!config.ebpf.profile.unwinding.dwarf_disabled);
+            ebpf::set_dwarf_enabled(
+                !is_uprobe_meltdown && !config.ebpf.profile.unwinding.dwarf_disabled,
+            );
             ebpf::set_dwarf_regex(
                 CString::new(config.ebpf.profile.unwinding.dwarf_regex.as_bytes())
                     .unwrap()
@@ -1034,6 +1120,30 @@ impl EbpfCollector {
                 config.ebpf.profile.unwinding.dwarf_shard_map_size as i32,
             );
 
+            // Language-specific profiling configuration
+            // Set feature regex for each language profiler based on configuration
+            // When xxx_disabled is false, set regex to ".*" to enable the feature
+            // When xxx_disabled is true, don't set regex (feature remains disabled)
+            let languages = &config.ebpf.profile.languages;
+            if !languages.python_disabled {
+                ebpf::set_feature_regex(
+                    ebpf::FEATURE_PROFILE_PYTHON,
+                    CString::new(".*").unwrap().as_c_str().as_ptr(),
+                );
+            }
+            if !languages.php_disabled {
+                ebpf::set_feature_regex(
+                    ebpf::FEATURE_PROFILE_PHP,
+                    CString::new(".*").unwrap().as_c_str().as_ptr(),
+                );
+            }
+            if !languages.nodejs_disabled {
+                ebpf::set_feature_regex(
+                    ebpf::FEATURE_PROFILE_V8,
+                    CString::new(".*").unwrap().as_c_str().as_ptr(),
+                );
+            }
+
             #[cfg(feature = "extended_observability")]
             {
                 if !off_cpu.disabled {
@@ -1042,7 +1152,7 @@ impl EbpfCollector {
                     ebpf::disable_offcpu_profiler();
                 }
 
-                if !memory.disabled {
+                if !is_uprobe_meltdown && !memory.disabled {
                     ebpf::enable_memory_profiler();
                 } else {
                     ebpf::disable_memory_profiler();
@@ -1053,18 +1163,8 @@ impl EbpfCollector {
             let mut contexts: [*mut c_void; 3] = [ptr::null_mut(); 3];
             #[cfg(feature = "extended_observability")]
             {
-                let mp_ctx = memory_profile::MemoryContext::new(
-                    memory.report_interval,
-                    memory.allocated_addresses_lru_len,
-                    ebpf_conf.profile.preprocess.stack_compression,
-                );
-                handle.memory_profile_settings = Some(mp_ctx.settings());
-                stats_collector.register_countable(
-                    &stats::NoTagModule("ebpf-memory-profiler"),
-                    Countable::Ref(mp_ctx.counters()),
-                );
                 contexts[ebpf::PROFILER_CTX_MEMORY_IDX] =
-                    Box::into_raw(Box::new(mp_ctx)) as *mut c_void;
+                    Box::into_raw(Box::new(memory_context)) as *mut c_void;
             }
 
             if ebpf::start_continuous_profiler(
@@ -1075,10 +1175,9 @@ impl EbpfCollector {
             ) != 0
             {
                 warn!("ebpf start_continuous_profiler error.");
-                return Err(Error::EbpfInitError);
             }
 
-            if !on_cpu.disabled {
+            if !is_uprobe_meltdown && !on_cpu.disabled {
                 let feature = "ebpf.profile.on_cpu";
                 process_listener.register(feature, set_feature_on_cpu);
 
@@ -1134,7 +1233,7 @@ impl EbpfCollector {
                     ebpf::set_offcpu_minblock_time(off_cpu.min_blocking_time.as_micros() as u32);
                 }
 
-                if !memory.disabled {
+                if !is_uprobe_meltdown && !memory.disabled {
                     let feature = "ebpf.profile.memory";
                     process_listener.register(feature, set_feature_memory);
 
@@ -1164,7 +1263,8 @@ impl EbpfCollector {
         #[cfg(feature = "extended_observability")]
         if config.dpdk_enabled {
             let dpdk = &config.ebpf.socket.uprobe.dpdk;
-            if !dpdk.command.is_empty() {
+
+            if !is_uprobe_meltdown && !dpdk.command.is_empty() {
                 ebpf::set_dpdk_cmd_name(
                     CString::new(dpdk.command.as_bytes())
                         .unwrap()
@@ -1172,6 +1272,7 @@ impl EbpfCollector {
                         .as_ptr(),
                 );
             }
+
             if !dpdk.rx_hooks.is_empty() {
                 ebpf::set_dpdk_hooks(
                     ebpf::DPDK_HOOK_TYPE_RECV as c_int,
@@ -1192,6 +1293,12 @@ impl EbpfCollector {
             }
 
             ebpf::dpdk_trace_start();
+        }
+
+        // Istio envoy mtls
+        #[cfg(feature = "extended_observability")]
+        if !is_uprobe_meltdown && config.ebpf.socket.uprobe.tls.enabled {
+            ebpf::envoy_trace_start();
         }
 
         ebpf::bpf_tracer_finish();
@@ -1251,6 +1358,12 @@ impl EbpfCollector {
         info!("ebpf collector stopping ebpf-kernel.");
         unsafe {
             ebpf::socket_tracer_stop();
+            #[cfg(feature = "extended_observability")]
+            {
+                if ebpf::set_tcp_option_tracing_enabled(false) != 0 {
+                    warn!("failed to disable tcp option tracing while stopping");
+                }
+            }
         }
     }
 
@@ -1273,11 +1386,17 @@ impl EbpfCollector {
         process_listener: &Arc<ProcessListener>,
     ) -> Result<Box<Self>> {
         let ebpf_config = config.load();
-        if ebpf_config.ebpf.disabled {
+        let is_ebpf_meltdown = crate::utils::guard::is_kernel_ebpf_meltdown();
+        let is_uprobe_meltdown = crate::utils::guard::is_kernel_ebpf_uprobe_meltdown();
+
+        if ebpf_config.ebpf.disabled || is_ebpf_meltdown {
             info!("ebpf collector disabled.");
             return Err(Error::EbpfDisabled);
         }
-        info!("ebpf collector init...");
+        info!(
+            "ebpf collector init... uprobe_meltdown: {}",
+            is_uprobe_meltdown
+        );
         let queue_name = "0-ebpf-to-ebpf-collector";
         let (sender, receiver, counter) =
             bounded_with_debug(ebpf_config.queue_size, queue_name, queue_debugger);
@@ -1287,6 +1406,16 @@ impl EbpfCollector {
                 module: queue_name,
             },
             Countable::Owned(Box::new(counter)),
+        );
+
+        #[cfg(feature = "extended_observability")]
+        let memory_profiler = memory_profile::MemoryProfiler::new(
+            config.clone(),
+            ebpf_profile_sender.clone(),
+            time_diff.clone(),
+            policy_getter,
+            queue_debugger,
+            &stats_collector,
         );
 
         let config_handle = Self::ebpf_init(
@@ -1299,6 +1428,8 @@ impl EbpfCollector {
             time_diff.clone(),
             &stats_collector,
             process_listener,
+            #[cfg(feature = "extended_observability")]
+            memory_profiler.context(),
         )?;
 
         info!("ebpf collector initialized.");
@@ -1321,12 +1452,15 @@ impl EbpfCollector {
             config_handle,
             counter: Arc::new(EbpfCounter {
                 rx: AtomicU64::new(0),
+                time_backtrack_max: AtomicU64::new(0),
                 get_token_failed: AtomicU64::new(0),
             }),
             need_reload_config: Default::default(),
             stats_collector,
             exception_handler,
             process_listener: process_listener.clone(),
+            #[cfg(feature = "extended_observability")]
+            memory_profiler,
         }))
     }
 
@@ -1349,14 +1483,16 @@ impl EbpfCollector {
     pub fn on_config_change(&mut self, config: &EbpfConfig) {
         unsafe {
             let ecfg = &config.ebpf.profile;
+            let is_uprobe_meltdown = crate::utils::guard::is_kernel_ebpf_uprobe_meltdown();
             let restart_cprofiler = ebpf::dwarf_available()
                 && ebpf::continuous_profiler_running()
-                && (ebpf::get_dwarf_enabled() != !ecfg.unwinding.dwarf_disabled
+                && ((!is_uprobe_meltdown
+                    && ebpf::get_dwarf_enabled() != !ecfg.unwinding.dwarf_disabled)
                     || ebpf::get_dwarf_process_map_size() as u32
                         != ecfg.unwinding.dwarf_process_map_size
                     || ebpf::get_dwarf_shard_map_size() as u32
                         != ecfg.unwinding.dwarf_shard_map_size);
-            ebpf::set_dwarf_enabled(!ecfg.unwinding.dwarf_disabled);
+            ebpf::set_dwarf_enabled(!is_uprobe_meltdown && !ecfg.unwinding.dwarf_disabled);
             ebpf::set_dwarf_regex(
                 CString::new(ecfg.unwinding.dwarf_regex.as_bytes())
                     .unwrap()
@@ -1377,9 +1513,13 @@ impl EbpfCollector {
                             as *mut memory_profile::MemoryContext,
                     ));
                 }
-                if let Ok(handle) =
-                    Self::ebpf_core_init(&self.process_listener, config, &self.stats_collector)
-                {
+                if let Ok(handle) = Self::ebpf_core_init(
+                    &self.process_listener,
+                    #[cfg(feature = "extended_observability")]
+                    self.memory_profiler.context(),
+                    config,
+                    &self.stats_collector,
+                ) {
                     self.config_handle = handle;
                 } else {
                     warn!("ebpf start_continuous_profiler error.");
@@ -1387,14 +1527,44 @@ impl EbpfCollector {
                     return;
                 }
             }
-            #[cfg(feature = "extended_observability")]
-            if let Some(s) = self.config_handle.memory_profile_settings.as_ref() {
-                s.set_report_interval(ecfg.memory.report_interval);
-                s.set_address_lru_len(ecfg.memory.allocated_addresses_lru_len);
-            }
 
             Self::ebpf_on_config_change(config.l7_log_packet_size);
+
+            #[cfg(feature = "extended_observability")]
+            {
+                let tcp_option_trace = &config.ebpf.socket.sock_ops.tcp_option_trace;
+
+                if ebpf::set_tcp_option_tracing_sample_window(
+                    tcp_option_trace.sampling_window_bytes as u32,
+                ) != 0
+                {
+                    warn!(
+                        "failed to set tcp option tracing sampling window to {}",
+                        tcp_option_trace.sampling_window_bytes
+                    );
+                }
+
+                if ebpf::set_tcp_option_tracing_enabled(tcp_option_trace.enabled) != 0 {
+                    warn!(
+                        "tcp option tracing enable failed (set enabled = {})",
+                        tcp_option_trace.enabled
+                    );
+                }
+
+                // NicOptimize
+                if ebpf::set_nic_optimization(config.ebpf.network.nic_opt_enabled) != 0 {
+                    warn!(
+                        "Failed to apply NIC optimization setting (enabled: {})",
+                        config.ebpf.network.nic_opt_enabled
+                    );
+                }
+
+                for nic in &config.ebpf.network.nic_optimize {
+                    nic.apply();
+                }
+            }
         }
+
         if config.l7_log_enabled() || config.dpdk_enabled {
             self.start();
         } else {
@@ -1422,6 +1592,9 @@ impl EbpfCollector {
                 .unwrap(),
         );
 
+        #[cfg(feature = "extended_observability")]
+        self.memory_profiler.start();
+
         debug!("ebpf collector starting ebpf-kernel.");
         Self::ebpf_start();
         info!("ebpf collector started");
@@ -1437,6 +1610,9 @@ impl EbpfCollector {
         }
         Self::ebpf_stop();
 
+        #[cfg(feature = "extended_observability")]
+        self.memory_profiler.stop();
+
         info!("notified ebpf collector stopping thread.");
         self.thread_handle.take()
     }
@@ -1450,6 +1626,9 @@ impl EbpfCollector {
             SWITCH = false;
         }
         Self::ebpf_stop();
+
+        #[cfg(feature = "extended_observability")]
+        self.memory_profiler.stop();
 
         info!("ebpf collector stopping thread.");
         if let Some(handler) = self.thread_handle.take() {

@@ -115,6 +115,26 @@ const (
 
 	DISABLED = 0
 	ENABLED  = 1
+
+	MEGA_BYTE = 1024 * 1024
+
+	HALF_MEGA_BYTE = MEGA_BYTE / 2
+
+	BUFFER_SIZE_EXTRA = 512 * 1024 // 512KB
+)
+
+const (
+	UNKNOW_VTAP_TYPE_KVM        = 1
+	UNKNOW_VTAP_TYPE_WORKLOAD_V = 3
+)
+
+const (
+	CONFIG_KEY_FIELDS                 = "fields"
+	CONFIG_KEY_CONST_FIELDS           = "const_fields"
+	CONFIG_KEY_COMPOUND_FIELDS        = "compound_fields"
+	CONFIG_KEY_BIZ_PROTOCOL_POLICIES  = "biz_protocol_policies"
+	CONFIG_KEY_BIZ_FIELD_DICTIONARIES = "biz_field.dictionaries"
+	CONFIG_KEY_BIZ_FIELD_POLICIES     = "biz_field.policies"
 )
 
 const (
@@ -125,6 +145,7 @@ const (
 	CONFIG_KEY_PROXY_CONTROLLER_PORT       = "global.communication.proxy_controller_port"
 	CONFIG_KEY_CAPTURE_MODE                = "inputs.cbpf.common.capture_mode"
 	CONFIG_KEY_DOMAIN_FILTER               = "inputs.resources.pull_resource_from_controller.domain_filter"
+	CONFIG_KEY_WORKLOAD_RESOURCE_ENABLED   = "inputs.resources.workload_resource_sync_enabled"
 	CONFIG_KEY_HYPERVISOR_RESOURCE_ENABLED = "inputs.resources.private_cloud.hypervisor_resource_enabled"
 )
 

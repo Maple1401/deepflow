@@ -41,6 +41,7 @@ import (
 type AgentParamData struct {
 	K8SWatchPolicy int32
 	OrgID          uint32
+	GRPCBufferSize uint64
 	CtrlIP         string
 	CtrlMac        string
 	GroupID        string
@@ -116,6 +117,13 @@ func agentRegiterCommand() []*cobra.Command {
 			agentInitCmd(cmd, []AgentCmdExecute{AconfigData})
 		},
 	}
+	grpcBufferSizeCmd := &cobra.Command{
+		Use:   "grpc-buffer-size",
+		Short: "grpc request server with current-grpc-buffer-size",
+		Run: func(cmd *cobra.Command, args []string) {
+			agentInitCmd(cmd, []AgentCmdExecute{AGRPCBufferSize})
+		},
+	}
 	skipInterfaceCmd := &cobra.Command{
 		Use:   "skip-interface",
 		Short: "get skip-interface from deepflow-server",
@@ -123,6 +131,14 @@ func agentRegiterCommand() []*cobra.Command {
 			agentInitCmd(cmd, []AgentCmdExecute{AskipInterface})
 		},
 	}
+	CustomAppConfigCmd := &cobra.Command{
+		Use:   "custom-app-config",
+		Short: "get custom app config from deepflow-server",
+		Run: func(cmd *cobra.Command, args []string) {
+			agentInitCmd(cmd, []AgentCmdExecute{AGRPCCustomAppConfig})
+		},
+	}
+
 	gpidAgentResponseCmd := &cobra.Command{
 		Use:   "gpid-agent-response",
 		Short: "get gpid-agent-response from deepflow-server",
@@ -137,7 +153,6 @@ func agentRegiterCommand() []*cobra.Command {
 			AgpidGlobalTable(cmd)
 		},
 	}
-
 	gpidAgentRequestCmd := &cobra.Command{
 		Use:   "gpid-agent-request",
 		Short: "get gpid-agent-request from deepflow-server",
@@ -145,6 +160,7 @@ func agentRegiterCommand() []*cobra.Command {
 			AgpidAgentRequest(cmd)
 		},
 	}
+
 	realGlobalCmd := &cobra.Command{
 		Use:   "realclient-to-realserver",
 		Short: "get realclient-to-realserver from deepflow-server",
@@ -174,13 +190,14 @@ func agentRegiterCommand() []*cobra.Command {
 		Short: "get all data from deepflow-server",
 		Run: func(cmd *cobra.Command, args []string) {
 			agentInitCmd(cmd, []AgentCmdExecute{AplatformData, AipGroups, AflowAcls,
-				Asegments, AtapTypes, Acontainers, AconfigData, AskipInterface})
+				Asegments, AtapTypes, Acontainers, AconfigData, AGRPCBufferSize,
+				AskipInterface, AGRPCCustomAppConfig})
 		},
 	}
 
 	commands := []*cobra.Command{agentCacheCmd, platformDataCmd, ipGroupsCmd,
-		flowAclsCmd, configCmd, tapTypesCmd, segmentsCmd, containersCmd,
-		skipInterfaceCmd, gpidAgentResponseCmd, gpidGlobalTableCmd,
+		flowAclsCmd, configCmd, grpcBufferSizeCmd, tapTypesCmd, segmentsCmd, containersCmd,
+		skipInterfaceCmd, gpidAgentResponseCmd, CustomAppConfigCmd, gpidGlobalTableCmd,
 		gpidAgentRequestCmd, realGlobalCmd, ripToVipCmd, pluginCmd, allCmd}
 	return commands
 }
@@ -191,6 +208,7 @@ func AgentCheckRegisterCommand() *cobra.Command {
 		Short: "pull grpc data from deepflow-server",
 	}
 	trisolarisCmd.PersistentFlags().Int32VarP(&agentParamData.K8SWatchPolicy, "kwp", "", 0, "agent k8s watch policy: 0.normal 1.only 2.disabled")
+	trisolarisCmd.PersistentFlags().Uint64VarP(&agentParamData.GRPCBufferSize, "size", "", 0, "agent current grpc buffer size, Unit: MB")
 	trisolarisCmd.PersistentFlags().StringVarP(&agentParamData.CtrlIP, "cip", "", "", "agent ctrl ip")
 	trisolarisCmd.PersistentFlags().StringVarP(&agentParamData.CtrlMac, "cmac", "", "", "agent ctrl mac")
 	trisolarisCmd.PersistentFlags().StringVarP(&agentParamData.GroupID, "gid", "", "", "agent group ID")
@@ -260,11 +278,13 @@ func agentInitCmd(cmd *cobra.Command, cmds []AgentCmdExecute) {
 	clusterID := agentParamData.ClusterID
 	teamID := agentParamData.TeamID
 	k8sWatchPolicy := agent.KubernetesWatchPolicy(agentParamData.K8SWatchPolicy)
+	grpcBufferSize := agentParamData.GRPCBufferSize * 1024 * 1024
 	fmt.Printf("request trisolaris(%s), params(%+v)\n", conn.Target(), agentParamData)
 	c := agent.NewSynchronizerClient(conn)
 	reqData := &agent.SyncRequest{
 		CtrlIp:                &agentParamData.CtrlIP,
 		CtrlMac:               &agentParamData.CtrlMac,
+		CurrentGrpcBufferSize: &grpcBufferSize,
 		AgentGroupIdRequest:   &groupID,
 		KubernetesClusterId:   &clusterID,
 		KubernetesWatchPolicy: &k8sWatchPolicy,
@@ -278,7 +298,12 @@ func agentInitCmd(cmd *cobra.Command, cmds []AgentCmdExecute) {
 		fmt.Println(err)
 		return
 	}
-	fmt.Printf("revision: %s\n", response.GetRevision())
+	if agentParamData.GRPCBufferSize == 0 {
+		fmt.Printf("revision: %s\n", response.GetRevision())
+	} else {
+		fmt.Printf("current grpc buffer size (byte): %d\n", grpcBufferSize)
+	}
+
 	for _, cmd := range cmds {
 		cmd(response)
 	}
@@ -574,11 +599,20 @@ func AconfigData(response *agent.SyncResponse) {
 	fmt.Println(proto.MarshalTextString(dynamicConfig))
 }
 
+func AGRPCBufferSize(response *agent.SyncResponse) {
+	fmt.Printf("only partial fields: %t\n", response.GetOnlyPartialFields())
+	fmt.Printf("new grpc buffer size (byte): %d\n", response.GetNewGrpcBufferSize())
+}
+
 func AskipInterface(response *agent.SyncResponse) {
 	fmt.Println("SkipInterface:")
 	for index, skipInterface := range response.GetSkipInterface() {
 		AJsonFormat(index+1, fmt.Sprintf("mac: %s", Uint64ToMac(skipInterface.GetMac())))
 	}
+}
+
+func AGRPCCustomAppConfig(response *agent.SyncResponse) {
+	fmt.Println(string(response.GetCustomAppConfig().GetConfigs()))
 }
 
 func AtapTypes(response *agent.SyncResponse) {

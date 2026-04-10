@@ -28,7 +28,9 @@ use std::sync::Arc;
 
 use enum_dispatch::enum_dispatch;
 use public::bitmap::Bitmap;
-use public::l7_protocol::{L7ProtocolChecker as L7ProtocolCheckerBitmap, L7ProtocolEnum};
+use public::l7_protocol::{
+    L7ProtocolChecker as L7ProtocolCheckerBitmap, L7ProtocolEnum, LogMessageType,
+};
 
 use super::protocol_logs::sql::ObfuscateCache;
 use super::{
@@ -127,6 +129,23 @@ pub struct L7ProtocolChecker {
     other: Vec<L7ProtocolTuple>,
 }
 
+impl From<&FlowConfig> for L7ProtocolChecker {
+    fn from(config: &FlowConfig) -> Self {
+        Self::new(
+            &config.l7_protocol_enabled_bitmap,
+            &config
+                .l7_protocol_parse_port_bitmap
+                .iter()
+                .filter_map(|(name, bitmap)| {
+                    L7ProtocolParser::try_from(name.as_ref())
+                        .ok()
+                        .map(|p| (p.protocol(), bitmap.clone()))
+                })
+                .collect(),
+        )
+    }
+}
+
 impl L7ProtocolChecker {
     pub fn new(
         protocol_bitmap: &L7ProtocolBitmap,
@@ -159,7 +178,7 @@ impl L7ProtocolChecker {
         &self,
         l4_protocol: L4Protocol,
         port: u16,
-    ) -> L7ProtocolCheckerIterator {
+    ) -> L7ProtocolCheckerIterator<'_> {
         L7ProtocolCheckerIterator {
             iter: match l4_protocol {
                 L4Protocol::Tcp => self.tcp.iter(),
@@ -255,7 +274,7 @@ impl FlowLog {
         if let Some(payload) = packet.get_l7() {
             let mut parse_param = ParseParam::new(
                 &*packet,
-                self.perf_cache.clone(),
+                Some(self.perf_cache.clone()),
                 Rc::clone(&self.wasm_vm),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Rc::clone(&self.so_plugin),
@@ -269,15 +288,19 @@ impl FlowLog {
             parse_param.set_buf_size(flow_config.l7_log_packet_size as usize);
             parse_param.set_captured_byte(packet.get_captured_byte());
             parse_param.set_oracle_conf(flow_config.oracle_parse_conf);
+            parse_param.set_iso8583_conf(&flow_config.iso8583_parse_conf);
+            parse_param.set_web_sphere_mq_conf(&flow_config.web_sphere_mq_parse_conf);
 
             let parser = self.l7_protocol_log_parser.as_mut().unwrap();
 
-            if log_parser_config
+            parse_param.obfuscate_cache = if log_parser_config
                 .obfuscate_enabled_protocols
                 .is_enabled(self.l7_protocol_enum.get_l7_protocol())
             {
-                parser.set_obfuscate_cache(self.obfuscate_cache.as_ref().map(|o| o.clone()));
-            }
+                self.obfuscate_cache.clone()
+            } else {
+                None
+            };
 
             let ret = parser.parse_payload(
                 {
@@ -350,7 +373,7 @@ impl FlowLog {
 
             let mut param = ParseParam::new(
                 &*packet,
-                self.perf_cache.clone(),
+                Some(self.perf_cache.clone()),
                 Rc::clone(&self.wasm_vm),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Rc::clone(&self.so_plugin),
@@ -364,6 +387,8 @@ impl FlowLog {
             param.set_buf_size(pkt_size);
             param.set_captured_byte(payload.len());
             param.set_oracle_conf(flow_config.oracle_parse_conf);
+            param.set_iso8583_conf(&flow_config.iso8583_parse_conf);
+            param.set_web_sphere_mq_conf(&flow_config.web_sphere_mq_parse_conf);
 
             for protocol in checker.possible_protocols(
                 packet.lookup_key.proto.into(),
@@ -375,13 +400,15 @@ impl FlowLog {
                 let Some(mut parser) = get_parser(L7ProtocolEnum::L7Protocol(*protocol)) else {
                     continue;
                 };
-                if log_parser_config
+                param.obfuscate_cache = if log_parser_config
                     .obfuscate_enabled_protocols
                     .is_enabled(*protocol)
                 {
-                    parser.set_obfuscate_cache(self.obfuscate_cache.as_ref().map(|o| o.clone()));
-                }
-                if parser.check_payload(cut_payload, &param) {
+                    self.obfuscate_cache.clone()
+                } else {
+                    None
+                };
+                if let Some(message_type) = parser.check_payload(cut_payload, &param) {
                     self.l7_protocol_enum = parser.l7_protocol_enum();
 
                     // redis can not determine direction by RESP protocol when packet is from ebpf, special treatment
@@ -403,8 +430,13 @@ impl FlowLog {
                             2. eBPF: If the `server_port` can not be determined in `FlowMap::init_flow`,
                                 use the first packet's `dst_port` as `server_port`.
                         */
-                        self.server_port = packet.lookup_key.dst_port;
-                        packet.lookup_key.direction = PacketDirection::ClientToServer;
+                        if message_type == LogMessageType::Request {
+                            self.server_port = packet.lookup_key.dst_port;
+                            packet.lookup_key.direction = PacketDirection::ClientToServer;
+                        } else {
+                            self.server_port = packet.lookup_key.src_port;
+                            packet.lookup_key.direction = PacketDirection::ServerToClient;
+                        }
                     }
 
                     self.l7_protocol_log_parser = Some(Box::new(parser));
@@ -650,24 +682,11 @@ impl FlowLog {
         }
     }
 
-    pub fn copy_and_reset_l7_perf_data(
-        &mut self,
-        l7_timeout_count: u32,
-    ) -> (L7PerfStats, L7Protocol) {
-        let default_l7_perf = L7PerfStats {
-            err_timeout: l7_timeout_count,
-            ..Default::default()
-        };
-
+    pub fn copy_and_reset_l7_perf_data(&mut self) -> (Vec<L7PerfStats>, L7Protocol) {
         let l7_perf = self
             .l7_protocol_log_parser
             .as_mut()
-            .map_or(default_l7_perf.clone(), |l| {
-                l.perf_stats().map_or(default_l7_perf, |mut p| {
-                    p.err_timeout = l7_timeout_count;
-                    p
-                })
-            });
+            .map_or(vec![], |l| l.perf_stats());
 
         (l7_perf, self.l7_protocol_enum.get_l7_protocol())
     }

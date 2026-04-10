@@ -36,9 +36,9 @@ use dns_lookup::lookup_host;
 use flexi_logger::{
     colored_opt_format, writers::LogWriter, Age, Cleanup, Criterion, FileSpec, Logger, Naming,
 };
-use integration_vector::vector_component::VectorComponent;
 use log::{debug, error, info, warn};
 use num_enum::{FromPrimitive, IntoPrimitive};
+use serde::Serialize;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::broadcast;
 use zstd::Encoder as ZstdEncoder;
@@ -55,7 +55,6 @@ use crate::{
     common::{
         enums::CaptureNetworkType,
         flow::L7Stats,
-        proc_event::BoxedProcEvents,
         tagged_flow::{BoxedTaggedFlow, TaggedFlow},
         tap_types::CaptureNetworkTyper,
         FeatureFlags, DEFAULT_LOG_RETENTION, DEFAULT_LOG_UNCOMPRESSED_FILE_COUNT,
@@ -80,6 +79,7 @@ use crate::{
         ApplicationLog, BoxedPrometheusExtra, Datadog, MetricServer, OpenTelemetry,
         OpenTelemetryCompressed, Profile, TelegrafMetric,
     },
+    liveness::{self, ComponentId, ComponentSpec, LivenessRegistry, LivenessServer},
     metric::document::BoxedDocument,
     monitor::Monitor,
     platform::synchronizer::Synchronizer as PlatformSynchronizer,
@@ -105,7 +105,6 @@ use crate::{
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::{
-    ebpf_dispatcher::EbpfCollector,
     platform::SocketSynchronizer,
     utils::{environment::core_file_check, lru::Lru, process::ProcessListener},
 };
@@ -118,12 +117,15 @@ use crate::{
     utils::environment::{IN_CONTAINER, K8S_WATCH_POLICY},
 };
 
+#[cfg(feature = "enterprise-integration")]
 use integration_skywalking::SkyWalkingExtra;
+#[cfg(feature = "enterprise-integration")]
+use integration_vector::vector_component::VectorComponent;
 use packet_sequence_block::BoxedPacketSequenceBlock;
 use pcap_assembler::{BoxedPcapBatch, PcapAssembler};
 
 #[cfg(feature = "enterprise")]
-use enterprise_utils::utils::{kernel_version_check, ActionFlags};
+use enterprise_utils::kernel_version::{kernel_version_check, ActionFlags};
 use public::{
     buffer::BatchedBox,
     debug::QueueDebugger,
@@ -138,6 +140,8 @@ use public::{netns, packet, queue::Receiver};
 
 const MINUTE: Duration = Duration::from_secs(60);
 const COMMON_DELAY: u64 = 5; // Potential delay from other processing steps in flow_map
+const MAIN_LOOP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(10);
+const MAIN_LOOP_COMPONENT_TIMEOUT_MS: u64 = 60_000;
 const QG_PROCESS_MAX_DELAY: u64 = 5; // FIXME: Potential delay from processing steps in qg, it is an estimated value and is not accurate; the data processing capability of the quadruple_generator should be optimized.
 
 #[derive(Debug, Default)]
@@ -279,8 +283,28 @@ impl AgentState {
         sg.1.replace(config);
         self.notifier.notify_one();
     }
+
+    pub fn update_partial_config(&self, user_config: UserConfig) {
+        if self.terminated.load(Ordering::Relaxed) {
+            // when state is Terminated, main thread should still be notified for exiting
+            self.notifier.notify_one();
+            return;
+        }
+        let mut sg = self.state.lock().unwrap();
+        sg.0.enabled = user_config.global.common.enabled;
+        if let Some(changed_config) = sg.1.as_mut() {
+            changed_config.user_config = user_config;
+        } else {
+            sg.1.replace(ChangedConfig {
+                user_config,
+                ..Default::default()
+            });
+        }
+        self.notifier.notify_one();
+    }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct VersionInfo {
     pub name: &'static str,
     pub branch: &'static str,
@@ -411,6 +435,23 @@ impl Trident {
         sidecar_mode: bool,
         cgroups_disabled: bool,
     ) -> Result<Trident> {
+        // To prevent 'numad' from interfering with the CPU
+        // affinity settings of deepflow-agent
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        match trace_utils::protect_cpu_affinity() {
+            Ok(()) => info!("CPU affinity protected successfully"),
+            Err(e) => {
+                // Distinguish between "numad not found" (normal) and other errors
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    info!("numad process not found, skipping CPU affinity protection (normal)");
+                } else {
+                    warn!(
+                        "Failed to protect CPU affinity due to unexpected error: {}",
+                        e
+                    );
+                }
+            }
+        }
         let config = match agent_mode {
             RunningMode::Managed => {
                 match Config::load_from_file(config_path.as_ref()) {
@@ -606,13 +647,20 @@ impl Trident {
     fn kernel_version_check(state: &AgentState, exception_handler: &ExceptionHandler) {
         let action = kernel_version_check();
         if action.contains(ActionFlags::TERMINATE) {
-            exception_handler.set(Exception::KernelVersionCircuitBreaker);
+            exception_handler.set(Exception::KernelVersionCircuitBreaker, None);
             crate::utils::clean_and_exit(1);
         } else if action.contains(ActionFlags::MELTDOWN) {
-            exception_handler.set(Exception::KernelVersionCircuitBreaker);
+            exception_handler.set(Exception::KernelVersionCircuitBreaker, None);
             state.melt_down();
-        } else if action.contains(ActionFlags::ALARM) {
-            exception_handler.set(Exception::KernelVersionCircuitBreaker);
+            warn!("kernel check: set MELTDOWN");
+        } else if action.contains(ActionFlags::EBPF_MELTDOWN) {
+            exception_handler.set(Exception::KernelVersionCircuitBreaker, None);
+            // set ebpf_meltdown
+            warn!("kernel check: set EBPF_MELTDOWN");
+        } else if action.contains(ActionFlags::EBPF_UPROBE_MELTDOWN) {
+            exception_handler.set(Exception::KernelVersionCircuitBreaker, None);
+            // set ebpf_uprobe_meltdown
+            warn!("kernel check: set EBPF_UPROBE_MELTDOWN");
         }
     }
 
@@ -704,6 +752,34 @@ impl Trident {
                 .build()
                 .unwrap(),
         );
+        let liveness_registry = config_handler
+            .static_config
+            .liveness_probe_enabled
+            .then(|| LivenessRegistry::new(version_info));
+        let liveness_server = liveness_registry
+            .as_ref()
+            .map(|registry| {
+                let server = LivenessServer::new(
+                    runtime.clone(),
+                    registry.clone(),
+                    config_handler.static_config.liveness_probe_port,
+                );
+                server
+                    .start()
+                    .map_err(|e| anyhow!("start liveness probe failed: {e}"))?;
+                Ok::<_, anyhow::Error>(server)
+            })
+            .transpose()?;
+        let main_loop_liveness = liveness_registry.as_ref();
+        let main_loop_liveness = liveness::register(
+            main_loop_liveness,
+            ComponentSpec {
+                id: ComponentId::new("main-loop", 0),
+                display_name: "main loop".into(),
+                timeout_ms: MAIN_LOOP_COMPONENT_TIMEOUT_MS,
+                ..Default::default()
+            },
+        );
 
         let mut k8s_opaque_id = None;
         if matches!(
@@ -719,7 +795,6 @@ impl Trident {
 
         let (ipmac_tx, _) = broadcast::channel::<IpMacPair>(1);
         let ipmac_tx = Arc::new(ipmac_tx);
-
         let synchronizer = Arc::new(Synchronizer::new(
             runtime.clone(),
             session.clone(),
@@ -738,6 +813,7 @@ impl Trident {
             config_path,
             ipmac_tx.clone(),
             ntp_diff,
+            liveness_registry.clone(),
         ));
         stats_collector.register_countable(
             &stats::NoTagModule("ntp"),
@@ -755,6 +831,8 @@ impl Trident {
                 session.clone(),
                 runtime.clone(),
                 exception_handler.clone(),
+                config_handler.flow(),
+                config_handler.log_parser(),
             );
             #[cfg(any(target_os = "linux", target_os = "android"))]
             remote_executor.start();
@@ -789,8 +867,9 @@ impl Trident {
                     cgroups_controller = Some(cg_controller);
                 }
                 Err(e) => {
-                    warn!("initialize cgroups controller failed: {}, resource utilization will be checked regularly to prevent resource usage from exceeding the limit.", e);
-                    exception_handler.set(Exception::CgroupsConfigError);
+                    let error_msg = format!("initialize cgroups controller failed: {}, resource utilization will be checked regularly to prevent resource usage from exceeding the limit.", e);
+                    warn!("{}", error_msg);
+                    exception_handler.set(Exception::CgroupsConfigError, Some(error_msg));
                 }
             }
         }
@@ -804,13 +883,8 @@ impl Trident {
             exception_handler.clone(),
             cgroup_mount_path,
             is_cgroup_v2,
-            config_handler
-                .candidate_config
-                .user_config
-                .global
-                .tunning
-                .idle_memory_trimming,
             cgroups_disabled,
+            liveness_registry.clone(),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -886,10 +960,12 @@ impl Trident {
         let mut config_initialized = false;
 
         loop {
+            main_loop_liveness.heartbeat();
             let mut state_guard = state.state.lock().unwrap();
             if state.terminated.load(Ordering::Relaxed) {
                 mem::drop(state_guard);
                 if let Some(mut c) = components {
+                    main_loop_liveness.heartbeat();
                     c.stop();
                     guard.stop();
                     monitor.stop();
@@ -906,10 +982,21 @@ impl Trident {
                         }
                     }
                 }
+                main_loop_liveness.pause();
+                drop(liveness_server);
                 return Ok(());
             }
 
-            state_guard = state.notifier.wait(state_guard).unwrap();
+            let wait_result = state
+                .notifier
+                .wait_timeout(state_guard, MAIN_LOOP_LIVENESS_TIMEOUT)
+                .unwrap();
+            state_guard = wait_result.0;
+            if wait_result.1.timed_out() {
+                mem::drop(state_guard);
+                continue;
+            }
+            main_loop_liveness.heartbeat();
             match State::from(state_guard.0) {
                 State::Running if state_guard.1.is_none() => {
                     mem::drop(state_guard);
@@ -924,6 +1011,7 @@ impl Trident {
                         api_watcher.stop();
                     }
                     if let Some(ref mut c) = components {
+                        main_loop_liveness.heartbeat();
                         c.start();
                     }
                     continue;
@@ -936,9 +1024,11 @@ impl Trident {
                     }
                     if let Some(cfg) = new_config {
                         let agent_id = synchronizer.agent_id.read().clone();
+                        main_loop_liveness.heartbeat();
                         let callbacks = config_handler.on_config(
                             cfg.user_config,
                             &exception_handler,
+                            &stats_collector,
                             None,
                             #[cfg(target_os = "linux")]
                             &api_watcher,
@@ -948,6 +1038,7 @@ impl Trident {
                             first_run,
                         );
                         first_run = false;
+                        main_loop_liveness.heartbeat();
 
                         #[cfg(target_os = "linux")]
                         if config_handler
@@ -961,6 +1052,7 @@ impl Trident {
                         }
 
                         if let Some(Components::Agent(c)) = components.as_mut() {
+                            main_loop_liveness.heartbeat();
                             for callback in callbacks {
                                 callback(&config_handler, c);
                             }
@@ -979,6 +1071,7 @@ impl Trident {
                         if !config_initialized {
                             // start guard on receiving first config to ensure
                             // the meltdown thresholds are set by the config
+                            main_loop_liveness.heartbeat();
                             guard.start();
                             config_initialized = true;
                         }
@@ -1016,9 +1109,11 @@ impl Trident {
             let agent_id = synchronizer.agent_id.read().clone();
             match components.as_mut() {
                 None => {
+                    main_loop_liveness.heartbeat();
                     let callbacks = config_handler.on_config(
                         user_config,
                         &exception_handler,
+                        &stats_collector,
                         None,
                         #[cfg(target_os = "linux")]
                         &api_watcher,
@@ -1028,6 +1123,7 @@ impl Trident {
                         first_run,
                     );
                     first_run = false;
+                    main_loop_liveness.heartbeat();
 
                     #[cfg(target_os = "linux")]
                     if config_handler
@@ -1040,12 +1136,14 @@ impl Trident {
                         api_watcher.stop();
                     }
 
+                    main_loop_liveness.heartbeat();
                     let mut comp = Components::new(
                         &version_info,
                         &config_handler,
                         stats_collector.clone(),
                         &session,
                         &synchronizer,
+                        liveness_registry.clone(),
                         exception_handler.clone(),
                         #[cfg(target_os = "linux")]
                         libvirt_xml_extractor.clone(),
@@ -1062,6 +1160,7 @@ impl Trident {
                         ipmac_tx.clone(),
                     )?;
 
+                    main_loop_liveness.heartbeat();
                     comp.start();
 
                     if let Components::Agent(components) = &mut comp {
@@ -1071,6 +1170,7 @@ impl Trident {
                             parse_tap_type(components, tap_types);
                         }
 
+                        main_loop_liveness.heartbeat();
                         for callback in callbacks {
                             callback(&config_handler, components);
                         }
@@ -1079,10 +1179,12 @@ impl Trident {
                     components.replace(comp);
                 }
                 Some(Components::Agent(components)) => {
+                    main_loop_liveness.heartbeat();
                     let callbacks: Vec<fn(&ConfigHandler, &mut AgentComponents)> = config_handler
                         .on_config(
                             user_config,
                             &exception_handler,
+                            &stats_collector,
                             Some(components),
                             #[cfg(target_os = "linux")]
                             &api_watcher,
@@ -1092,6 +1194,7 @@ impl Trident {
                             first_run,
                         );
                     first_run = false;
+                    main_loop_liveness.heartbeat();
 
                     #[cfg(target_os = "linux")]
                     if config_handler
@@ -1105,8 +1208,10 @@ impl Trident {
                     }
 
                     components.config = config_handler.candidate_config.clone();
+                    main_loop_liveness.heartbeat();
                     components.start();
 
+                    main_loop_liveness.heartbeat();
                     component_on_config_change(
                         &config_handler,
                         components,
@@ -1118,6 +1223,7 @@ impl Trident {
                         #[cfg(target_os = "linux")]
                         libvirt_xml_extractor.clone(),
                     );
+                    main_loop_liveness.heartbeat();
                     for callback in callbacks {
                         callback(&config_handler, components);
                     }
@@ -1131,6 +1237,7 @@ impl Trident {
                     config_handler.on_config(
                         user_config,
                         &exception_handler,
+                        &stats_collector,
                         None,
                         #[cfg(target_os = "linux")]
                         &api_watcher,
@@ -1282,6 +1389,7 @@ fn component_on_config_change(
                     components.toa_info_sender.clone(),
                     components.l4_flow_aggr_sender.clone(),
                     components.metrics_sender.clone(),
+                    components.liveness_registry.clone(),
                     #[cfg(target_os = "linux")]
                     netns::NsFile::Root,
                     #[cfg(target_os = "linux")]
@@ -1403,6 +1511,7 @@ fn component_on_config_change(
                     components.toa_info_sender.clone(),
                     components.l4_flow_aggr_sender.clone(),
                     components.metrics_sender.clone(),
+                    components.liveness_registry.clone(),
                     #[cfg(target_os = "linux")]
                     netns::NsFile::Root,
                     #[cfg(target_os = "linux")]
@@ -1651,14 +1760,14 @@ impl WatcherComponents {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(unix, feature = "libtrace"))]
 pub struct EbpfDispatcherComponent {
-    pub ebpf_collector: Box<EbpfCollector>,
+    pub ebpf_collector: Box<crate::ebpf_dispatcher::EbpfCollector>,
     pub session_aggregator: SessionAggregator,
     pub l7_collector: L7CollectorThread,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(unix, feature = "libtrace"))]
 impl EbpfDispatcherComponent {
     pub fn start(&mut self) {
         self.session_aggregator.start();
@@ -1751,7 +1860,7 @@ pub struct AgentComponents {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub socket_synchronizer: SocketSynchronizer,
     pub debugger: Debugger,
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(unix, feature = "libtrace"))]
     pub ebpf_dispatcher_component: Option<EbpfDispatcherComponent>,
     pub running: AtomicBool,
     pub stats_collector: Arc<stats::Collector>,
@@ -1762,8 +1871,10 @@ pub struct AgentComponents {
     pub profile_uniform_sender: UniformSenderThread<Profile>,
     pub packet_sequence_uniform_output: DebugSender<BoxedPacketSequenceBlock>, // Enterprise Edition Feature: packet-sequence
     pub packet_sequence_uniform_sender: UniformSenderThread<BoxedPacketSequenceBlock>, // Enterprise Edition Feature: packet-sequence
-    pub proc_event_uniform_sender: UniformSenderThread<BoxedProcEvents>,
+    #[cfg(feature = "libtrace")]
+    pub proc_event_uniform_sender: UniformSenderThread<crate::common::proc_event::BoxedProcEvents>,
     pub application_log_uniform_sender: UniformSenderThread<ApplicationLog>,
+    #[cfg(feature = "enterprise-integration")]
     pub skywalking_uniform_sender: UniformSenderThread<SkyWalkingExtra>,
     pub datadog_uniform_sender: UniformSenderThread<Datadog>,
     pub exception_handler: ExceptionHandler,
@@ -1779,6 +1890,7 @@ pub struct AgentComponents {
     pub policy_getter: PolicyGetter,
     pub npb_bandwidth_watcher: Box<Arc<NpbBandwidthWatcher>>,
     pub npb_arp_table: Arc<NpbArpTable>,
+    #[cfg(feature = "enterprise-integration")]
     pub vector_component: VectorComponent,
     pub is_ce_version: bool, // Determine whether the current version is a ce version, CE-AGENT always set pcap-assembler disabled
     pub tap_interfaces: Vec<Link>,
@@ -1786,6 +1898,7 @@ pub struct AgentComponents {
     pub last_dispatcher_component_id: usize,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub process_listener: Arc<ProcessListener>,
+    pub liveness_registry: Option<LivenessRegistry>,
     max_memory: u64,
     capture_mode: PacketCaptureType,
     agent_mode: RunningMode,
@@ -2072,6 +2185,7 @@ impl AgentComponents {
         stats_collector: Arc<stats::Collector>,
         session: &Arc<Session>,
         synchronizer: &Arc<Synchronizer>,
+        liveness_registry: Option<LivenessRegistry>,
         exception_handler: ExceptionHandler,
         #[cfg(target_os = "linux")] libvirt_xml_extractor: Arc<LibvirtXmlExtractor>,
         platform_synchronizer: Arc<PlatformSynchronizer>,
@@ -2082,7 +2196,8 @@ impl AgentComponents {
         agent_mode: RunningMode,
         runtime: Arc<Runtime>,
         sender_leaky_bucket: Arc<LeakyBucket>,
-        ipmac_tx: Arc<broadcast::Sender<IpMacPair>>,
+        // only used in vector component
+        #[allow(unused)] ipmac_tx: Arc<broadcast::Sender<IpMacPair>>,
     ) -> Result<Self> {
         let static_config = &config_handler.static_config;
         let candidate_config = &config_handler.candidate_config;
@@ -2318,7 +2433,9 @@ impl AgentComponents {
                 .clone(),
         ));
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        platform_synchronizer.set_process_listener(&process_listener);
+        if candidate_config.user_config.inputs.proc.enabled {
+            platform_synchronizer.set_process_listener(&process_listener);
+        }
 
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let (toa_sender, toa_recv, _) = queue::bounded_with_debug(
@@ -2492,11 +2609,7 @@ impl AgentComponents {
         let pcap_batch_queue = "2-pcap-batch-to-sender";
         let (pcap_batch_sender, pcap_batch_receiver, pcap_batch_counter) =
             queue::bounded_with_debug(
-                user_config
-                    .processors
-                    .packet
-                    .pcap_stream
-                    .receiver_queue_size,
+                user_config.processors.packet.pcap_stream.sender_queue_size,
                 pcap_batch_queue,
                 &queue_debugger,
             );
@@ -2574,9 +2687,9 @@ impl AgentComponents {
             bpf_syntax_str,
         }));
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         let queue_size = config_handler.ebpf().load().queue_size;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         let mut dpdk_ebpf_senders = vec![];
 
         let mut tap_interfaces = vec![];
@@ -2589,21 +2702,23 @@ impl AgentComponents {
             #[cfg(target_os = "linux")]
             let netns = entry.1;
 
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let queue_name = "0-ebpf-dpdk-to-dispatcher";
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            let (dpdk_ebpf_sender, dpdk_ebpf_receiver, counter) =
-                queue::bounded_with_debug(queue_size, queue_name, &queue_debugger);
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            stats_collector.register_countable(
-                &stats::QueueStats {
-                    id: i,
-                    module: queue_name,
-                },
-                Countable::Owned(Box::new(counter)),
-            );
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            dpdk_ebpf_senders.push(dpdk_ebpf_sender);
+            #[cfg(all(unix, feature = "libtrace"))]
+            let dpdk_ebpf_receiver = {
+                let queue_name = "0-ebpf-dpdk-to-dispatcher";
+                let (dpdk_ebpf_sender, dpdk_ebpf_receiver, counter) =
+                    queue::bounded_with_debug(queue_size, queue_name, &queue_debugger);
+                stats_collector.register_countable(
+                    &stats::QueueStats {
+                        id: i,
+                        module: queue_name,
+                    },
+                    Countable::Owned(Box::new(counter)),
+                );
+                dpdk_ebpf_senders.push(dpdk_ebpf_sender);
+                Some(dpdk_ebpf_receiver)
+            };
+            #[cfg(all(unix, not(feature = "libtrace")))]
+            let dpdk_ebpf_receiver = None;
 
             let dispatcher_component = build_dispatchers(
                 i,
@@ -2628,6 +2743,7 @@ impl AgentComponents {
                 toa_sender.clone(),
                 l4_flow_aggr_sender.clone(),
                 metrics_sender.clone(),
+                liveness_registry.clone(),
                 #[cfg(target_os = "linux")]
                 netns,
                 #[cfg(target_os = "linux")]
@@ -2635,7 +2751,7 @@ impl AgentComponents {
                 #[cfg(target_os = "linux")]
                 libvirt_xml_extractor.clone(),
                 #[cfg(target_os = "linux")]
-                Some(dpdk_ebpf_receiver),
+                dpdk_ebpf_receiver,
                 #[cfg(target_os = "linux")]
                 {
                     packet_fanout_count > 1
@@ -2644,30 +2760,35 @@ impl AgentComponents {
             dispatcher_components.push(dispatcher_component);
         }
         tap_interfaces.sort();
-        let proc_event_queue_name = "1-proc-event-to-sender";
-        #[allow(unused)]
-        let (proc_event_sender, proc_event_receiver, counter) = queue::bounded_with_debug(
-            user_config.inputs.ebpf.tunning.collector_queue_size,
-            proc_event_queue_name,
-            &queue_debugger,
-        );
-        stats_collector.register_countable(
-            &QueueStats {
-                module: proc_event_queue_name,
-                ..Default::default()
-            },
-            Countable::Owned(Box::new(counter)),
-        );
-        let proc_event_uniform_sender = UniformSenderThread::new(
-            proc_event_queue_name,
-            Arc::new(proc_event_receiver),
-            config_handler.sender(),
-            stats_collector.clone(),
-            exception_handler.clone(),
-            None,
-            SenderEncoder::Raw,
-            sender_leaky_bucket.clone(),
-        );
+        #[cfg(feature = "libtrace")]
+        let (proc_event_sender, proc_event_uniform_sender) = {
+            let proc_event_queue_name = "1-proc-event-to-sender";
+            let (proc_event_sender, proc_event_receiver, counter) = queue::bounded_with_debug(
+                user_config.inputs.ebpf.tunning.collector_queue_size,
+                proc_event_queue_name,
+                &queue_debugger,
+            );
+            stats_collector.register_countable(
+                &QueueStats {
+                    module: proc_event_queue_name,
+                    ..Default::default()
+                },
+                Countable::Owned(Box::new(counter)),
+            );
+            let proc_event_uniform_sender = UniformSenderThread::new(
+                proc_event_queue_name,
+                Arc::new(proc_event_receiver),
+                config_handler.sender(),
+                stats_collector.clone(),
+                exception_handler.clone(),
+                None,
+                SenderEncoder::Raw,
+                sender_leaky_bucket.clone(),
+            );
+            (proc_event_sender, proc_event_uniform_sender)
+        };
+        #[cfg(all(not(unix), feature = "libtrace"))]
+        let _ = proc_event_sender;
 
         let profile_queue_name = "1-profile-to-sender";
         let (profile_sender, profile_receiver, counter) = queue::bounded_with_debug(
@@ -2726,37 +2847,41 @@ impl AgentComponents {
             sender_leaky_bucket.clone(),
         );
 
-        let skywalking_queue_name = "1-skywalking-to-sender";
-        let (skywalking_sender, skywalking_receiver, counter) = queue::bounded_with_debug(
-            user_config
-                .processors
-                .flow_log
-                .tunning
-                .flow_aggregator_queue_size,
-            skywalking_queue_name,
-            &queue_debugger,
-        );
-        stats_collector.register_countable(
-            &QueueStats {
-                module: skywalking_queue_name,
-                ..Default::default()
-            },
-            Countable::Owned(Box::new(counter)),
-        );
-        let skywalking_uniform_sender = UniformSenderThread::new(
-            skywalking_queue_name,
-            Arc::new(skywalking_receiver),
-            config_handler.sender(),
-            stats_collector.clone(),
-            exception_handler.clone(),
-            None,
-            if candidate_config.metric_server.compressed {
-                SenderEncoder::Zstd
-            } else {
-                SenderEncoder::Raw
-            },
-            sender_leaky_bucket.clone(),
-        );
+        #[cfg(feature = "enterprise-integration")]
+        let (skywalking_sender, skywalking_uniform_sender) = {
+            let skywalking_queue_name = "1-skywalking-to-sender";
+            let (skywalking_sender, skywalking_receiver, counter) = queue::bounded_with_debug(
+                user_config
+                    .processors
+                    .flow_log
+                    .tunning
+                    .flow_aggregator_queue_size,
+                skywalking_queue_name,
+                &queue_debugger,
+            );
+            stats_collector.register_countable(
+                &QueueStats {
+                    module: skywalking_queue_name,
+                    ..Default::default()
+                },
+                Countable::Owned(Box::new(counter)),
+            );
+            let skywalking_uniform_sender = UniformSenderThread::new(
+                skywalking_queue_name,
+                Arc::new(skywalking_receiver),
+                config_handler.sender(),
+                stats_collector.clone(),
+                exception_handler.clone(),
+                None,
+                if candidate_config.metric_server.compressed {
+                    SenderEncoder::Zstd
+                } else {
+                    SenderEncoder::Raw
+                },
+                sender_leaky_bucket.clone(),
+            );
+            (skywalking_sender, skywalking_uniform_sender)
+        };
 
         let datadog_queue_name = "1-datadog-to-sender";
         let (datadog_sender, datadog_receiver, counter) = queue::bounded_with_debug(
@@ -2791,10 +2916,11 @@ impl AgentComponents {
         );
 
         let ebpf_dispatcher_id = dispatcher_components.len();
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         let mut ebpf_dispatcher_component = None;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         if !config_handler.ebpf().load().ebpf.disabled
+            && !crate::utils::guard::is_kernel_ebpf_meltdown()
             && (candidate_config.capture_mode != PacketCaptureType::Analyzer
                 || candidate_config
                     .user_config
@@ -2859,7 +2985,7 @@ impl AgentComponents {
                 &synchronizer,
                 agent_mode,
             );
-            match EbpfCollector::new(
+            match crate::ebpf_dispatcher::EbpfCollector::new(
                 ebpf_dispatcher_id,
                 synchronizer.ntp_diff(),
                 config_handler.ebpf(),
@@ -3053,6 +3179,7 @@ impl AgentComponents {
             telegraf_sender,
             profile_sender,
             application_log_sender,
+            #[cfg(feature = "enterprise-integration")]
             skywalking_sender,
             datadog_sender,
             candidate_config.metric_server.port,
@@ -3108,6 +3235,7 @@ impl AgentComponents {
             &stats::NoTagModule("npb_bandwidth_watcher"),
             Countable::Ref(Arc::downgrade(&npb_bandwidth_watcher_counter) as Weak<dyn RefCountable>),
         );
+        #[cfg(feature = "enterprise-integration")]
         let vector_component = VectorComponent::new(
             user_config.inputs.vector.enabled,
             user_config.inputs.vector.config.clone(),
@@ -3130,7 +3258,7 @@ impl AgentComponents {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             socket_synchronizer,
             debugger,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
+            #[cfg(all(unix, feature = "libtrace"))]
             ebpf_dispatcher_component,
             stats_collector,
             running: AtomicBool::new(false),
@@ -3144,8 +3272,10 @@ impl AgentComponents {
             prometheus_uniform_sender,
             telegraf_uniform_sender,
             profile_uniform_sender,
+            #[cfg(feature = "libtrace")]
             proc_event_uniform_sender,
             application_log_uniform_sender,
+            #[cfg(feature = "enterprise-integration")]
             skywalking_uniform_sender,
             datadog_uniform_sender,
             capture_mode: candidate_config.capture_mode,
@@ -3164,6 +3294,7 @@ impl AgentComponents {
             policy_getter,
             npb_bandwidth_watcher,
             npb_arp_table,
+            #[cfg(feature = "enterprise-integration")]
             vector_component,
             runtime,
             dispatcher_components,
@@ -3173,6 +3304,7 @@ impl AgentComponents {
             bpf_options,
             #[cfg(any(target_os = "linux", target_os = "android"))]
             process_listener,
+            liveness_registry,
         })
     }
 
@@ -3225,7 +3357,7 @@ impl AgentComponents {
             }
         }
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         if let Some(ebpf_dispatcher_component) = self.ebpf_dispatcher_component.as_mut() {
             ebpf_dispatcher_component.start();
         }
@@ -3235,8 +3367,10 @@ impl AgentComponents {
             self.prometheus_uniform_sender.start();
             self.telegraf_uniform_sender.start();
             self.profile_uniform_sender.start();
+            #[cfg(feature = "libtrace")]
             self.proc_event_uniform_sender.start();
             self.application_log_uniform_sender.start();
+            #[cfg(feature = "enterprise-integration")]
             self.skywalking_uniform_sender.start();
             self.datadog_uniform_sender.start();
             if self.config.metric_server.enabled {
@@ -3247,6 +3381,7 @@ impl AgentComponents {
 
         self.npb_bandwidth_watcher.start();
         self.npb_arp_table.start();
+        #[cfg(feature = "enterprise-integration")]
         self.vector_component.start();
         #[cfg(any(target_os = "linux", target_os = "android"))]
         self.process_listener.start();
@@ -3282,7 +3417,7 @@ impl AgentComponents {
 
         self.debugger.stop();
 
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(all(unix, feature = "libtrace"))]
         if let Some(d) = self.ebpf_dispatcher_component.as_mut() {
             d.stop();
         }
@@ -3303,6 +3438,7 @@ impl AgentComponents {
         if let Some(h) = self.profile_uniform_sender.notify_stop() {
             join_handles.push(h);
         }
+        #[cfg(feature = "libtrace")]
         if let Some(h) = self.proc_event_uniform_sender.notify_stop() {
             join_handles.push(h);
         }
@@ -3312,6 +3448,7 @@ impl AgentComponents {
         if let Some(h) = self.application_log_uniform_sender.notify_stop() {
             join_handles.push(h);
         }
+        #[cfg(feature = "enterprise-integration")]
         if let Some(h) = self.skywalking_uniform_sender.notify_stop() {
             join_handles.push(h);
         }
@@ -3337,6 +3474,7 @@ impl AgentComponents {
         if let Some(h) = self.process_listener.notify_stop() {
             join_handles.push(h);
         }
+        #[cfg(feature = "enterprise-integration")]
         if let Some(h) = self.vector_component.notify_stop() {
             join_handles.push(h);
         }
@@ -3371,6 +3509,7 @@ impl Components {
         stats_collector: Arc<stats::Collector>,
         session: &Arc<Session>,
         synchronizer: &Arc<Synchronizer>,
+        liveness_registry: Option<LivenessRegistry>,
         exception_handler: ExceptionHandler,
         #[cfg(target_os = "linux")] libvirt_xml_extractor: Arc<LibvirtXmlExtractor>,
         platform_synchronizer: Arc<PlatformSynchronizer>,
@@ -3394,6 +3533,7 @@ impl Components {
             stats_collector,
             session,
             synchronizer,
+            liveness_registry,
             exception_handler,
             #[cfg(target_os = "linux")]
             libvirt_xml_extractor,
@@ -3484,6 +3624,7 @@ fn build_dispatchers(
     toa_info_sender: DebugSender<Box<(SocketAddr, SocketAddr)>>,
     l4_flow_aggr_sender: DebugSender<BoxedTaggedFlow>,
     metrics_sender: DebugSender<BoxedDocument>,
+    liveness_registry: Option<LivenessRegistry>,
     #[cfg(target_os = "linux")] netns: netns::NsFile,
     #[cfg(target_os = "linux")] kubernetes_poller: Arc<GenericPoller>,
     #[cfg(target_os = "linux")] libvirt_xml_extractor: Arc<LibvirtXmlExtractor>,
@@ -3723,6 +3864,7 @@ fn build_dispatchers(
         .pcap_interfaces(pcap_interfaces.clone())
         .tunnel_type_trim_bitmap(dispatcher_config.tunnel_type_trim_bitmap)
         .bond_group(dispatcher_config.bond_group.clone())
+        .liveness_registry(liveness_registry.clone())
         .analyzer_raw_packet_block_size(
             user_config.inputs.cbpf.tunning.raw_packet_buffer_block_size,
         );

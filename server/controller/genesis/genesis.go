@@ -18,6 +18,8 @@ package genesis
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"time"
 
@@ -28,30 +30,41 @@ import (
 	"github.com/deepflowio/deepflow/server/controller/genesis/common"
 	"github.com/deepflowio/deepflow/server/controller/genesis/grpc"
 	kstore "github.com/deepflowio/deepflow/server/controller/genesis/store/kubernetes"
-	sstore "github.com/deepflowio/deepflow/server/controller/genesis/store/sync"
+	sstorem "github.com/deepflowio/deepflow/server/controller/genesis/store/sync/mysql"
+	sstorer "github.com/deepflowio/deepflow/server/controller/genesis/store/sync/redis"
+	"github.com/deepflowio/deepflow/server/controller/model"
 	"github.com/deepflowio/deepflow/server/libs/logger"
 	"github.com/deepflowio/deepflow/server/libs/queue"
+	"gorm.io/gorm"
 )
 
 var log = logger.MustGetLogger("genesis")
+
 var GenesisService *Genesis
 
 type Genesis struct {
+	redisStore   bool
 	ctx          context.Context
+	sync         common.GenesisSync
 	config       *config.ControllerConfig
-	sync         *sstore.GenesisSync
 	kubernetes   *kstore.GenesisKubernetes
 	Synchronizer *grpc.SynchronizerServer
 }
 
-func NewGenesis(ctx context.Context, config *config.ControllerConfig) *Genesis {
+func NewGenesis(ctx context.Context, isMaster bool, config *config.ControllerConfig) *Genesis {
 	syncQueue := queue.NewOverwriteQueue("genesis-sync-data", config.GenesisCfg.QueueLengths)
 	kubernetesQueue := queue.NewOverwriteQueue("genesis-k8s-data", config.GenesisCfg.QueueLengths)
 
-	genesisSync := sstore.NewGenesisSync(ctx, syncQueue, config)
+	var enabled bool = true
+	var genesisSync common.GenesisSync
+	genesisSync = sstorer.NewGenesisSync(ctx, isMaster, syncQueue, config)
+	if genesisSync == nil || config.GenesisCfg.Database != common.CONFIG_DB_REDIS {
+		enabled = false
+		genesisSync = sstorem.NewGenesisSync(ctx, isMaster, syncQueue, config)
+	}
 	genesisSync.Start()
 
-	genesisK8S := kstore.NewGenesisKubernetes(ctx, kubernetesQueue, config)
+	genesisK8S := kstore.NewGenesisKubernetes(ctx, isMaster, kubernetesQueue, config)
 	genesisK8S.Start()
 
 	synchronizer := grpc.NewGenesisSynchronizerServer(config.GenesisCfg, syncQueue, kubernetesQueue, genesisSync, genesisK8S)
@@ -71,56 +84,13 @@ func NewGenesis(ctx context.Context, config *config.ControllerConfig) *Genesis {
 		sync:         genesisSync,
 		kubernetes:   genesisK8S,
 		Synchronizer: synchronizer,
+		redisStore:   enabled,
 	}
 	return GenesisService
 }
 
-func (g *Genesis) getServerIPs(orgID int) ([]string, error) {
-	db, err := metadb.GetDB(orgID)
-	if err != nil {
-		log.Error("get metadb session failed", logger.NewORGPrefix(orgID))
-		return []string{}, err
-	}
-
-	var serverIPs []string
-	var controllers []metadbmodel.Controller
-	var azControllerConns []metadbmodel.AZControllerConnection
-	var currentRegion string
-
-	nodeIP := os.Getenv(ccommon.NODE_IP_KEY)
-	err = db.Find(&azControllerConns).Error
-	if err != nil {
-		log.Warningf("query az_controller_connection failed (%s)", err.Error(), logger.NewORGPrefix(orgID))
-		return []string{}, err
-	}
-	err = db.Where("ip <> ? AND state <> ?", nodeIP, ccommon.CONTROLLER_STATE_EXCEPTION).Find(&controllers).Error
-	if err != nil {
-		log.Warningf("query controller failed (%s)", err.Error(), logger.NewORGPrefix(orgID))
-		return []string{}, err
-	}
-
-	controllerIPToRegion := make(map[string]string)
-	for _, conn := range azControllerConns {
-		if nodeIP == conn.ControllerIP {
-			currentRegion = conn.Region
-		}
-		controllerIPToRegion[conn.ControllerIP] = conn.Region
-	}
-
-	for _, controller := range controllers {
-		// skip other region controller
-		if region, ok := controllerIPToRegion[controller.IP]; !ok || region != currentRegion {
-			continue
-		}
-
-		// use pod ip communication in internal region
-		serverIP := controller.PodIP
-		if serverIP == "" {
-			serverIP = controller.IP
-		}
-		serverIPs = append(serverIPs, serverIP)
-	}
-	return serverIPs, nil
+func (g *Genesis) GetRedisStoreEnabled() bool {
+	return g.redisStore
 }
 
 func (g *Genesis) GetGenesisSyncData(orgID int) common.GenesisSyncDataResponse {
@@ -135,10 +105,54 @@ func (g *Genesis) GetKubernetesData(orgID int, clusterID string) (common.Kuberne
 	return g.kubernetes.GetKubernetesData(orgID, clusterID)
 }
 
-func (g *Genesis) GetKubernetesResponse(orgID int, clusterID string) (map[string][]string, error) {
-	serverIPs, err := g.getServerIPs(orgID)
+func (g *Genesis) GetKubernetesResponse(orgID int, clusterID string) (map[string][][]byte, error) {
+	resp := map[string][][]byte{}
+
+	var destIP string
+	db, err := metadb.GetDB(orgID)
 	if err != nil {
-		return map[string][]string{}, err
+		return resp, fmt.Errorf("get metadb session failed: %s", err.Error())
 	}
-	return g.kubernetes.GetKubernetesResponse(orgID, clusterID, serverIPs)
+
+	var cluster model.GenesisCluster
+	err = db.Where("id = ?", clusterID).First(&cluster).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return resp, fmt.Errorf("no vtap report cluster id: %s", clusterID)
+		}
+		return resp, fmt.Errorf("query cluster (%s) from genesis_cluster failed (%s)", clusterID, err.Error())
+	}
+
+	nodeIP := os.Getenv(ccommon.NODE_IP_KEY)
+	var azControllerConns []metadbmodel.AZControllerConnection
+	err = db.Find(&azControllerConns).Error
+	if err != nil {
+		return resp, fmt.Errorf("query node (%s) az_controller_connection failed (%s)", nodeIP, err.Error())
+	}
+	nodeIPToRegion := map[string]string{}
+	for _, conn := range azControllerConns {
+		nodeIPToRegion[conn.ControllerIP] = conn.Region
+	}
+	currentRegion, ok := nodeIPToRegion[nodeIP]
+	if !ok {
+		return resp, fmt.Errorf("node (%s) region not found", nodeIP)
+	}
+	clusterRegion, ok := nodeIPToRegion[cluster.NodeIP]
+	if !ok || clusterRegion != currentRegion {
+		return resp, fmt.Errorf("cluster store controller mode (%s) not in current region", cluster.NodeIP)
+	}
+	if cluster.NodeIP != nodeIP {
+		var controller metadbmodel.Controller
+		err = db.Where("ip = ? AND state <> ?", cluster.NodeIP, ccommon.CONTROLLER_STATE_EXCEPTION).First(&controller).Error
+		if err != nil {
+			return resp, fmt.Errorf("query node (%s) controller failed (%s)", cluster.NodeIP, err.Error())
+		}
+		if controller.PodIP == "" {
+			return resp, fmt.Errorf("controller (%s) pod ip is empty", cluster.NodeIP)
+		}
+		// use pod ip communication in internal region
+		destIP = controller.PodIP
+	}
+
+	return g.kubernetes.GetKubernetesResponse(orgID, clusterID, destIP)
 }

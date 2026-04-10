@@ -22,10 +22,10 @@ const MAX_METHOD_LEN: usize = 8;
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::{L7PerfStats, L7Protocol, PacketDirection},
+        flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     config::handler::{L7LogDynamicConfig, LogParserConfig},
     flow_generator::{
@@ -34,11 +34,14 @@ use crate::{
             pb_adapter::{
                 ExtendedInfo, KeyVal, L7ProtocolSendLog, L7Request, L7Response, TraceInfo,
             },
-            set_captured_byte, swap_if, AppProtoHead, LogMessageType,
+            set_captured_byte, swap_if, value_is_default, AppProtoHead, L7ResponseStatus,
+            PrioFields, BASE_FIELD_PRIORITY,
         },
     },
     plugin::wasm::{wasm_plugin::NatsMessage as WasmNatsMessage, WasmData},
 };
+
+use public::l7_protocol::LogMessageType;
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct Info {
@@ -199,6 +202,10 @@ pub struct NatsInfo {
     msg_type: LogMessageType,
     #[serde(skip)]
     is_tls: bool,
+    #[serde(skip)]
+    is_async: bool,
+    #[serde(skip)]
+    is_reversed: bool,
 
     rtt: u64,
 
@@ -207,8 +214,8 @@ pub struct NatsInfo {
     req_len: Option<u32>,
     resp_len: Option<u32>,
 
-    #[serde(rename = "trace_id", skip_serializing_if = "Option::is_none")]
-    trace_id: Option<String>,
+    #[serde(rename = "trace_ids", skip_serializing_if = "value_is_default")]
+    trace_ids: PrioFields,
     #[serde(rename = "span_id", skip_serializing_if = "Option::is_none")]
     span_id: Option<String>,
 
@@ -230,10 +237,9 @@ pub struct NatsInfo {
 
 #[derive(Default)]
 pub struct NatsLog {
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
     version: String,
     server_name: String,
-    last_is_on_blacklist: bool,
 }
 
 fn slice_split(slice: &[u8], n: usize) -> Option<(&[u8], &[u8])> {
@@ -631,7 +637,7 @@ impl NatsInfo {
             _ => return None,
         };
         if let Some(config) = config {
-            (info.trace_id, info.span_id) = info.parse_trace_span(&config.l7_log_dynamic);
+            (info.trace_ids, info.span_id) = info.parse_trace_span(&config.l7_log_dynamic);
         }
         match info.msg_type {
             LogMessageType::Request => info.req_len = Some((length_begin - payload.len()) as u32),
@@ -675,19 +681,23 @@ impl NatsInfo {
         }
     }
 
-    fn parse_trace_span(&self, config: &L7LogDynamicConfig) -> (Option<String>, Option<String>) {
+    fn parse_trace_span(&self, config: &L7LogDynamicConfig) -> (PrioFields, Option<String>) {
         let headers = match &self.message {
             NatsMessage::Hpub(x) => &x.headers,
             NatsMessage::Hmsg(x) => &x.headers,
-            _ => return (None, None),
+            _ => return (PrioFields::new(), None),
         };
-        let mut trace_id = None;
+        let mut trace_ids = PrioFields::new();
         let mut span_id = None;
         for (k, v) in headers.iter() {
             for tt in config.trace_types.iter() {
                 if tt.check(k) {
-                    trace_id = tt.decode_trace_id(v).map(|x| x.to_string());
-                    break;
+                    if let Some(trace_id) = tt.decode_trace_id(v) {
+                        trace_ids.merge_field(BASE_FIELD_PRIORITY, trace_id.to_string());
+                    }
+                    if !config.multiple_trace_id_collection && !trace_ids.is_empty() {
+                        break;
+                    }
                 }
             }
             for st in config.span_types.iter() {
@@ -697,7 +707,7 @@ impl NatsInfo {
                 }
             }
         }
-        (trace_id, span_id)
+        (trace_ids, span_id)
     }
 
     fn set_is_on_blacklist(&mut self, config: &LogParserConfig) {
@@ -727,10 +737,16 @@ impl Default for NatsMessage {
 
 impl From<NatsInfo> for L7ProtocolSendLog {
     fn from(info: NatsInfo) -> Self {
-        let flags = match info.is_tls {
-            true => EbpfFlags::TLS.bits(),
-            false => EbpfFlags::NONE.bits(),
+        let mut flags = match info.is_tls {
+            true => ApplicationFlags::TLS,
+            false => ApplicationFlags::NONE,
         };
+        if info.is_async {
+            flags = flags | ApplicationFlags::ASYNC;
+        }
+        if info.is_reversed {
+            flags = flags | ApplicationFlags::REVERSED;
+        }
         let name = info.get_name();
         let subject = info
             .get_subject()
@@ -739,7 +755,7 @@ impl From<NatsInfo> for L7ProtocolSendLog {
         let log = L7ProtocolSendLog {
             captured_request_byte: info.captured_request_byte,
             captured_response_byte: info.captured_response_byte,
-            flags,
+            flags: flags.bits(),
             version: Some(info.version),
             req_len: info.req_len,
             resp_len: info.resp_len,
@@ -754,7 +770,7 @@ impl From<NatsInfo> for L7ProtocolSendLog {
                 ..Default::default()
             },
             trace_info: Some(TraceInfo {
-                trace_id: info.trace_id,
+                trace_ids: info.trace_ids.into_strings_top3(),
                 span_id: info.span_id,
                 ..Default::default()
             }),
@@ -772,6 +788,18 @@ impl From<NatsInfo> for L7ProtocolSendLog {
             ..Default::default()
         };
         log
+    }
+}
+
+impl From<&NatsInfo> for LogCache {
+    fn from(info: &NatsInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: L7ResponseStatus::Ok,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
+            ..Default::default()
+        }
     }
 }
 
@@ -798,6 +826,9 @@ impl L7ProtocolInfoInterface for NatsInfo {
             if rsp.is_on_blacklist {
                 req.is_on_blacklist = rsp.is_on_blacklist;
             }
+            if rsp.is_reversed {
+                req.is_reversed = rsp.is_reversed;
+            }
         }
         Ok(())
     }
@@ -816,6 +847,10 @@ impl L7ProtocolInfoInterface for NatsInfo {
 
     fn is_on_blacklist(&self) -> bool {
         self.is_on_blacklist
+    }
+
+    fn is_reversed(&self) -> bool {
+        self.is_reversed
     }
 }
 
@@ -867,27 +902,33 @@ impl NatsLog {
             if custom.proto_str.len() > 0 {
                 info.l7_protocol_str = Some(custom.proto_str);
             }
+            if let Some(is_async) = custom.is_async {
+                info.is_async = is_async;
+            }
+            if let Some(is_reversed) = custom.is_reversed {
+                info.is_reversed = is_reversed;
+            }
         }
     }
 }
 
 impl L7ProtocolParserInterface for NatsLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
 
-        NatsInfo::try_parse(payload, param.parse_config).is_some()
+        if NatsInfo::try_parse(payload, param.parse_config).is_some() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
-
         let mut vec = Vec::new();
         let mut payload = payload;
 
@@ -902,6 +943,7 @@ impl L7ProtocolParserInterface for NatsLog {
             vec.push(L7ProtocolInfo::NatsInfo(info));
         }
 
+        self.perf_stats.clear();
         for info in &mut vec {
             if let L7ProtocolInfo::NatsInfo(info) = info {
                 info.is_tls = param.is_tls();
@@ -914,26 +956,22 @@ impl L7ProtocolParserInterface for NatsLog {
                 if let Some(config) = param.parse_config {
                     info.set_is_on_blacklist(config);
                 }
-                if !info.is_on_blacklist && !self.last_is_on_blacklist {
-                    match param.direction {
-                        PacketDirection::ClientToServer => {
-                            self.perf_stats.as_mut().map(|p| p.inc_req());
-                        }
-                        PacketDirection::ServerToClient => {
-                            self.perf_stats.as_mut().map(|p| p.inc_resp());
+
+                if param.parse_perf {
+                    let mut perf_stat = L7PerfStats::default();
+                    if info.msg_type == LogMessageType::Response {
+                        if let Some(endpoint) =
+                            info.load_endpoint_from_cache(param, info.is_reversed)
+                        {
+                            info.endpoint = Some(endpoint.to_string());
                         }
                     }
-                    if info.msg_type != LogMessageType::Session {
-                        info.cal_rrt(param, &info.endpoint).map(|(rtt, endpoint)| {
-                            info.rtt = rtt;
-                            if info.msg_type == LogMessageType::Response {
-                                info.endpoint = endpoint;
-                            }
-                            self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
-                        });
+                    if let Some(stats) = info.perf_stats(param) {
+                        info.rtt = stats.rrt_sum;
+                        perf_stat.sequential_merge(&stats);
                     }
+                    self.perf_stats.push(perf_stat);
                 }
-                self.last_is_on_blacklist = info.is_on_blacklist;
             }
         }
 
@@ -948,8 +986,8 @@ impl L7ProtocolParserInterface for NatsLog {
         }
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 
     fn protocol(&self) -> L7Protocol {
@@ -962,10 +1000,9 @@ impl L7ProtocolParserInterface for NatsLog {
 
     fn reset(&mut self) {
         let mut s = Self::default();
-        s.last_is_on_blacklist = self.last_is_on_blacklist;
         s.version = self.version.clone();
         s.server_name = self.server_name.clone();
-        s.perf_stats = self.perf_stats.take();
+        s.perf_stats = self.perf_stats();
         *self = s;
     }
 }
@@ -980,9 +1017,9 @@ mod tests {
 
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
-        config::{handler::TraceType, ExtraLogFields},
+        config::handler::{L7LogDynamicConfigBuilder, TraceType},
         flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/nats";
@@ -1011,7 +1048,7 @@ mod tests {
             };
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -1020,18 +1057,15 @@ mod tests {
             );
             param.set_captured_byte(payload.len());
 
-            let config = L7LogDynamicConfig::new(
-                vec![],
-                vec![],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                ExtraLogFields::default(),
-                false,
-                #[cfg(feature = "enterprise")]
-                std::collections::HashMap::new(),
-            );
+            let config = L7LogDynamicConfigBuilder {
+                proxy_client: vec![],
+                x_request_id: vec![],
+                trace_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                span_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                ..Default::default()
+            };
             let parse_config = &LogParserConfig {
-                l7_log_dynamic: config.clone(),
+                l7_log_dynamic: config.into(),
                 ..Default::default()
             };
 
@@ -1039,7 +1073,7 @@ mod tests {
 
             if first_packet {
                 first_packet = false;
-                if !nats.check_payload(payload, param) {
+                if nats.check_payload(payload, param).is_none() {
                     output.push_str("not nats\n");
                     break;
                 }

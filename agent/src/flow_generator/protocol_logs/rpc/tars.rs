@@ -24,18 +24,20 @@ use nom::{
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use serde::Serialize;
 
+use public::l7_protocol::LogMessageType;
+
 use crate::{
     common::{
-        flow::{L7PerfStats, L7Protocol, PacketDirection},
+        flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
     },
     config::handler::LogParserConfig,
     flow_generator::{
         error::{Error, Result},
         protocol_logs::{
             pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response},
-            AppProtoHead, L7ResponseStatus, LogMessageType,
+            AppProtoHead, L7ResponseStatus,
         },
     },
 };
@@ -436,22 +438,22 @@ impl TarsInfo {
 #[derive(Default)]
 pub struct TarsLog {
     info: TarsInfo,
-    perf_stats: Option<L7PerfStats>,
-    last_is_on_blacklist: bool,
+    perf_stats: Vec<L7PerfStats>,
 }
 
 impl L7ProtocolParserInterface for TarsLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
-        TarsInfo::parse(payload).is_ok()
+        if TarsInfo::parse(payload).is_ok() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
         let mut info = match TarsInfo::parse(payload) {
             Ok((_, info)) => info,
             Err(e) => {
@@ -464,25 +466,20 @@ impl L7ProtocolParserInterface for TarsLog {
         if let Some(config) = param.parse_config {
             info.set_is_on_blacklist(config);
         }
-
-        if !info.is_on_blacklist && !self.last_is_on_blacklist {
-            match param.direction {
-                PacketDirection::ClientToServer => {
-                    self.perf_stats.as_mut().map(|p| p.inc_req());
-                }
-                PacketDirection::ServerToClient => {
-                    self.perf_stats.as_mut().map(|p| p.inc_resp());
+        self.perf_stats.clear();
+        if param.parse_perf {
+            let mut perf_stat = L7PerfStats::default();
+            if info.msg_type == LogMessageType::Response {
+                if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                    info.endpoint = Some(endpoint.to_string());
                 }
             }
-            info.cal_rrt(param, &info.endpoint).map(|(rrt, endpoint)| {
-                info.rrt = rrt;
-                if info.msg_type == LogMessageType::Response {
-                    info.endpoint = endpoint;
-                }
-                self.perf_stats.as_mut().map(|p| p.update_rrt(rrt));
-            });
+            if let Some(stats) = info.perf_stats(param) {
+                info.rrt = stats.rrt_sum;
+                perf_stat.sequential_merge(&stats);
+            }
+            self.perf_stats.push(perf_stat);
         }
-        self.last_is_on_blacklist = info.is_on_blacklist;
         if param.parse_log {
             Ok(L7ParseResult::Single(L7ProtocolInfo::TarsInfo(info)))
         } else {
@@ -496,13 +493,12 @@ impl L7ProtocolParserInterface for TarsLog {
 
     fn reset(&mut self) {
         let mut s = Self::default();
-        s.last_is_on_blacklist = self.last_is_on_blacklist;
-        s.perf_stats = self.perf_stats.take();
+        s.perf_stats = self.perf_stats();
         *self = s;
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 }
 
@@ -535,6 +531,18 @@ impl From<TarsInfo> for L7ProtocolSendLog {
             ..Default::default()
         };
         return log;
+    }
+}
+
+impl From<&TarsInfo> for LogCache {
+    fn from(info: &TarsInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.ret.map(|r| r.into()).unwrap_or_default(),
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
+            ..Default::default()
+        }
     }
 }
 
@@ -581,12 +589,9 @@ mod tests {
 
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
-        config::{
-            handler::{L7LogDynamicConfig, LogParserConfig, TraceType},
-            ExtraLogFields,
-        },
+        config::handler::{L7LogDynamicConfigBuilder, LogParserConfig, TraceType},
         flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/tars";
@@ -614,7 +619,7 @@ mod tests {
             };
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -623,24 +628,21 @@ mod tests {
             );
             param.set_captured_byte(payload.len());
 
-            let config = L7LogDynamicConfig::new(
-                vec![],
-                vec![],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                ExtraLogFields::default(),
-                false,
-                #[cfg(feature = "enterprise")]
-                std::collections::HashMap::new(),
-            );
+            let config = L7LogDynamicConfigBuilder {
+                proxy_client: vec![],
+                x_request_id: vec![],
+                trace_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                span_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                ..Default::default()
+            };
             let parse_config = &LogParserConfig {
-                l7_log_dynamic: config.clone(),
+                l7_log_dynamic: config.into(),
                 ..Default::default()
             };
 
             param.set_log_parser_config(parse_config);
 
-            if !tars.check_payload(payload, param) {
+            if tars.check_payload(payload, param).is_none() {
                 output.push_str("not tars\n");
                 continue;
             }

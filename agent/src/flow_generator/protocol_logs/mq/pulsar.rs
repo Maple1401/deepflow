@@ -12,21 +12,24 @@ use std::collections::HashMap;
 use crate::{
     common::{
         enums::IpProtocol,
-        flow::{L7PerfStats, L7Protocol, PacketDirection},
+        flow::{L7PerfStats, L7Protocol},
         l7_protocol_info::{L7ProtocolInfo, L7ProtocolInfoInterface},
-        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, ParseParam},
-        meta_packet::EbpfFlags,
+        l7_protocol_log::{L7ParseResult, L7ProtocolParserInterface, LogCache, ParseParam},
+        meta_packet::ApplicationFlags,
     },
     config::handler::LogParserConfig,
     flow_generator::{
         error::Result,
         protocol_logs::{
             pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response, TraceInfo},
-            set_captured_byte, AppProtoHead, L7ResponseStatus, LogMessageType,
+            set_captured_byte, value_is_default, AppProtoHead, L7ResponseStatus, PrioFields,
+            BASE_FIELD_PRIORITY,
         },
     },
     utils::bytes::read_u32_be,
 };
+
+use public::l7_protocol::LogMessageType;
 
 // ProtocolVersion in PulsarApi.proto
 const MAX_PROTOCOL_VERSION: i32 = 21;
@@ -111,8 +114,8 @@ pub struct PulsarInfo {
     // ledgerId:entryId:partitionIndex:batchIndex
     #[serde(skip_serializing_if = "Option::is_none")]
     x_request_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    trace_id: Option<String>,
+    #[serde(skip_serializing_if = "value_is_default")]
+    trace_ids: PrioFields,
     #[serde(skip_serializing_if = "Option::is_none")]
     span_id: Option<String>,
 
@@ -135,26 +138,23 @@ pub struct PulsarInfo {
 }
 
 pub struct PulsarLog {
-    perf_stats: Option<L7PerfStats>,
+    perf_stats: Vec<L7PerfStats>,
 
     version: i32,
     domain: Option<String>,
 
     producer_topic: PulsarTopicMap,
     consumer_topic: PulsarTopicMap,
-
-    last_is_on_blacklist: bool,
 }
 
 impl Default for PulsarLog {
     fn default() -> Self {
         Self {
-            perf_stats: None,
+            perf_stats: vec![],
             version: MAX_PROTOCOL_VERSION,
             domain: None,
             producer_topic: PulsarTopicMap::new(),
             consumer_topic: PulsarTopicMap::new(),
-            last_is_on_blacklist: false,
         }
     }
 }
@@ -300,23 +300,32 @@ impl PulsarInfo {
         }
     }
 
-    fn parse_trace_span(&self, param: &ParseParam) -> (Option<String>, Option<String>) {
+    fn parse_trace_span(&self, param: &ParseParam) -> (PrioFields, Option<String>) {
         let Some(config) = param.parse_config.map(|x| &x.l7_log_dynamic) else {
-            return (None, None);
+            return (PrioFields::new(), None);
         };
         let Some(metadata) = self.message_metadata.as_ref() else {
-            return (None, None);
+            return (PrioFields::new(), None);
         };
 
-        let mut trace_id = None;
+        let multiple_trace_id_collection = if let Some(config) = param.parse_config {
+            config.l7_log_dynamic.multiple_trace_id_collection
+        } else {
+            true
+        };
+        let mut trace_ids = PrioFields::new();
         let mut span_id = None;
         for kv in metadata.properties.iter() {
             let k = kv.key.as_str();
             let v = kv.value.as_str();
             for tt in config.trace_types.iter() {
                 if tt.check(k) {
-                    trace_id = tt.decode_trace_id(v).map(|x| x.to_string());
-                    break;
+                    if let Some(trace_id) = tt.decode_trace_id(v) {
+                        trace_ids.merge_field(BASE_FIELD_PRIORITY, trace_id.to_string());
+                    }
+                    if !multiple_trace_id_collection && !trace_ids.is_empty() {
+                        break;
+                    }
                 }
             }
             for st in config.span_types.iter() {
@@ -327,7 +336,7 @@ impl PulsarInfo {
             }
         }
 
-        (trace_id, span_id)
+        (trace_ids, span_id)
     }
 
     fn parse_sequence_id(&self) -> Option<u32> {
@@ -718,7 +727,7 @@ impl PulsarInfo {
             info.message_metadata = Box::new(Some(MessageMetadata::decode(buf).ok()?));
             let _payload = extra.get(10 + metadata_size..)?;
         }
-        (info.trace_id, info.span_id) = info.parse_trace_span(param);
+        (info.trace_ids, info.span_id) = info.parse_trace_span(param);
         info.x_request_id = info.parse_x_request_id();
         info.request_id = info.get_request_id().map(|x| x as u32);
         info.domain = info.parse_domain();
@@ -756,8 +765,8 @@ impl PulsarInfo {
 impl From<PulsarInfo> for L7ProtocolSendLog {
     fn from(info: PulsarInfo) -> Self {
         let flags = match info.is_tls {
-            true => EbpfFlags::TLS.bits(),
-            false => EbpfFlags::NONE.bits(),
+            true => ApplicationFlags::TLS.bits(),
+            false => ApplicationFlags::NONE.bits(),
         };
 
         let log = L7ProtocolSendLog {
@@ -781,7 +790,7 @@ impl From<PulsarInfo> for L7ProtocolSendLog {
                 ..Default::default()
             },
             trace_info: Some(TraceInfo {
-                trace_id: info.trace_id,
+                trace_ids: info.trace_ids.into_strings_top3(),
                 span_id: info.span_id,
                 ..Default::default()
             }),
@@ -793,6 +802,18 @@ impl From<PulsarInfo> for L7ProtocolSendLog {
             ..Default::default()
         };
         log
+    }
+}
+
+impl From<&PulsarInfo> for LogCache {
+    fn from(info: &PulsarInfo) -> Self {
+        LogCache {
+            msg_type: info.msg_type,
+            resp_status: info.resp_status,
+            on_blacklist: info.is_on_blacklist,
+            endpoint: info.get_endpoint(),
+            ..Default::default()
+        }
     }
 }
 
@@ -845,27 +866,28 @@ impl L7ProtocolInfoInterface for PulsarInfo {
 }
 
 impl L7ProtocolParserInterface for PulsarLog {
-    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> bool {
+    fn check_payload(&mut self, payload: &[u8], param: &ParseParam) -> Option<LogMessageType> {
         if !param.ebpf_type.is_raw_protocol() {
-            return false;
+            return None;
         }
         if param.l4_protocol != IpProtocol::TCP {
-            return false;
+            return None;
         }
         if payload.len() < 8 {
-            return false;
+            return None;
         }
-        PulsarInfo::parse(payload, param).is_some()
+        if PulsarInfo::parse(payload, param).is_some() {
+            Some(LogMessageType::Request)
+        } else {
+            None
+        }
     }
 
     fn parse_payload(&mut self, payload: &[u8], param: &ParseParam) -> Result<L7ParseResult> {
-        if self.perf_stats.is_none() && param.parse_perf {
-            self.perf_stats = Some(L7PerfStats::default())
-        };
-
         let mut vec = Vec::new();
         let mut payload = payload;
 
+        self.perf_stats.clear();
         while let Some((tmp, mut info)) = PulsarInfo::parse(payload, param) {
             payload = tmp;
             self.version = self
@@ -885,39 +907,20 @@ impl L7ProtocolParserInterface for PulsarLog {
                 if let Some(config) = param.parse_config {
                     info.set_is_on_blacklist(config);
                 }
-                if !info.is_on_blacklist && !self.last_is_on_blacklist {
-                    match param.direction {
-                        PacketDirection::ClientToServer => {
-                            self.perf_stats.as_mut().map(|p| p.inc_req());
-                        }
-                        PacketDirection::ServerToClient => {
-                            self.perf_stats.as_mut().map(|p| p.inc_resp());
+
+                if param.parse_perf {
+                    let mut perf_stat = L7PerfStats::default();
+                    if info.msg_type == LogMessageType::Response {
+                        if let Some(endpoint) = info.load_endpoint_from_cache(param, false) {
+                            info.topic = Some(endpoint.to_string());
                         }
                     }
-                    match info.resp_status {
-                        L7ResponseStatus::ClientError => {
-                            self.perf_stats
-                                .as_mut()
-                                .map(|p: &mut L7PerfStats| p.inc_req_err());
-                        }
-                        L7ResponseStatus::ServerError => {
-                            self.perf_stats
-                                .as_mut()
-                                .map(|p: &mut L7PerfStats| p.inc_resp_err());
-                        }
-                        _ => {}
+                    if let Some(stats) = info.perf_stats(param) {
+                        info.rtt = stats.rrt_sum;
+                        perf_stat.sequential_merge(&stats);
                     }
-                    if info.msg_type != LogMessageType::Session {
-                        info.cal_rrt(param, &info.topic).map(|(rtt, endpoint)| {
-                            info.rtt = rtt;
-                            if info.msg_type == LogMessageType::Response {
-                                info.topic = endpoint;
-                            }
-                            self.perf_stats.as_mut().map(|p| p.update_rrt(rtt));
-                        });
-                    }
+                    self.perf_stats.push(perf_stat);
                 }
-                self.last_is_on_blacklist = info.is_on_blacklist;
             }
         }
 
@@ -932,8 +935,8 @@ impl L7ProtocolParserInterface for PulsarLog {
         }
     }
 
-    fn perf_stats(&mut self) -> Option<L7PerfStats> {
-        self.perf_stats.take()
+    fn perf_stats(&mut self) -> Vec<L7PerfStats> {
+        std::mem::take(&mut self.perf_stats)
     }
 
     fn protocol(&self) -> L7Protocol {
@@ -956,12 +959,9 @@ mod tests {
 
     use crate::{
         common::{flow::PacketDirection, l7_protocol_log::L7PerfCache, MetaPacket},
-        config::{
-            handler::{L7LogDynamicConfig, LogParserConfig, TraceType},
-            ExtraLogFields,
-        },
+        config::handler::{L7LogDynamicConfigBuilder, LogParserConfig, TraceType},
         flow_generator::L7_RRT_CACHE_CAPACITY,
-        utils::test::Capture,
+        utils::test_utils::Capture,
     };
 
     const FILE_DIR: &str = "resources/test/flow_generator/pulsar";
@@ -989,7 +989,7 @@ mod tests {
             };
             let param = &mut ParseParam::new(
                 packet as &MetaPacket,
-                log_cache.clone(),
+                Some(log_cache.clone()),
                 Default::default(),
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 Default::default(),
@@ -998,24 +998,21 @@ mod tests {
             );
             param.set_captured_byte(payload.len());
 
-            let config = L7LogDynamicConfig::new(
-                vec![],
-                vec![],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                vec![TraceType::Sw8, TraceType::TraceParent],
-                ExtraLogFields::default(),
-                false,
-                #[cfg(feature = "enterprise")]
-                std::collections::HashMap::new(),
-            );
+            let config = L7LogDynamicConfigBuilder {
+                proxy_client: vec![],
+                x_request_id: vec![],
+                trace_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                span_types: vec![TraceType::Sw8, TraceType::TraceParent],
+                ..Default::default()
+            };
             let parse_config = &LogParserConfig {
-                l7_log_dynamic: config.clone(),
+                l7_log_dynamic: config.into(),
                 ..Default::default()
             };
 
             param.set_log_parser_config(parse_config);
 
-            if !pulsar.check_payload(payload, param) {
+            if pulsar.check_payload(payload, param).is_none() {
                 output.push_str("not pulsar\n");
                 continue;
             }

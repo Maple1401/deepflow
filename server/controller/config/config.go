@@ -43,19 +43,51 @@ import (
 var log = logging.MustGetLogger("config")
 
 type Specification struct {
-	VTapGroupMax                 int `default:"1000" yaml:"vtap_group_max"`
-	VTapMaxPerGroup              int `default:"10000" yaml:"vtap_max_per_group"`
-	AZMaxPerServer               int `default:"10" yaml:"az_max_per_server"`
+	VTapGroupMax    int `default:"1000" yaml:"vtap_group_max"`
+	VTapMaxPerGroup int `default:"10000" yaml:"vtap_max_per_group"`
+	AZMaxPerServer  int `default:"10" yaml:"az_max_per_server"`
+
 	DataSourceMax                int `default:"25" yaml:"data_source_max"`
 	DataSourceRetentionTimeMax   int `default:"24000" yaml:"data_source_retention_time_max"`
 	DataSourceExtMetricsInterval int `default:"10" yaml:"data_source_ext_metrics_interval"`
 	DataSourcePrometheusInterval int `default:"10" yaml:"data_source_prometheus_interval"`
+
+	BizDecodePolicyMax           int `default:"100" yaml:"biz_decode_policy_max"`
+	BizDecodePolicyFieldMax      int `default:"200" yaml:"biz_decode_policy_field_max"`
+	BizDecodeDictionaryMax       int `default:"1000" yaml:"biz_decode_dictionary_max"`
+	BizDecodeCustomProtocolMax   int `default:"200" yaml:"biz_decode_custom_protocol_max"`
+	MaxBizPolicyPcapFileSize     int `default:"50" yaml:"max-biz-policy-pcap-file-size"` // unit: MB
+	MaxPerBizPolicyPcapFileCount int `default:"5" yaml:"max-per-biz-policy-pcap-file-count"`
+
+	PcapPolicyMax                 int `default:"1000" yaml:"pcap_policy_max"`
+	PcapPolicyComplexityThreshold int `default:"1000" yaml:"pcap_policy_complexity_threshold"`
+}
+
+type ACLController struct {
+	Enabled bool   `default:"false" yaml:"enabled"`
+	Host    string `default:"acl-controller" yaml:"host"`
+	Port    int    `default:"20408" yaml:"port"`
+	Timeout int    `default:"30" yaml:"timeout"`
+}
+
+type FUser struct {
+	Enabled bool   `default:"false" yaml:"enabled"`
+	Host    string `default:"fuser" yaml:"host"`
+	Port    int    `default:"20824" yaml:"port"`
+	Timeout int    `default:"30" yaml:"timeout"`
 }
 
 type DFWebService struct {
 	Enabled bool   `default:"false" yaml:"enabled"`
 	Host    string `default:"df-web" yaml:"host"`
 	Port    int    `default:"20825" yaml:"port"`
+	Timeout int    `default:"30" yaml:"timeout"`
+}
+
+type QuerierJSService struct {
+	Enabled bool   `default:"false" yaml:"enabled"`
+	Host    string `default:"querier-js" yaml:"host"`
+	Port    int    `default:"30420" yaml:"port"`
 	Timeout int    `default:"30" yaml:"timeout"`
 }
 
@@ -82,18 +114,23 @@ type ControllerConfig struct {
 	NoIPOverlapping                bool   `default:"false" yaml:"no-ip-overlapping"`
 	AgentCommandTimeout            int    `default:"30" yaml:"agent-cmd-timeout"`
 
-	DFWebService DFWebService   `yaml:"df-web-service"`
-	FPermit      common.FPermit `yaml:"fpermit"`
+	ACLController    ACLController      `yaml:"acl-controller"`
+	FUser            FUser              `yaml:"fuser"`
+	DFWebService     DFWebService       `yaml:"df-web-service"`
+	QuerierJSService QuerierJSService   `yaml:"querier-js-service"`
+	FPermit          common.FPermit     `yaml:"fpermit"`
+	IngesterApi      common.IngesterApi `yaml:"ingester-api"`
 
 	MetadbCfg     metadb.Config
 	PostgreSQLCfg metadb.PostgreSQLConfig     `yaml:"postgresql"`
 	MySqlCfg      metadb.MySQLConfig          `yaml:"mysql"`
+	DMCfg         metadb.DMConfig             `yaml:"dm"`
 	RedisCfg      redis.Config                `yaml:"redis"`
 	ClickHouseCfg clickhouse.ClickHouseConfig `yaml:"clickhouse"`
 
-	IngesterApi common.IngesterApi `yaml:"ingester-api"`
-	Spec        Specification      `yaml:"spec"`
+	Spec Specification `yaml:"spec"`
 
+	Pcap           configs.Pcap                  `yaml:"pcap"`
 	MonitorCfg     monitor.MonitorConfig         `yaml:"monitor"`
 	ManagerCfg     manager.ManagerConfig         `yaml:"manager"`
 	GenesisCfg     genesis.GenesisConfig         `yaml:"genesis"`
@@ -110,13 +147,23 @@ type Config struct {
 }
 
 func (c *Config) Validate() error {
-	if !c.ControllerConfig.MySqlCfg.Enabled && !c.ControllerConfig.PostgreSQLCfg.Enabled {
-		return fmt.Errorf("mysql or postgresql must be enabled")
-	}
-	if c.ControllerConfig.MySqlCfg.Enabled && c.ControllerConfig.PostgreSQLCfg.Enabled {
-		return fmt.Errorf("mysql and postgresql can not be enabled at the same time")
+	if !c.exactlyOneMetadbEnabled() {
+		return fmt.Errorf("only one metadb can be enabled at the same time")
 	}
 	return nil
+}
+
+func (c *Config) exactlyOneMetadbEnabled() bool {
+	count := 0
+	for _, enabled := range []bool{c.ControllerConfig.MySqlCfg.Enabled, c.ControllerConfig.PostgreSQLCfg.Enabled, c.ControllerConfig.DMCfg.Enabled} {
+		if enabled {
+			count++
+			if count > 1 {
+				return false
+			}
+		}
+	}
+	return count == 1
 }
 
 func (c *Config) Load(path string) {
@@ -157,6 +204,7 @@ func (c *Config) Load(path string) {
 
 	c.ControllerConfig.MetadbCfg.InitFromMySQL(c.ControllerConfig.MySqlCfg)
 	c.ControllerConfig.MetadbCfg.InitFromPostgreSQL(c.ControllerConfig.PostgreSQLCfg)
+	c.ControllerConfig.MetadbCfg.InitFromDaMeng(c.ControllerConfig.DMCfg)
 }
 
 func DefaultConfig() *Config {

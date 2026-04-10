@@ -22,7 +22,9 @@ import (
 	"strconv"
 	"strings"
 
+	ctlcommon "github.com/deepflowio/deepflow/server/controller/common"
 	"github.com/deepflowio/deepflow/server/querier/common"
+	"github.com/deepflowio/deepflow/server/querier/config"
 )
 
 const (
@@ -55,6 +57,11 @@ const (
 	FUNCTION_ANY           = "Any"
 	FUNCTION_DERIVATIVE    = "nonNegativeDerivative"
 	FUNCTION_COUNTDISTINCT = "countDistinct"
+)
+
+const (
+	TOPK_COUNTS_DEFAULT_LIMIT = "3"
+	TOPK_COUNTS_MODE_FLAG     = "'counts'"
 )
 
 // 对外提供的算子与数据库实际算子转换
@@ -125,6 +132,7 @@ type Function interface {
 	SetFillNullAsZero(bool)
 	SetIsGroupArray(bool)
 	SetCondition(string)
+	SetIsLeast(bool)
 	SetTime(*Time)
 	SetMath(string)
 	GetFlag() int
@@ -167,6 +175,7 @@ type DefaultFunction struct {
 	FillNullAsZero bool
 	IsGroupArray   bool // 是否针对list做聚合，例:SUMArray(rtt_max)
 	Nest           bool // 是否为内层嵌套算子
+	IsLeast        bool // 是否限制最大值
 	Time           *Time
 	Math           string
 	NodeBase
@@ -237,10 +246,6 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 		return
 	}
 
-	isSingleTagTok := f.Name == FUNCTION_TOPK && len(f.Args) == 1
-	if isSingleTagTok {
-		buf.WriteString("arrayStringConcat(")
-	}
 	buf.WriteString(dbFuncName)
 
 	if f.IsGroupArray {
@@ -255,6 +260,10 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 	args := f.Args
 	if f.Name == FUNCTION_TOPK {
 		args = f.Args[len(f.Args)-1:]
+		// topk add counts mode
+		if ctlcommon.CompareVersion(config.Cfg.Clickhouse.Version, ctlcommon.CLICK_HOUSE_VERSION) >= 0 {
+			args = append(args, []string{TOPK_COUNTS_DEFAULT_LIMIT, TOPK_COUNTS_MODE_FLAG}...)
+		}
 	} else if f.Name == FUNCTION_ANY || f.Name == FUNCTION_UNIQ || f.Name == FUNCTION_UNIQ_EXACT {
 		args = nil
 	}
@@ -311,9 +320,6 @@ func (f *DefaultFunction) WriteTo(buf *bytes.Buffer) {
 	}
 
 	buf.WriteString(")")
-	if isSingleTagTok {
-		buf.WriteString(", ',')")
-	}
 	buf.WriteString(f.Math)
 	if !f.Nest && f.Alias != "" {
 		buf.WriteString(" AS ")
@@ -403,6 +409,10 @@ func (f *DefaultFunction) SetIsGroupArray(isGroupArray bool) {
 
 func (f *DefaultFunction) SetCondition(condition string) {
 	f.Condition = condition
+}
+
+func (f *DefaultFunction) SetIsLeast(isLeast bool) {
+	f.IsLeast = isLeast
 }
 
 func (f *DefaultFunction) SetMath(math string) {
@@ -757,7 +767,7 @@ type DivFunction struct {
 	DivType int
 }
 
-func (f *DivFunction) WriteTo(buf *bytes.Buffer) {
+func (f *DivFunction) writeField(buf *bytes.Buffer) {
 	if f.DivType == FUNCTION_DIV_TYPE_DEFAULT {
 		buf.WriteString("divide(")
 		f.Fields[0].WriteTo(buf)
@@ -781,6 +791,18 @@ func (f *DivFunction) WriteTo(buf *bytes.Buffer) {
 		buf.WriteString(FormatField(f.Fields[1].(Function).GetDefaultAlias(true)))
 		buf.WriteString("`")
 	}
+}
+
+func (f *DivFunction) WriteTo(buf *bytes.Buffer) {
+	if f.IsLeast {
+		buf.WriteString("if(")
+		f.writeField(buf)
+		buf.WriteString(">=0, least(")
+		f.writeField(buf)
+		buf.WriteString(", 1), null)")
+	} else {
+		f.writeField(buf)
+	}
 	buf.WriteString(f.Math)
 	if !f.Nest && f.Alias != "" {
 		buf.WriteString(" AS ")
@@ -793,10 +815,14 @@ func (f *DivFunction) WriteTo(buf *bytes.Buffer) {
 func (f *DivFunction) GetWiths() []Node {
 	f.Withs = append(f.Withs, f.Fields[0].GetWiths()...)
 	f.Withs = append(f.Withs, f.Fields[1].GetWiths()...)
+	divFunctionStr := fmt.Sprintf("divide(%s, %s)", f.Fields[0].ToString(), f.Fields[1].ToString())
+	if f.IsLeast {
+		divFunctionStr = fmt.Sprintf("if(%s>=0, least(%s, 1), null)", divFunctionStr, divFunctionStr)
+	}
 	if f.DivType == FUNCTION_DIV_TYPE_0DIVIDER_AS_NULL {
 		with := fmt.Sprintf(
-			"if(%s>0, divide(%s, %s), null)",
-			f.Fields[1].ToString(), f.Fields[0].ToString(), f.Fields[1].ToString(),
+			"if(%s>0, %s, null)",
+			f.Fields[1].ToString(), divFunctionStr,
 		)
 		alias := FormatField(fmt.Sprintf(
 			"divide_0diveider_as_null%s%s",
@@ -806,8 +832,8 @@ func (f *DivFunction) GetWiths() []Node {
 		f.Withs = append(f.Withs, &With{Value: with, Alias: alias})
 	} else if f.DivType == FUNCTION_DIV_TYPE_0DIVIDER_AS_0 {
 		with := fmt.Sprintf(
-			"if(%s>0, divide(%s, %s), 0)",
-			f.Fields[1].ToString(), f.Fields[0].ToString(), f.Fields[1].ToString(),
+			"if(%s>0, %s, 0)",
+			f.Fields[1].ToString(), divFunctionStr,
 		)
 		alias := FormatField(fmt.Sprintf(
 			"divide_0diveider_as_0%s%s",
@@ -896,13 +922,15 @@ func (f *CounterAvgFunction) WriteTo(buf *bytes.Buffer) {
 
 type DelayAvgFunction struct {
 	DefaultFunction
-	divFunction *DivFunction
+	divFunction   *DivFunction
+	minusFunction *DefaultFunction
 }
 
 func (f *DelayAvgFunction) Init() {
 	// Sum(Numerator)/Sum(Denominator)
 	if strings.Contains(f.Fields[0].ToString(), "/") {
-		fieldsSlice := strings.Split(f.Fields[0].ToString(), "/")
+		dbField := f.Fields[0].ToString()
+		fieldsSlice := strings.Split(strings.TrimPrefix(dbField, "1 - "), "/")
 		if len(fieldsSlice) > 1 {
 			dividendSumFunc := DefaultFunction{
 				Name:   FUNCTION_SUM,
@@ -920,8 +948,22 @@ func (f *DelayAvgFunction) Init() {
 				DefaultFunction: DefaultFunction{
 					Name:   FUNCTION_DIV,
 					Fields: []Node{&dividendSumFunc, &divisorSumFunc},
-					Math:   f.Math,
 				},
+			}
+			if f.IsLeast {
+				f.divFunction.IsLeast = true
+			}
+
+			// 1 - Sum(Numerator)/Sum(Denominator)
+			if strings.HasPrefix(dbField, "1 - ") {
+				f.divFunction.Nest = true
+				f.minusFunction = &DefaultFunction{
+					Name:   FUNCTION_MINUS,
+					Fields: []Node{&Field{Value: "1"}, f.divFunction},
+					Math:   f.Math,
+				}
+			} else {
+				f.divFunction.Math = f.Math
 			}
 		}
 	}
@@ -931,7 +973,11 @@ func (f *DelayAvgFunction) WriteTo(buf *bytes.Buffer) {
 	if !strings.Contains(f.Fields[0].ToString(), "/") {
 		f.DefaultFunction.WriteTo(buf)
 	} else {
-		f.divFunction.WriteTo(buf)
+		if f.minusFunction != nil {
+			f.minusFunction.WriteTo(buf)
+		} else {
+			f.divFunction.WriteTo(buf)
+		}
 		if f.Alias != "" {
 			buf.WriteString(" AS ")
 			buf.WriteString("`")

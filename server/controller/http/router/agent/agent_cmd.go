@@ -153,26 +153,22 @@ func forwardToServerConnectedByAgent() gin.HandlerFunc {
 			key, common.NodeIP, agent.CurControllerIP, agent.ControllerIP)
 		// get reverse proxy host
 		newHost := common.NodeIP
-		if common.NodeIP == agent.CurControllerIP {
-			if manager := service.GetAgentCMDManager(key); manager != nil {
-				log.Infof("agent(key: %s) command context next, node ip(%s)", key)
+		if newHost != agent.CurControllerIP && newHost != agent.ControllerIP {
+			newHost = agent.ControllerIP
+			c.Request.Header.Set(ForwardControllerTimes, fmt.Sprintf("%d", forwardTimes+1))
+		} else {
+			manager := service.GetAgentCMDManager(key)
+			if manager != nil && manager.IsValid() {
 				c.Next()
 				return
-			} else {
-				newHost = agent.ControllerIP
-				c.Request.Header.Set(ForwardControllerTimes, fmt.Sprintf("%d", forwardTimes+1))
 			}
-		} else if common.NodeIP == agent.ControllerIP {
-			if manager := service.GetAgentCMDManager(key); manager != nil {
-				log.Infof("agent(key: %s) command context next, node ip(%s)", key)
-				c.Next()
-				return
+
+			log.Infof("agent(key: %s) cmd manager not found in server(ip: %s), lookup next", key, common.NodeIP)
+			if newHost == agent.CurControllerIP {
+				newHost = agent.ControllerIP
 			} else {
 				newHost = agent.CurControllerIP
-				c.Request.Header.Set(ForwardControllerTimes, fmt.Sprintf("%d", forwardTimes+1))
 			}
-		} else {
-			newHost = agent.ControllerIP
 			c.Request.Header.Set(ForwardControllerTimes, fmt.Sprintf("%d", forwardTimes+1))
 		}
 
@@ -221,19 +217,19 @@ func (a *AgentCMD) getCMDAndNamespaceHandler() gin.HandlerFunc {
 		userType, _ := c.Get(common.HEADER_KEY_X_USER_TYPE)
 		if !(userType == common.USER_TYPE_SUPER_ADMIN || userType == common.USER_TYPE_ADMIN) {
 			var cmds []*grpcapi.RemoteCommand
-			for _, item := range data.RemoteCommand {
+			for _, item := range data.RemoteCommands {
 				_, ok1 := profileCommandMap[*item.Cmd]
 				_, ok2 := probeCommandMap[*item.Cmd]
 				if ok1 || ok2 {
 					cmds = append(cmds, item)
 				}
 			}
-			data.RemoteCommand = cmds
+			data.RemoteCommands = cmds
 		}
 
 		if filterCommandMap, ok := agentCommandMap[AgentCommandType(c.Query("type"))]; ok {
 			var cmds []*grpcapi.RemoteCommand
-			for _, item := range data.RemoteCommand {
+			for _, item := range data.RemoteCommands {
 				if item.Cmd == nil {
 					continue
 				}
@@ -241,8 +237,8 @@ func (a *AgentCMD) getCMDAndNamespaceHandler() gin.HandlerFunc {
 					cmds = append(cmds, item)
 				}
 			}
-			data.RemoteCommand = cmds
-			data.LinuxNamespace = nil
+			data.RemoteCommands = cmds
+			data.LinuxNamespaces = nil
 
 		}
 		response.JSON(c, response.SetData(data))

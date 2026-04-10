@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	api "github.com/deepflowio/deepflow/message/agent"
@@ -32,16 +33,17 @@ import (
 )
 
 const (
-	cmdInactivityTimeout = 1 * time.Minute
+	agentInactivityTimeout         = 1 * time.Minute
+	reqeustIDOfResponseToHeartbeat = 0
 )
 
 func newRemoteExecContext(streamCtx context.Context) *remoteExecContext {
 	streamCtx, cancel := context.WithCancel(streamCtx)
 	return &remoteExecContext{
-		streamCtx:    streamCtx,
-		streamCancel: cancel,
-		errChan:      make(chan error, 1),
-		initDoneChan: make(chan struct{}),
+		streamCtx:           streamCtx,
+		streamCancel:        cancel,
+		streamHandleErrChan: make(chan error, 1),
+		cmdMngInitDoneChan:  make(chan struct{}),
 	}
 }
 
@@ -51,28 +53,32 @@ type remoteExecContext struct {
 
 	heartbeatCount uint32 // used to sample the agent's heartbeats
 
-	key          string // agent key, format: ip-mac
-	isFirstRecv  bool   // whether the first message has been received
-	manager      *service.CMDManager
-	wg           sync.WaitGroup
-	errChan      chan error    // channel to handle errors
-	initDoneChan chan struct{} // channel to signal initialization done
+	wg                  sync.WaitGroup
+	streamHandleErrChan chan error    // channel to handle errors
+	cmdMngInitDoneChan  chan struct{} // channel to signal initialization done
+
+	// the following fields are initialized after the first message is received
+	isFirstRecv bool   // whether the first message has been received
+	key         string // agent key, format: ip-mac
+	cmdMng      *service.CMDManager
 }
 
 func (e *RemoteExecute) RemoteExecute(stream api.Synchronizer_RemoteExecuteServer) error {
 	ctx := newRemoteExecContext(stream.Context())
-	defer ctx.streamCancel()
-
 	ctx.wg.Add(1)
 	defer func() {
 		ctx.wg.Wait()
-		service.RemoveAllFromCMDManager(ctx.key)
+		close(ctx.streamHandleErrChan)
+		close(ctx.cmdMngInitDoneChan)
+		service.RemoveAgentCMDManager(ctx.key)
 	}()
+
+	defer ctx.streamCancel()
 
 	go e.receiveAndHandle(ctx, stream)
 
-	<-ctx.initDoneChan
-	log.Infof("[remote-exec] agent(key: %s) init done", ctx.key)
+	<-ctx.cmdMngInitDoneChan
+	log.Infof("[REMOTE_EXEC] agent(key: %s) cmd manager init done", ctx.key)
 
 	return e.waitAndSend(ctx, stream)
 }
@@ -82,166 +88,142 @@ func (e *RemoteExecute) receiveAndHandle(
 	stream api.Synchronizer_RemoteExecuteServer,
 ) {
 	defer func() {
-		log.Infof("[remote-exec] agent(key: %s) remote exec stream receive goroutine done", ctx.key)
-		ctx.wg.Done()
 		if r := recover(); r != nil {
 			e.handlePanic(ctx)
 		}
+		log.Infof("[REMOTE_EXEC] agent(key: %s) remote exec stream receive goroutine done", ctx.key)
+		ctx.wg.Done()
 	}()
 
-	inactivityTimer := time.NewTimer(cmdInactivityTimeout)
-	defer inactivityTimer.Stop()
+	agentInactivityTimer := time.NewTimer(agentInactivityTimeout)
+	defer agentInactivityTimer.Stop()
 
 	for {
 		select {
 		case <-ctx.streamCtx.Done():
-			log.Infof("[remote-exec] context done, agent(key: %s), context err: %v", ctx.key, ctx.streamCtx.Err())
+			log.Infof("[REMOTE_EXEC] agent(key: %s) stream context done, err: %v", ctx.key, ctx.streamCtx.Err())
 			return
-		case <-inactivityTimer.C:
-			e.handleInactivityTimeout(ctx)
+		case <-agentInactivityTimer.C:
+			e.handleAgentInactivityTimeout(ctx)
 			return
 		default:
 			resp, err := stream.Recv()
 			// Handle any errors that occur during stream reception
 			// if server restart, an io.EOF error may be received
 			if err == io.EOF {
-				e.handleStreamErr(ctx, err)
+				e.handleStreamEOF(ctx, stream, err)
 				return
 			}
 
-			e.resetTimer(inactivityTimer)
-			e.initCtxAndHandleResp(ctx, resp, err)
+			e.resetTimer(ctx, agentInactivityTimer)
+
+			if resp == nil {
+				log.Infof("[REMOTE_EXEC] agent received null response: %s", resp.String())
+				return
+			}
+			if resp.AgentId == nil {
+				log.Warningf("[REMOTE_EXEC] agent received null agent id: %s", resp.String())
+				return
+			}
+
+			e.initCtx(ctx, resp)
+
+			if !ctx.cmdMng.IsValid() {
+				log.Errorf("[REMOTE_EXEC] agent(key: %s) cmd manager not found", ctx.key)
+				continue
+			}
+
+			if e.isHeartbeat(resp) {
+				e.logHeartbeat(ctx, resp)
+				// response to agent heartbeat
+				ctx.cmdMng.RequestChan <- &api.RemoteExecRequest{RequestId: proto.Uint64(reqeustIDOfResponseToHeartbeat)}
+				continue
+			}
+
+			if err != nil {
+				log.Errorf("[REMOTE_EXEC] agent(key: %s) received strem error: %s", ctx.key, err.Error())
+				continue
+			}
+
+			e.handleResponse(ctx, resp)
 		}
 	}
 }
 
-func (e *RemoteExecute) initCtxAndHandleResp(ctx *remoteExecContext, resp *api.RemoteExecResponse, err error) {
-	if resp == nil {
-		return
-	}
-
-	log.Debugf("[remote-exec] agent command response: %s", resp.String())
-
-	if resp.AgentId == nil {
-		log.Warningf("[remote-exec] get null agent info from response: %s", resp.String())
-		return
-	}
-
+func (e *RemoteExecute) initCtx(ctx *remoteExecContext, resp *api.RemoteExecResponse) {
+	log.Debugf("[REMOTE_EXEC] agent command response: %s", resp.String())
 	ctx.key = resp.AgentId.GetIp() + "-" + resp.AgentId.GetMac()
 
 	if !ctx.isFirstRecv {
 		ctx.isFirstRecv = true
-		log.Infof("[remote-exec] agent(key: %s) called me for the first time", ctx.key)
+		log.Infof("[REMOTE_EXEC] agent(key: %s) called me for the first time", ctx.key)
 	}
 
-	if ctx.manager == nil {
-		log.Infof("[remote-exec] agent(key: %s) cmd manager not found, new one manager", ctx.key)
-		ctx.manager = service.AddToCMDManagerIfNotExist(ctx.key, uint64(1))
-		ctx.initDoneChan <- struct{}{}
+	if ctx.cmdMng == nil {
+		log.Infof("[REMOTE_EXEC] agent(key: %s) cmd manager not found, new one manager", ctx.key)
+		ctx.cmdMng = service.NewAgentCMDManagerIfNotExist(ctx.key, uint64(1))
+		log.Infof("[REMOTE_EXEC] agent(key: %s) cmd manager created, sending init done signal", ctx.key)
+		ctx.cmdMngInitDoneChan <- struct{}{}
+		log.Infof("[REMOTE_EXEC] agent(key: %s) cmd manager init done signal sent successfully", ctx.key)
+	} else {
+		log.Infof("[REMOTE_EXEC] agent(key: %s) cmd manager already exists, reusing existing", ctx.key)
+		ctx.cmdMng = service.GetAgentCMDManager(ctx.key)
 	}
-
-	service.LockAgentCMD()
-	defer service.UnlockAgentCMD()
-
-	ctx.manager = service.GetAgentCMDManagerWithoutLock(ctx.key)
-	if ctx.manager == nil {
-		log.Errorf("[remote-exec] agent(key: %s) cmd manager not found", ctx.key)
-		return
-	}
-
-	if e.isHeartbeat(resp) {
-		e.logHeartbeat(ctx, resp)
-		ctx.manager.ExecCH <- &api.RemoteExecRequest{RequestId: proto.Uint64(0)}
-		return
-	}
-
-	if err != nil {
-		e.handleStreamErr(ctx, err)
-		return
-	}
-
-	e.handleResponse(ctx, resp)
 }
 
 func (e *RemoteExecute) handleResponse(ctx *remoteExecContext, resp *api.RemoteExecResponse) {
 	if resp.RequestId == nil {
-		log.Errorf("[remote-exec] agent(key: %s) command resp request id not found", ctx.key, resp.RequestId)
+		log.Errorf("[REMOTE_EXEC] agent(key: %s) responsed null request id", ctx.key)
 		return
 	}
 
-	cmdResp := service.GetAgentCMDRespWithoutLock(ctx.key, *resp.RequestId)
-	if cmdResp == nil {
-		log.Errorf("[remote-exec] agent(key: %s, request id: %v) remote exec map not found", ctx.key, resp.RequestId)
+	cmdRespMng := ctx.cmdMng.GetRespManager(*resp.RequestId)
+	if !cmdRespMng.IsValid() {
+		log.Errorf("[REMOTE_EXEC] agent(key: %s, request_id: %d) response manager not found", ctx.key, resp.GetRequestId())
 		return
 	}
 
 	e.logResponse(resp, ctx.key)
 
-	if resp.Errmsg != nil {
-		e.handleRespErrmsg(ctx.key, resp, cmdResp)
+	switch {
+	case resp.Errmsg != nil:
+		log.Errorf("[REMOTE_EXEC] agent(key: %s, request_id: %d) run command error: %s", ctx.key, resp.GetRequestId(), *resp.Errmsg)
+		cmdRespMng.SetErrorMessage(*resp.Errmsg)
+
+		result := resp.CommandResult
+		if result == nil || result.Content == nil {
+			cmdRespMng.ResponseDoneChan <- struct{}{}
+			return
+		}
+		cmdRespMng.AppendContent(result.Content)
+
+		// check if response is completed
+		if result.Md5 != nil {
+			cmdRespMng.ResponseDoneChan <- struct{}{}
+			return
+		}
 		return
-	}
-
-	if len(resp.LinuxNamespaces) > 0 {
-		e.handleRespLinuxNamespaces(ctx.key, resp, cmdResp)
+	case len(resp.LinuxNamespaces) > 0:
+		cmdRespMng.SetLinuxNamespaces(resp.LinuxNamespaces)
+		cmdRespMng.GetLinuxNamespacesDoneChan <- struct{}{}
 		return
-	}
-
-	if len(resp.Commands) > 0 {
-		e.handleRespCommands(ctx.key, resp, cmdResp)
+	case len(resp.Commands) > 0:
+		cmdRespMng.SetRemoteCommands(resp.Commands)
+		cmdRespMng.GetRemoteCommandsDoneChan <- struct{}{}
 		return
-	}
-
-	e.handleRespCommandResult(ctx.key, resp, cmdResp)
-}
-
-func (e *RemoteExecute) handleRespErrmsg(key string, resp *api.RemoteExecResponse, cmdResp *service.CMDResp) {
-	log.Errorf("[remote-exec] agent(key: %s) run command error: %s", key, *resp.Errmsg)
-	service.AppendErrorMessageWithoutLock(key, *resp.RequestId, resp.Errmsg)
-
-	result := resp.CommandResult
-	if result == nil || result.Content == nil {
-		cmdResp.ExecDoneCH <- struct{}{}
-		return
-	}
-	service.AppendContentWithoutLock(key, *resp.RequestId, result.Content)
-
-	if result.Md5 != nil {
-		cmdResp.ExecDoneCH <- struct{}{}
-		return
-	}
-}
-
-func (e *RemoteExecute) handleRespLinuxNamespaces(key string, resp *api.RemoteExecResponse, cmdResp *service.CMDResp) {
-	if len(service.GetNamespacesWithoutLock(key, *resp.RequestId)) > 0 {
-		service.InitNamespacesWithoutLock(key, *resp.RequestId, resp.LinuxNamespaces)
-	} else {
-		service.AppendNamespacesWithoutLock(key, *resp.RequestId, resp.LinuxNamespaces)
-	}
-	cmdResp.LinuxNamespaceDoneCH <- struct{}{}
-}
-
-func (e *RemoteExecute) handleRespCommands(key string, resp *api.RemoteExecResponse, cmdResp *service.CMDResp) {
-	if len(service.GetCommandsWithoutLock(key, *resp.RequestId)) > 0 {
-		service.InitCommandsWithoutLock(key, *resp.RequestId, resp.Commands)
-	} else {
-		service.AppendCommandsWithoutLock(key, *resp.RequestId, resp.Commands)
-	}
-	cmdResp.RemoteCMDDoneCH <- struct{}{}
-}
-
-func (e *RemoteExecute) handleRespCommandResult(key string, resp *api.RemoteExecResponse, cmdResp *service.CMDResp) {
-	result := resp.CommandResult
-	if resp.CommandResult == nil {
-		return
-	}
-
-	if result.Content != nil {
-		service.AppendContentWithoutLock(key, *resp.RequestId, result.Content)
-	}
-	if result.Md5 != nil {
-		cmdResp.ExecDoneCH <- struct{}{}
-		return
+	default:
+		log.Infof("[REMOTE_EXEC] agent(key: %s, request_id: %d) responsed default", ctx.key, resp.GetRequestId())
+		result := resp.CommandResult
+		if result == nil {
+			return
+		}
+		if result.Content != nil {
+			cmdRespMng.AppendContent(result.Content)
+		}
+		if result.Md5 != nil {
+			cmdRespMng.ResponseDoneChan <- struct{}{}
+			return
+		}
 	}
 }
 
@@ -249,23 +231,31 @@ func (e *RemoteExecute) waitAndSend(
 	ctx *remoteExecContext,
 	stream api.Synchronizer_RemoteExecuteServer,
 ) error {
+	log.Infof("[REMOTE_EXEC] agent(key: %s) waitAndSend started, entering request waiting loop", ctx.key)
+
+	// Log RequestChan buffer status
+	log.Infof("[REMOTE_EXEC] agent(key: %s) RequestChan buffer length: %d, capacity: %d",
+		ctx.key, len(ctx.cmdMng.RequestChan), cap(ctx.cmdMng.RequestChan))
+
 	for {
-		if ctx.manager == nil {
-			err := fmt.Errorf("[remote-exec] agent(key: %s) cmd manager not found", ctx.key)
+		if !ctx.cmdMng.IsValid() {
+			err := fmt.Errorf("[REMOTE_EXEC] agent(key: %s) cmd manager is invalid", ctx.key)
 			log.Error(err)
 			return err
 		}
 
+		log.Debugf("[REMOTE_EXEC] agent(key: %s) waiting for requests in select loop", ctx.key)
+
 		select {
 		case <-ctx.streamCtx.Done():
-			log.Infof("[remote-exec] context done, agent(key: %s), context err: %v", ctx.key, ctx.streamCtx.Err())
+			log.Infof("[REMOTE_EXEC] agent(key: %s) stream context done, err: %v", ctx.key, ctx.streamCtx.Err())
 			return ctx.streamCtx.Err()
-		case err := <-ctx.errChan:
+		case err := <-ctx.streamHandleErrChan:
 			log.Error(err)
 			return err
-		case req, ok := <-ctx.manager.ExecCH:
+		case req, ok := <-ctx.cmdMng.RequestChan:
 			if !ok {
-				err := fmt.Errorf("[remote-exec] agent(key: %s) cmd manager exec channel is closed", ctx.key)
+				err := fmt.Errorf("[REMOTE_EXEC] agent(key: %s) RequestChan has been closed", ctx.key)
 				log.Error(err)
 				return err
 			}
@@ -279,67 +269,105 @@ func (e *RemoteExecute) waitAndSend(
 func (e *RemoteExecute) handlePanic(ctx *remoteExecContext) {
 	buf := make([]byte, 2048)
 	n := runtime.Stack(buf, false)
-	errMsg := fmt.Sprintf("[remote-exec] recovered in RemoteExecute: %s", buf[:n])
-	log.Errorf(errMsg)
-	ctx.errChan <- fmt.Errorf(errMsg)
+	err := fmt.Errorf("[REMOTE_EXEC] agent(key: %s) recovered in RemoteExecute: %s", ctx.key, buf[:n])
+	log.Error(err.Error())
+	// Send error to errChan in a non-blocking way to prevent deadlock
+	select {
+	case ctx.streamHandleErrChan <- err:
+	default:
+		log.Errorf("[REMOTE_EXEC] agent(key: %s) error channel is full, could not send panic error", ctx.key)
+	}
 }
 
-func (e *RemoteExecute) handleInactivityTimeout(ctx *remoteExecContext) {
-	errMsg := fmt.Errorf("[remote-exec] no message received for %vs, closing connection for agent(key: %s)",
-		cmdInactivityTimeout.Seconds(), ctx.key)
-	log.Error(errMsg)
-	ctx.errChan <- errMsg
+func (e *RemoteExecute) handleAgentInactivityTimeout(ctx *remoteExecContext) {
+	err := fmt.Errorf("[REMOTE_EXEC] no message received for %vs, closing connection for agent(key: %s)",
+		agentInactivityTimeout.Seconds(), ctx.key)
+	log.Error(err.Error())
+	// Send error to errChan in a non-blocking way to prevent deadlock
+	select {
+	case ctx.streamHandleErrChan <- err:
+	default:
+		log.Errorf("[REMOTE_EXEC] agent(key: %s) error channel is full, could not send timeout error", ctx.key)
+	}
 }
 
-func (e *RemoteExecute) handleStreamErr(ctx *remoteExecContext, err error) {
-	if err == io.EOF {
-		log.Errorf("[remote-exec] agent(key: %s) command stream error: %v", ctx.key, err)
-		ctx.errChan <- err
+func (e *RemoteExecute) handleStreamEOF(ctx *remoteExecContext, stream api.Synchronizer_RemoteExecuteServer, err error) {
+	// Extract gRPC status for more diagnostic detail (code + message)
+	st, _ := status.FromError(err)
+	// stream.Context().Err() reveals whether the closure was due to deadline exceeded or cancellation
+	ctxErr := stream.Context().Err()
+	log.Errorf("[REMOTE_EXEC] agent(key: %s) command stream EOF: grpc_status_code=%s, grpc_message=%q, ctx_err=%v",
+		ctx.key, st.Code(), st.Message(), ctxErr)
+	// Send error to errChan in a non-blocking way to prevent deadlock
+	select {
+	case ctx.streamHandleErrChan <- err:
+	default:
+		log.Warningf("[REMOTE_EXEC] agent(key: %s) error channel is full, dropping error: %v", ctx.key, err)
 	}
 }
 
 // resetTimer attempts to stop the inactivity timer and reset it to its original duration.
 // If the timer has already expired, it drains the channel to prevent blocking.
-func (e *RemoteExecute) resetTimer(timer *time.Timer) {
+func (e *RemoteExecute) resetTimer(ctx *remoteExecContext, timer *time.Timer) {
 	if !timer.Stop() {
-		<-timer.C
+		select {
+		case <-timer.C:
+		default:
+			log.Debugf("[REMOTE_EXEC] agent(key: %s) timer channel was already drained, this is normal", ctx.key)
+		}
 	}
-	timer.Reset(cmdInactivityTimeout)
+	timer.Reset(agentInactivityTimeout)
 }
 
 func (e *RemoteExecute) isHeartbeat(resp *api.RemoteExecResponse) bool {
 	return resp.CommandResult == nil && resp.LinuxNamespaces == nil &&
 		resp.Commands == nil && resp.Errmsg == nil
 }
+
 func (e *RemoteExecute) needLogHeartbeat(ctx *remoteExecContext) bool {
 	return ctx.heartbeatCount%20 == 0
 }
+
 func (e *RemoteExecute) logHeartbeat(ctx *remoteExecContext, resp *api.RemoteExecResponse) {
 	ctx.heartbeatCount++
 	if e.needLogHeartbeat(ctx) {
-		log.Infof("[remote-exec] agent(key: %s) heartbeat count: %d", ctx.key, ctx.heartbeatCount)
-		log.Infof("[remote-exec] agent heartbeat command response: %s", resp.String())
+		log.Infof("[REMOTE_EXEC] agent(key: %s) heartbeat count: %d", ctx.key, ctx.heartbeatCount)
+		log.Infof("[REMOTE_EXEC] agent(key: %s) heartbeat command response: %s", ctx.key, resp.String())
 	}
 }
 
 func (e *RemoteExecute) sendRequest(ctx *remoteExecContext, stream api.Synchronizer_RemoteExecuteServer, req *api.RemoteExecRequest) error {
 	e.logRequest(ctx, req)
 	if err := stream.Send(req); err != nil {
-		log.Errorf("[remote-exec] failed to send cmd to agent: %s, req: %#v", err.Error(), req)
+		log.Errorf("[REMOTE_EXEC] server failed to send request to agent(key: %s) , req: %#v, err: %v", ctx.key, req, err)
 		return err
 	}
 	return nil
 }
 
 func (e *RemoteExecute) logResponse(resp *api.RemoteExecResponse, key string) {
+	if resp.GetCommandResult() != nil {
+		log.Infof("[REMOTE_EXEC] get response from agent(key: %s), request_id: %d, MD5: %s, total_len: %d", key, resp.GetRequestId(), resp.GetCommandResult().GetMd5(), resp.GetCommandResult().GetTotalLen())
+	} else {
+		log.Infof("[REMOTE_EXEC] get response from agent(key: %s), request_id: %d", key, resp.GetRequestId())
+	}
 	b, _ := json.Marshal(resp)
-	log.Infof("[remote-exec] agent(key: %s) response: %s", key, string(b))
+	log.Debugf("[REMOTE_EXEC] get response from agent(key: %s), request_id: %d: %s", key, resp.GetRequestId(), string(b))
 }
 
 func (e *RemoteExecute) logRequest(ctx *remoteExecContext, req *api.RemoteExecRequest) {
-	if req.RequestId != nil && *req.RequestId == 0 && !e.needLogHeartbeat(ctx) { // agent heartbeat request id is 0
+	if req.RequestId != nil && *req.RequestId == reqeustIDOfResponseToHeartbeat {
 		return
 	}
-	b, _ := json.Marshal(req)
-	log.Infof("[remote-exec] agent(key: %s) request: %s", ctx.key, string(b))
+
+	if req.GetExecType() == api.ExecutionType_DRY_REPLAY_PCAP {
+		if req.GetCommandData() != nil {
+			log.Infof("[REMOTE_EXEC] send request to agent(key: %s), request_id: %d, exec_type: %s, batch_len: %d, MD5: %s, total_len: %d", ctx.key, req.GetRequestId(), req.GetExecType(), req.GetBatchLen(), req.GetCommandData().GetMd5(), req.GetCommandData().GetTotalLen())
+		} else {
+			log.Infof("[REMOTE_EXEC] send request to agent(key: %s), request_id: %d, exec_type: %s, batch_len: %d", ctx.key, req.GetRequestId(), req.GetExecType(), req.GetBatchLen())
+		}
+	} else {
+		b, _ := json.Marshal(req)
+		log.Infof("[REMOTE_EXEC] send request to agent(key: %s), request_id: %d: %s", ctx.key, req.GetRequestId(), string(b))
+	}
 }
